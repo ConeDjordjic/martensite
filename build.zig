@@ -20,5 +20,17 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run the tests").dependOn(&run_tests.step);
 
-    _ = mod;
+    const example = b.addExecutable(.{
+        .name = "hello",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/hello.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "martensite", .module = mod }},
+        }),
+    });
+    b.installArtifact(example);
+
+    const run_example = b.addRunArtifact(example);
+    b.step("run", "Run the hello example").dependOn(&run_example.step);
 }
