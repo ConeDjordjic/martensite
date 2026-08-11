@@ -141,14 +141,7 @@ const Scanner = struct {
         while (s.i < s.bytes.len and (s.bytes[s.i] == ' ' or s.bytes[s.i] == '\t')) s.i += 1;
 
         const value_start = s.i;
-        while (true) {
-            if (s.i >= s.bytes.len) return null;
-            const c = s.bytes[s.i];
-            if (c == '\r' or c == '\n') break;
-            if (c < 0x20 and c != '\t') return error.Invalid;
-            if (c == 0x7f) return error.Invalid;
-            s.i += 1;
-        }
+        s.i += try scanValue(s.bytes[s.i..]) orelse return null;
         var end = s.i;
         while (end > value_start and (s.bytes[end - 1] == ' ' or s.bytes[end - 1] == '\t')) end -= 1;
         const value = s.bytes[value_start..end];
@@ -157,6 +150,50 @@ const Scanner = struct {
         return .{ .name = name, .value = value };
     }
 };
+
+// 16, not the 32 that suggestVectorLength gives. Header values are
+// short, so 32-byte chunks leave most of their lanes unused and measured
+// slower on a browser-sized head.
+const vector_len = 16;
+const V = @Vector(vector_len, u8);
+
+/// Bytes up to the CR or LF ending a header value, or null if it hasn't
+/// ended. Rejects control characters.
+fn scanValue(bytes: []const u8) Error!?usize {
+    var i: usize = 0;
+
+    if (vector_len > 1) {
+        while (i + vector_len <= bytes.len) : (i += vector_len) {
+            const chunk: V = bytes[i..][0..vector_len].*;
+            // Everything under 0x20 except tab is illegal, and so is
+            // DEL, so a single compare finds both the end of the line
+            // and the junk.
+            const interesting = interestingLanes(chunk);
+            if (@reduce(.Or, interesting)) {
+                const mask: std.meta.Int(.unsigned, vector_len) = @bitCast(interesting);
+                i += @ctz(mask);
+                const c = bytes[i];
+                if (c == '\r' or c == '\n') return i;
+                return error.Invalid;
+            }
+        }
+    }
+
+    while (i < bytes.len) : (i += 1) {
+        const c = bytes[i];
+        if (c == '\r' or c == '\n') return i;
+        if (c < 0x20 and c != '\t') return error.Invalid;
+        if (c == 0x7f) return error.Invalid;
+    }
+    return null;
+}
+
+fn interestingLanes(chunk: V) @Vector(vector_len, bool) {
+    const low = chunk < @as(V, @splat(0x20));
+    const tab = chunk == @as(V, @splat('\t'));
+    const del = chunk == @as(V, @splat(0x7f));
+    return (low & ~tab) | del;
+}
 
 /// RFC 9110 token characters.
 fn isTokenChar(c: u8) bool {
