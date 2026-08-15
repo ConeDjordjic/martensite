@@ -35,11 +35,13 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
     var headers: [64]martensite.Header = undefined;
+    var head_buf: [8 * 1024]u8 = undefined;
 
     var reader = stream.reader(io, &read_buf);
     var writer = stream.writer(io, &write_buf);
     var http: martensite.Server = .init(io, &reader.interface, &writer.interface, .{
         .headers = &headers,
+        .head_buf = &head_buf,
     });
 
     while (true) {

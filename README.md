@@ -29,6 +29,28 @@ already had. This is `httparse`'s shape, not `hyper`'s.
 ambiguous cases. `martensite.chunked.Decoder` decodes in place. Neither knows
 what a socket is.
 
+## The one rule
+
+**Everything you get back borrows a buffer you own, and stays valid until the
+next thing you do to that buffer.** There is no allocator here to make copies
+for you, so if you want a method, a target or a header value to outlive the
+request, copy it out yourself.
+
+Concretely, for `Server`: a `Request` is good until the next `receive`. After
+that its slices point at whatever has since been read over them.
+
+This is the one thing worth getting right before writing any code against
+martensite, so it is checked rather than just written down. In Debug and
+ReleaseSafe, touching a stale `Request` panics:
+
+```
+thread 547234 panic: request outlived the receive that produced it
+```
+
+In ReleaseFast the check is gone and you get garbage, which is the same deal
+as an index out of range. `req.live()` answers the question without panicking
+if you would rather ask.
+
 ## Running on an Io
 
 `martensite.Server` is the one piece that takes a `std.Io`, and it is
@@ -39,6 +61,7 @@ var reader = stream.reader(io, &read_buf);
 var writer = stream.writer(io, &write_buf);
 var http: martensite.Server = .init(io, &reader.interface, &writer.interface, .{
     .headers = &headers,
+    .head_buf = &head_buf,
 });
 
 while (true) {
@@ -51,6 +74,12 @@ while (true) {
 
 Any `std.Io` implementation works, because that is what an interface is for.
 `examples/hello.zig` is a whole server in about sixty lines.
+
+`head_buf` is the one place martensite does copy. Reading a body advances the
+reader past the head, and the next fill rebases its buffer over the bytes the
+head pointed at, so a request that has a body gets its head copied there
+first. A request without one never touches it, and you can leave it out if
+you only serve GETs.
 
 One thing to know: **`std.Io.Uring` cannot serve HTTP in Zig 0.16.** Every
 socket operation in its vtable is a stub that returns `error.NetworkDown`, so
