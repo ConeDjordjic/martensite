@@ -215,7 +215,7 @@ pub fn readBody(s: *Server, buf: []u8) (BodyError || error{BodyTooLarge})![]u8 {
     }
 }
 
-pub const SendError = Io.Writer.Error;
+pub const SendError = Response.WriteError;
 
 /// Writes a response and flushes it.
 pub fn respond(s: *Server, r: Response) SendError!void {

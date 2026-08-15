@@ -26,7 +26,13 @@ pub const WriteOptions = struct {
     keep_alive: bool,
 };
 
-pub fn write(r: Response, w: *Io.Writer, options: WriteOptions) Io.Writer.Error!void {
+pub const WriteError = Io.Writer.Error || error{
+    /// A bad header name, or CR, LF or NUL in a value. Writing one lets
+    /// the caller tack on extra headers, or a whole second response.
+    InvalidHeader,
+};
+
+pub fn write(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void {
     const alive = options.keep_alive and r.keep_alive;
 
     try w.writeAll("HTTP/1.1 ");
@@ -35,6 +41,7 @@ pub fn write(r: Response, w: *Io.Writer, options: WriteOptions) Io.Writer.Error!
     try w.writeAll("\r\n");
 
     for (r.headers) |h| {
+        if (!validName(h.name) or !validValue(h.value)) return error.InvalidHeader;
         try w.writeAll(h.name);
         try w.writeAll(": ");
         try w.writeAll(h.value);
@@ -49,6 +56,28 @@ pub fn write(r: Response, w: *Io.Writer, options: WriteOptions) Io.Writer.Error!
     try w.writeAll("\r\n");
     if (!r.head_only) try w.writeAll(r.body);
 }
+
+fn validName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| if (!token_chars[c]) return false;
+    return true;
+}
+
+fn validValue(value: []const u8) bool {
+    for (value) |c| {
+        if (c == '\r' or c == '\n' or c == 0) return false;
+    }
+    return true;
+}
+
+const token_chars = blk: {
+    var t = [_]bool{false} ** 256;
+    for ("!#$%&'*+-.^_`|~") |c| t[c] = true;
+    for ('0'..'9' + 1) |c| t[c] = true;
+    for ('a'..'z' + 1) |c| t[c] = true;
+    for ('A'..'Z' + 1) |c| t[c] = true;
+    break :blk t;
+};
 
 fn hasHeader(r: Response, name: []const u8) bool {
     for (r.headers) |h| {
@@ -198,6 +227,24 @@ test "HEAD keeps the length and drops the body" {
     var buf: [256]u8 = undefined;
     const out = try render(.{ .body = "hello", .head_only = true }, true, &buf);
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", out);
+}
+
+test "a header value cannot carry a newline" {
+    var buf: [256]u8 = undefined;
+    for ([_][]const u8{ "a\r\nX-Evil: 1", "a\nX-Evil: 1", "a\rb", "a\x00b" }) |bad| {
+        try testing.expectError(error.InvalidHeader, render(.{
+            .headers = &.{.{ .name = "X-Thing", .value = bad }},
+        }, true, &buf));
+    }
+}
+
+test "a header name has to be a token" {
+    var buf: [256]u8 = undefined;
+    for ([_][]const u8{ "", "X Thing", "X:Thing", "X\r\nY" }) |bad| {
+        try testing.expectError(error.InvalidHeader, render(.{
+            .headers = &.{.{ .name = bad, .value = "1" }},
+        }, true, &buf));
+    }
 }
 
 test "an unnamed status still writes" {

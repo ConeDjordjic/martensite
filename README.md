@@ -94,6 +94,11 @@ standard one grows sockets, nothing here has to change.
 zig build test
 ```
 
+Responses get the same treatment in the other direction: a header name that
+is not a token, or a value carrying CR, LF or NUL, is `error.InvalidHeader`
+rather than output. Otherwise anything that puts user input in a header value
+can append headers, or a second response, to its own output.
+
 Framing is where request smuggling lives, so:
 
 ## Installing
