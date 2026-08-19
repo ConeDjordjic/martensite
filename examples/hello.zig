@@ -50,6 +50,22 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
             return;
         } orelse return;
 
+        // Any size of body, without holding it in memory.
+        if (std.mem.eql(u8, req.target(), "/drain")) {
+            var counter: Io.Writer.Discarding = .init(&.{});
+            var scratch: [4096]u8 = undefined;
+            var b = http.bodyReader(&scratch);
+            _ = b.interface.streamRemaining(&counter.writer) catch {
+                _ = http.respond(.{ .status = .bad_request, .keep_alive = false }) catch {};
+                return;
+            };
+            var line: [64]u8 = undefined;
+            const text = std.fmt.bufPrint(&line, "{d} bytes\n", .{counter.count}) catch "counted\n";
+            http.respond(.text(.ok, text)) catch return;
+            if (!http.alive()) return;
+            continue;
+        }
+
         var body_buf: [64 * 1024]u8 = undefined;
         const body = http.readBody(&body_buf) catch |err| {
             _ = http.respond(errorResponse(err)) catch {};

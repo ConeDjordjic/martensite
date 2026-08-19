@@ -158,6 +158,124 @@ pub fn receive(s: *Server) ReceiveError!?Request {
     }
 }
 
+/// The request body as an `Io.Reader`, so a body larger than memory can be
+/// streamed somewhere instead of landing in a buffer.
+///
+/// Decoding happens in the connection's read buffer, so this needs no buffer
+/// of its own and copies nothing that `readBody` would not have copied.
+pub const BodyReader = struct {
+    server: *Server,
+    interface: Io.Reader,
+    /// Where chunked bytes get decoded. Ours, because the destination may
+    /// not have a buffer to lend and the source's may be read-only.
+    scratch: []u8,
+    left: u64,
+    decoder: chunked.Decoder,
+    finished: bool,
+    err: ?BodyError,
+
+    fn stream(io_r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const b: *BodyReader = @alignCast(@fieldParentPtr("interface", io_r));
+        const s = b.server;
+        if (b.finished) return error.EndOfStream;
+
+        while (true) {
+            const buffered = s.reader.buffered();
+            if (buffered.len != 0) switch (s.pending) {
+                .none => unreachable,
+                .length => {
+                    const take = @min(@as(u64, limit.minInt(buffered.len)), b.left);
+                    const n: usize = @intCast(take);
+                    try w.writeAll(buffered[0..n]);
+                    s.reader.toss(n);
+                    b.left -= take;
+                    if (b.left == 0) b.complete();
+                    return n;
+                },
+                .chunked => {
+                    const take = @min(limit.minInt(buffered.len), b.scratch.len);
+                    @memcpy(b.scratch[0..take], buffered[0..take]);
+                    const r = b.decoder.decode(b.scratch[0..take]) catch {
+                        b.fail(error.BadChunk);
+                        return error.ReadFailed;
+                    };
+                    // Whatever the decoder did not consume stays in the
+                    // source and comes round again.
+                    s.reader.toss(take - r.leftover);
+                    if (r.done) b.complete();
+                    if (r.decoded != 0) {
+                        try w.writeAll(b.scratch[0..r.decoded]);
+                        return r.decoded;
+                    }
+                    if (b.finished) return error.EndOfStream;
+                    // No output and nothing consumed means the decoder is
+                    // mid-header and needs bytes it has not seen.
+                    if (r.leftover == take) break;
+                    continue;
+                },
+            };
+            break;
+        }
+
+        s.reader.fillMore() catch |err| switch (err) {
+            error.EndOfStream => {
+                b.fail(error.Incomplete);
+                return error.ReadFailed;
+            },
+            error.ReadFailed => {
+                b.fail(error.ReadFailed);
+                return error.ReadFailed;
+            },
+        };
+        return 0;
+    }
+
+    fn complete(b: *BodyReader) void {
+        b.finished = true;
+        b.server.pending = .none;
+    }
+
+    fn fail(b: *BodyReader, e: BodyError) void {
+        b.err = e;
+        b.finished = true;
+        b.server.keep_alive = false;
+    }
+
+    /// What actually went wrong, once the interface says ReadFailed.
+    pub fn failure(b: *const BodyReader) ?BodyError {
+        return b.err;
+    }
+};
+
+/// A reader over the current request's body. Valid until the next `receive`,
+/// like everything else here.
+///
+/// `scratch` is only used for chunked bodies and wants to be big enough to
+/// hold a chunk header plus some payload; a few hundred bytes is plenty.
+pub fn bodyReader(s: *Server, scratch: []u8) BodyReader {
+    if (s.pending != .none) {
+        s.reader.toss(s.head_len);
+        s.head_len = 0;
+    }
+    return .{
+        .server = s,
+        .interface = .{
+            .vtable = &.{ .stream = BodyReader.stream },
+            .buffer = &.{},
+            .seek = 0,
+            .end = 0,
+        },
+        .scratch = scratch,
+        .left = switch (s.pending) {
+            .length => |n| n,
+            else => 0,
+        },
+        .decoder = .{ .consume_trailer = true },
+        .finished = s.pending == .none,
+        .err = null,
+    };
+}
+
 pub const BodyError = error{
     /// The peer stopped sending halfway through the body.
     Incomplete,
@@ -494,4 +612,101 @@ test "a request knows when it is no longer the current one" {
     const second = (try s.receive()).?;
     try testing.expect(second.live());
     try testing.expect(!first.live());
+}
+
+test "streaming a body with a length" {
+    var h: Harness = undefined;
+    var s = h.init("POST / HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello world");
+    _ = (try s.receive()).?;
+
+    var sink: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&sink);
+    var scratch: [512]u8 = undefined;
+    var b = s.bodyReader(&scratch);
+    _ = try b.interface.streamRemaining(&w);
+    try testing.expectEqualStrings("hello world", w.buffered());
+}
+
+test "streaming a chunked body" {
+    var h: Harness = undefined;
+    var s = h.init("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var sink: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&sink);
+    var scratch: [512]u8 = undefined;
+    var b = s.bodyReader(&scratch);
+    _ = try b.interface.streamRemaining(&w);
+    try testing.expectEqualStrings("abcdefg", w.buffered());
+}
+
+test "streaming a body bigger than any buffer here" {
+    const chunk = "0123456789" ** 100;
+    const total = 200;
+    var calls: [total + 1]std.testing.Reader.Call = undefined;
+    calls[0] = .{ .buffer = "POST / HTTP/1.1\r\nContent-Length: 200000\r\n\r\n" };
+    for (calls[1..]) |*c| c.* = .{ .buffer = chunk };
+
+    var buf: [256]u8 = undefined;
+    var src: std.testing.Reader = .init(&buf, &calls);
+    var out: [256]u8 = undefined;
+    var w: Io.Writer = .fixed(&out);
+    var headers: [8]scan.Header = undefined;
+    var head_buf: [256]u8 = undefined;
+    var s: Server = .init(testing.io, &src.interface, &w, .{
+        .headers = &headers,
+        .head_buf = &head_buf,
+    });
+
+    _ = (try s.receive()).?;
+
+    var counter: Io.Writer.Discarding = .init(&.{});
+    var scratch: [512]u8 = undefined;
+    var b = s.bodyReader(&scratch);
+    const n = try b.interface.streamRemaining(&counter.writer);
+    try testing.expectEqual(@as(usize, 200_000), n);
+    try testing.expectEqual(@as(u64, 200_000), counter.count);
+}
+
+test "a truncated body reports why" {
+    var h: Harness = undefined;
+    var s = h.init("POST / HTTP/1.1\r\nContent-Length: 50\r\n\r\nshort");
+    _ = (try s.receive()).?;
+
+    var sink: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&sink);
+    var scratch: [512]u8 = undefined;
+    var b = s.bodyReader(&scratch);
+    try testing.expectError(error.ReadFailed, b.interface.streamRemaining(&w));
+    try testing.expectEqual(BodyError.Incomplete, b.failure().?);
+}
+
+test "a bad chunk reports why" {
+    var h: Harness = undefined;
+    var s = h.init("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\nabc\r\n0\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var sink: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&sink);
+    var scratch: [512]u8 = undefined;
+    var b = s.bodyReader(&scratch);
+    try testing.expectError(error.ReadFailed, b.interface.streamRemaining(&w));
+    try testing.expectEqual(BodyError.BadChunk, b.failure().?);
+}
+
+test "streaming leaves the connection on the next request" {
+    var h: Harness = undefined;
+    var s = h.init("POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var sink: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&sink);
+    var scratch: [512]u8 = undefined;
+    var b = s.bodyReader(&scratch);
+    _ = try b.interface.streamRemaining(&w);
+    try testing.expectEqualStrings("hello", w.buffered());
+
+    try s.respond(.{});
+    const second = (try s.receive()).?;
+    try testing.expectEqualStrings("/b", second.target());
 }

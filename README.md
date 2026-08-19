@@ -72,6 +72,20 @@ while (true) {
 }
 ```
 
+`readBody` puts the whole body in a buffer you supply, and anything bigger
+than that buffer is `error.BodyTooLarge` rather than a truncation. For
+uploads, take the body as a reader instead and send it somewhere:
+
+```zig
+var scratch: [4096]u8 = undefined;
+var b = http.bodyReader(&scratch);
+_ = try b.interface.streamRemaining(&file_writer.interface);
+if (b.failure()) |err| return err;
+```
+
+That decodes chunked encoding on the way through and never holds more than
+the connection's read buffer, so the body can be larger than memory.
+
 Any `std.Io` implementation works, because that is what an interface is for.
 `examples/hello.zig` is a whole server in about sixty lines.
 
