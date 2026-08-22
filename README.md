@@ -100,6 +100,27 @@ the connection's read buffer, so the body can be larger than memory.
 Any `std.Io` implementation works, because that is what an interface is for.
 `examples/hello.zig` is a whole server in about sixty lines.
 
+## Slow peers
+
+`Server` has no clock, on purpose: a deadline belongs to the connection, not
+to HTTP. `TimedReader` is the piece that puts one on a socket, and `Server`
+takes it like any other reader.
+
+```zig
+var reader: martensite.TimedReader = .init(io, stream, &read_buf, .{
+    .duration = .{ .raw = .fromSeconds(5), .clock = .awake },
+});
+reader.startDeadline(.{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+```
+
+The first is how long one read may wait. The second bounds a whole message,
+so a peer cannot hold a connection open forever by sending a byte a second.
+Without either, it can: a plain `stream.reader` waits as long as it takes.
+
+Measured against the example, which sets 5s and 10s: a silent peer is answered
+408 and closed after 5s, and one dribbling a header a second is dropped after
+11s. Normal requests are unaffected at 0.0004s.
+
 `head_buf` is the one place martensite does copy. Reading a body advances the
 reader past the head, and the next fill rebases its buffer over the bytes the
 head pointed at, so a request that has a body gets its head copied there

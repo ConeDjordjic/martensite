@@ -37,7 +37,11 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
     var headers: [64]martensite.Header = undefined;
     var head_buf: [8 * 1024]u8 = undefined;
 
-    var reader = stream.reader(io, &read_buf);
+    // A plain stream.reader works too, but then a silent peer ties this
+    // fiber up forever.
+    var reader: martensite.TimedReader = .init(io, stream, &read_buf, .{
+        .duration = seconds(5),
+    });
     var writer = stream.writer(io, &write_buf);
     var http: martensite.Server = .init(io, &reader.interface, &writer.interface, .{
         .headers = &headers,
@@ -45,13 +49,26 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
     });
 
     while (true) {
+        // This one is for the whole head, not for a single read.
+        reader.startDeadline(.{ .duration = seconds(10) });
+
         const req = http.receive() catch |err| {
-            _ = http.respond(errorResponse(err)) catch {};
+            // ReadFailed only says the read did not happen; the reader
+            // knows whether the peer went quiet or the socket broke.
+            const timed_out = err == error.ReadFailed and switch (reader.failure() orelse error.Unexpected) {
+                error.Timeout => true,
+                else => false,
+            };
+            _ = http.respond(if (timed_out)
+                .{ .status = .request_timeout, .keep_alive = false }
+            else
+                errorResponse(err)) catch {};
             return;
         } orelse return;
 
         // Any size of body, without holding it in memory.
         if (std.mem.eql(u8, req.target(), "/drain")) {
+            reader.startDeadline(.{ .duration = seconds(60) });
             var counter: Io.Writer.Discarding = .init(&.{});
             var scratch: [4096]u8 = undefined;
             var b = http.bodyReader(&scratch) catch return;
@@ -65,6 +82,8 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
             if (!http.alive()) return;
             continue;
         }
+
+        reader.startDeadline(.{ .duration = seconds(30) });
 
         var body_buf: [64 * 1024]u8 = undefined;
         const body = http.readBody(&body_buf) catch |err| {
@@ -80,6 +99,10 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
         http.respond(res) catch return;
         if (!http.alive()) return;
     }
+}
+
+fn seconds(n: i64) Io.Clock.Duration {
+    return .{ .raw = .fromSeconds(n), .clock = .awake };
 }
 
 fn errorResponse(err: anyerror) martensite.Response {

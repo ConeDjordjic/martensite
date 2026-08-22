@@ -9,6 +9,7 @@ pub const body = @import("body.zig");
 
 pub const Response = @import("Response.zig");
 pub const Server = @import("Server.zig");
+pub const TimedReader = @import("TimedReader.zig");
 
 pub const Header = scan.Header;
 pub const Head = scan.Head;
@@ -20,4 +21,5 @@ test {
     _ = body;
     _ = Response;
     _ = Server;
+    _ = TimedReader;
 }
