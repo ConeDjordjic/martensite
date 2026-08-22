@@ -54,7 +54,7 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
         if (std.mem.eql(u8, req.target(), "/drain")) {
             var counter: Io.Writer.Discarding = .init(&.{});
             var scratch: [4096]u8 = undefined;
-            var b = http.bodyReader(&scratch);
+            var b = http.bodyReader(&scratch) catch return;
             _ = b.interface.streamRemaining(&counter.writer) catch {
                 _ = http.respond(.{ .status = .bad_request, .keep_alive = false }) catch {};
                 return;
@@ -85,6 +85,7 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
 fn errorResponse(err: anyerror) martensite.Response {
     return switch (err) {
         error.HeadTooLarge => .{ .status = .request_header_fields_too_large, .keep_alive = false },
+        error.UnsupportedExpectation => .{ .status = .expectation_failed, .keep_alive = false },
         error.BodyTooLarge => .{ .status = .payload_too_large, .keep_alive = false },
         else => .{ .status = .bad_request, .keep_alive = false },
     };

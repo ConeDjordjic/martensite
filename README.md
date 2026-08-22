@@ -72,6 +72,17 @@ while (true) {
 }
 ```
 
+A peer that sent `Expect: 100-continue` is waiting to be told to go ahead,
+and reading the body tells it. Answering *without* reading does not, which is
+how you turn away an upload before it is sent:
+
+```zig
+if (req.expectsContinue() and tooBig(req)) {
+    try http.respond(.{ .status = .payload_too_large, .keep_alive = false });
+    continue;
+}
+```
+
 `readBody` puts the whole body in a buffer you supply, and anything bigger
 than that buffer is `error.BodyTooLarge` rather than a truncation. For
 uploads, take the body as a reader instead and send it somewhere:
