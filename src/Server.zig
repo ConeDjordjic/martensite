@@ -27,6 +27,8 @@ pending: body.Framing = .none,
 keep_alive: bool = true,
 /// Set once a response has gone out for the current request.
 answered: bool = true,
+/// The request was a HEAD, so a body must be described and not sent.
+head_only: bool = false,
 /// The peer said Expect: 100-continue and is waiting to be told to go
 /// ahead. Cleared once it has been.
 expect_continue: bool = false,
@@ -137,6 +139,7 @@ pub fn receive(s: *Server) ReceiveError!?Request {
                 if (maybe) |scanned| {
                     const framing = try body.request(scanned.head);
                     s.expect_continue = try expectsContinue(scanned.head);
+                    s.head_only = std.mem.eql(u8, scanned.head.method, "HEAD");
                     s.head_len = scanned.len;
                     s.pending = framing;
                     s.keep_alive = body.keepAlive(scanned.head);
@@ -377,11 +380,147 @@ pub const SendError = Response.WriteError;
 
 /// Writes a response and flushes it.
 pub fn respond(s: *Server, r: Response) SendError!void {
-    try r.write(s.writer, .{ .keep_alive = s.keep_alive });
+    var out = r;
+    // A HEAD gets the headers a GET would have got, and none of the body.
+    if (s.head_only) out.head_only = true;
+    try out.write(s.writer, .{ .keep_alive = s.keep_alive });
     try s.writer.flush();
     s.answered = true;
     if (!r.keep_alive) s.keep_alive = false;
 }
+
+pub const StreamOptions = struct {
+    /// Null means chunked.
+    content_length: ?u64 = null,
+};
+
+/// Starts a response whose body gets written afterwards. Finish it with
+/// `end`. `out_buf` becomes the writer's buffer, so its size is the
+/// biggest piece that goes out in one write. With chunked encoding that
+/// is the chunk size on the wire. Note this is not the same kind of
+/// buffer as `bodyReader`'s, even though it sits in the same place.
+pub fn respondStreaming(
+    s: *Server,
+    r: Response,
+    scratch: []u8,
+    options: StreamOptions,
+) SendError!ResponseWriter {
+    var head = r;
+    head.body = "";
+
+    const length_header: [1]Response.Header = .{.{
+        .name = "Transfer-Encoding",
+        .value = "chunked",
+    }};
+    var with_chunked: [32]Response.Header = undefined;
+    if (options.content_length == null and head.status.mayHaveBody()) {
+        if (r.headers.len + 1 > with_chunked.len) return error.WriteFailed;
+        @memcpy(with_chunked[0..r.headers.len], r.headers);
+        with_chunked[r.headers.len] = length_header[0];
+        head.headers = with_chunked[0 .. r.headers.len + 1];
+    }
+
+    var buf: [32]u8 = undefined;
+    var with_length: [32]Response.Header = undefined;
+    if (options.content_length) |n| {
+        if (r.headers.len + 1 > with_length.len) return error.WriteFailed;
+        @memcpy(with_length[0..r.headers.len], r.headers);
+        with_length[r.headers.len] = .{
+            .name = "Content-Length",
+            .value = std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable,
+        };
+        head.headers = with_length[0 .. r.headers.len + 1];
+    }
+
+    try head.writeHead(s.writer, .{ .keep_alive = s.keep_alive });
+    s.answered = true;
+    if (!r.keep_alive) s.keep_alive = false;
+
+    return .{
+        .server = s,
+        .scratch = scratch,
+        .mode = if (!head.status.mayHaveBody() or s.head_only)
+            .discard
+        else if (options.content_length) |n| .{ .length = n } else .chunked,
+        .interface = .{
+            .vtable = &.{ .drain = ResponseWriter.drain },
+            .buffer = scratch,
+        },
+    };
+}
+
+/// Writes a response body a piece at a time. Chunked unless a length was
+/// given, in which case it is checked against what actually gets written.
+pub const ResponseWriter = struct {
+    server: *Server,
+    interface: Io.Writer,
+    scratch: []u8,
+    mode: union(enum) {
+        chunked,
+        length: u64,
+        /// The status or the method says there is no body. Anything written
+        /// is dropped rather than corrupting the stream.
+        discard,
+    },
+
+    fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const rw: *ResponseWriter = @alignCast(@fieldParentPtr("interface", io_w));
+        const out = rw.server.writer;
+
+        // Whatever the interface buffered comes first, then the vectors.
+        const buffered = io_w.buffered();
+        var total: usize = buffered.len;
+        try rw.emit(out, buffered);
+        io_w.end = 0;
+
+        for (data[0 .. data.len - 1]) |slice| {
+            try rw.emit(out, slice);
+            total += slice.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| {
+            try rw.emit(out, last);
+            total += last.len;
+        }
+        return total;
+    }
+
+    fn emit(rw: *ResponseWriter, out: *Io.Writer, bytes: []const u8) Io.Writer.Error!void {
+        if (bytes.len == 0) return;
+        switch (rw.mode) {
+            .discard => {},
+            .length => |*left| {
+                // Writing more than promised would be read as the start of
+                // the next response.
+                if (bytes.len > left.*) return error.WriteFailed;
+                left.* -= bytes.len;
+                try out.writeAll(bytes);
+            },
+            .chunked => {
+                try out.print("{x}\r\n", .{bytes.len});
+                try out.writeAll(bytes);
+                try out.writeAll("\r\n");
+            },
+        }
+    }
+
+    /// Ends the body and flushes. You have to call this.
+    pub fn end(rw: *ResponseWriter) Io.Writer.Error!void {
+        try rw.interface.flush();
+        const out = rw.server.writer;
+        switch (rw.mode) {
+            .discard => {},
+            .chunked => try out.writeAll("0\r\n\r\n"),
+            .length => |left| if (left != 0) {
+                // Short of what Content-Length promised: the peer would sit
+                // waiting for bytes that are not coming.
+                rw.server.keep_alive = false;
+                return error.WriteFailed;
+            },
+        }
+        try out.flush();
+    }
+};
 
 /// Can the connection carry another request? False while a streamed
 /// response is still open.
@@ -897,4 +1036,122 @@ test "streaming sends the continue too" {
         try testing.expectEqualStrings("hi", w.buffered());
         try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 100 Continue\r\n\r\n"));
     }
+}
+
+test "a streamed response is chunked when the length is unknown" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET / HTTP/1.1\r\n\r\n");
+        _ = (try s.receive()).?;
+
+        var scratch: [64]u8 = undefined;
+        var rw = try s.respondStreaming(.{}, &scratch, .{});
+        try rw.interface.writeAll("hello ");
+        try rw.interface.writeAll("world");
+        try rw.end();
+
+        const out = h.written();
+        try testing.expect(std.mem.indexOf(u8, out, "Transfer-Encoding: chunked") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "Content-Length") == null);
+        try testing.expect(std.mem.endsWith(u8, out, "b\r\nhello world\r\n0\r\n\r\n"));
+    }
+}
+
+test "a streamed response with a known length is not chunked" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET / HTTP/1.1\r\n\r\n");
+        _ = (try s.receive()).?;
+
+        var scratch: [64]u8 = undefined;
+        var rw = try s.respondStreaming(.{}, &scratch, .{ .content_length = 11 });
+        try rw.interface.writeAll("hello world");
+        try rw.end();
+
+        const out = h.written();
+        try testing.expect(std.mem.indexOf(u8, out, "Content-Length: 11") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "chunked") == null);
+        try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\nhello world"));
+    }
+}
+
+test "writing more than the promised length is refused" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var scratch: [4]u8 = undefined;
+    var rw = try s.respondStreaming(.{}, &scratch, .{ .content_length = 4 });
+    try testing.expectError(error.WriteFailed, rw.interface.writeAll("far too much"));
+}
+
+test "stopping short of the promised length is refused" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var scratch: [64]u8 = undefined;
+    var rw = try s.respondStreaming(.{}, &scratch, .{ .content_length = 100 });
+    try rw.interface.writeAll("not enough");
+    try testing.expectError(error.WriteFailed, rw.end());
+    try testing.expect(!s.alive());
+}
+
+test "a streamed response survives a keep-alive connection" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+        _ = (try s.receive()).?;
+
+        var scratch: [64]u8 = undefined;
+        var rw = try s.respondStreaming(.{}, &scratch, .{});
+        try rw.interface.writeAll("first");
+        try rw.end();
+
+        const second = (try s.receive()).?;
+        try testing.expectEqualStrings("/b", second.target());
+    }
+}
+
+test "HEAD gets the headers and none of the body" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "HEAD /thing HTTP/1.1\r\n\r\n");
+        _ = (try s.receive()).?;
+        try s.respond(Response.text(.ok, "twelve bytes"));
+
+        const out = h.written();
+        try testing.expect(std.mem.indexOf(u8, out, "Content-Length: 12") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "twelve bytes") == null);
+        try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n"));
+    }
+}
+
+test "a streamed body is dropped for HEAD" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "HEAD / HTTP/1.1\r\n\r\n");
+        _ = (try s.receive()).?;
+
+        var scratch: [64]u8 = undefined;
+        var rw = try s.respondStreaming(.{}, &scratch, .{});
+        try rw.interface.writeAll("should not appear");
+        try rw.end();
+
+        const out = h.written();
+        try testing.expect(std.mem.indexOf(u8, out, "should not appear") == null);
+    }
+}
+
+test "many small writes become many chunks" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    // No buffer, so every write becomes its own chunk.
+    var rw = try s.respondStreaming(.{}, &.{}, .{});
+    for (0..3) |_| try rw.interface.writeAll("ab");
+    try rw.end();
+
+    try testing.expect(std.mem.endsWith(u8, h.written(), "2\r\nab\r\n2\r\nab\r\n2\r\nab\r\n0\r\n\r\n"));
 }

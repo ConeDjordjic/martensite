@@ -33,6 +33,13 @@ pub const WriteError = Io.Writer.Error || error{
 };
 
 pub fn write(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void {
+    try r.writeHead(w, options);
+    if (!r.head_only and r.status.mayHaveBody()) try w.writeAll(r.body);
+}
+
+/// Status line and headers, stopping at the blank line. Separate so a body
+/// can be streamed after it.
+pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void {
     const alive = options.keep_alive and r.keep_alive;
 
     try w.writeAll("HTTP/1.1 ");
@@ -48,13 +55,17 @@ pub fn write(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void 
         try w.writeAll("\r\n");
     }
 
-    if (!r.hasHeader("content-length") and !r.hasHeader("transfer-encoding")) {
+    // 1xx, 204 and 304 have no body, and a Content-Length on one of them is
+    // how a peer ends up reading the next response as this one's body.
+    if (r.status.mayHaveBody() and
+        !r.hasHeader("content-length") and
+        !r.hasHeader("transfer-encoding"))
+    {
         try w.print("Content-Length: {d}\r\n", .{r.body.len});
     }
     if (!alive) try w.writeAll("Connection: close\r\n");
 
     try w.writeAll("\r\n");
-    if (!r.head_only) try w.writeAll(r.body);
 }
 
 fn validName(name: []const u8) bool {
@@ -145,6 +156,16 @@ pub const Status = enum(u16) {
     http_version_not_supported = 505,
 
     _,
+
+    /// Whether a response with this status is allowed a body at all.
+    pub fn mayHaveBody(s: Status) bool {
+        const code = @intFromEnum(s);
+        if (code >= 100 and code < 200) return false;
+        return switch (s) {
+            .no_content, .not_modified => false,
+            else => true,
+        };
+    }
 
     pub fn phrase(s: Status) []const u8 {
         return switch (s) {
@@ -244,6 +265,16 @@ test "a header name has to be a token" {
         try testing.expectError(error.InvalidHeader, render(.{
             .headers = &.{.{ .name = bad, .value = "1" }},
         }, true, &buf));
+    }
+}
+
+test "statuses that cannot have a body do not get a length" {
+    var buf: [256]u8 = undefined;
+    for ([_]Status{ .@"continue", .switching_protocols, .no_content, .not_modified }) |st| {
+        const out = try render(.{ .status = st, .body = "ignored" }, true, &buf);
+        try testing.expect(std.mem.indexOf(u8, out, "Content-Length") == null);
+        try testing.expect(std.mem.indexOf(u8, out, "ignored") == null);
+        try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n"));
     }
 }
 
