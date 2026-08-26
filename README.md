@@ -134,6 +134,46 @@ to two error sets. Use `std.Io.Threaded`, which works, or a third-party
 runtime like [zio](https://github.com/lalinsky/zio) for io_uring. When the
 standard one grows sockets, nothing here has to change.
 
+## Building something on it
+
+That is what this is for, so there are two examples rather than one.
+
+`examples/hello.zig` is an ordinary server: routing by `req.target()`,
+buffered and streamed bodies, timeouts.
+
+`examples/websocket.zig` is a WebSocket echo server in about 150 lines,
+including the framing. The handshake arrives as an ordinary request, and
+`upgrade` hands the socket over:
+
+```zig
+const proto = req.upgradeTo() orelse return notAnUpgrade();
+try http.upgrade(.{
+    .status = .switching_protocols,
+    .headers = &.{
+        .{ .name = "Upgrade", .value = "websocket" },
+        .{ .name = "Connection", .value = "Upgrade" },
+        .{ .name = "Sec-WebSocket-Accept", .value = accept },
+    },
+});
+// The reader and writer are yours from here.
+```
+
+Clients usually send their first frame without waiting for the 101, and
+those bytes are still sitting in the reader after the handover.
+`examples/websocket.zig` is a working echo server with framing.
+
+## Responses you do not have the length of
+
+```zig
+var rw = try http.respondStreaming(.{}, &scratch, .{});
+try rw.interface.print("event: tick\ndata: {d}\n\n", .{n});
+try rw.end();
+```
+
+Chunked when you do not pass a length, plain when you do — and if you do, a
+body that runs over or stops short is `error.WriteFailed` rather than
+something the peer reads as part of the next response.
+
 ## Correctness
 
 ```

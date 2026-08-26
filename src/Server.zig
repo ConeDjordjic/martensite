@@ -29,6 +29,8 @@ keep_alive: bool = true,
 answered: bool = true,
 /// The request was a HEAD, so a body must be described and not sent.
 head_only: bool = false,
+/// Another protocol owns the connection now.
+handed_over: bool = false,
 /// The peer said Expect: 100-continue and is waiting to be told to go
 /// ahead. Cleared once it has been.
 expect_continue: bool = false,
@@ -64,6 +66,18 @@ pub const Request = struct {
     framing: body.Framing,
     owner: *const Server,
     generation: u32,
+
+    /// The peer asked to switch protocols and named one. Whether the name
+    /// is one you implement is your business.
+    ///
+    /// Requires `Connection: upgrade` as well as an `Upgrade` header, since
+    /// an Upgrade on its own is a hop-by-hop header a proxy may have left
+    /// behind.
+    pub fn upgradeTo(r: Request) ?[]const u8 {
+        r.check();
+        if (!connectionHas(r.head, "upgrade")) return null;
+        return r.header("upgrade");
+    }
 
     /// The peer is holding the body back until it hears 100 Continue.
     /// Reading the body sends it. Answering without reading does not, which
@@ -125,6 +139,7 @@ pub const ReceiveError = error{
 /// Reads the next request head, or null if the peer closed cleanly. An
 /// unread body left over from the last request gets dropped first.
 pub fn receive(s: *Server) ReceiveError!?Request {
+    if (s.handed_over) return null;
     if (!s.keep_alive) return null;
     try s.finishPrevious();
 
@@ -293,6 +308,19 @@ pub fn bodyReader(s: *Server, scratch: []u8) Io.Writer.Error!BodyReader {
         .finished = s.pending == .none,
         .err = null,
     };
+}
+
+/// Whether the Connection header lists `token`. It is a comma separated
+/// list, so a substring search would match Upgrade inside a longer word.
+fn connectionHas(head: scan.Head, token: []const u8) bool {
+    for (head.headers) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "connection")) continue;
+        var it = std.mem.splitScalar(u8, h.value, ',');
+        while (it.next()) |raw| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw, " \t"), token)) return true;
+        }
+    }
+    return false;
 }
 
 /// Tells a waiting peer to send its body. `readBody` and `bodyReader`
@@ -525,7 +553,31 @@ pub const ResponseWriter = struct {
 /// Can the connection carry another request? False while a streamed
 /// response is still open.
 pub fn alive(s: *const Server) bool {
-    return s.keep_alive;
+    return s.keep_alive and !s.handed_over;
+}
+
+/// Answers the handshake and stops treating the connection as HTTP.
+///
+/// Anything the peer sent after the head is still sitting in the reader,
+/// since clients often send their first frame without waiting for the
+/// 101.
+pub fn upgrade(s: *Server, response: Response) SendError!void {
+    s.reader.toss(s.head_len);
+    s.head_len = 0;
+    s.pending = .none;
+
+    var r = response;
+    r.keep_alive = true;
+    try r.write(s.writer, .{ .keep_alive = true });
+    try s.writer.flush();
+
+    s.answered = true;
+    s.handed_over = true;
+}
+
+/// Has it been handed to another protocol?
+pub fn handedOver(s: *const Server) bool {
+    return s.handed_over;
 }
 
 /// Copies the head out of the reader's buffer and re-points every slice in
@@ -1154,4 +1206,63 @@ test "many small writes become many chunks" {
     try rw.end();
 
     try testing.expect(std.mem.endsWith(u8, h.written(), "2\r\nab\r\n2\r\nab\r\n2\r\nab\r\n0\r\n\r\n"));
+}
+
+test "an upgrade request is recognised" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+        const req = (try s.receive()).?;
+        try testing.expectEqualStrings("websocket", req.upgradeTo().?);
+    }
+}
+
+test "Upgrade without Connection: upgrade is not one" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET / HTTP/1.1\r\nUpgrade: websocket\r\n\r\n");
+        const req = (try s.receive()).?;
+        try testing.expectEqual(@as(?[]const u8, null), req.upgradeTo());
+    }
+}
+
+test "Connection: keep-alive, Upgrade counts" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET / HTTP/1.1\r\nConnection: keep-alive, Upgrade\r\nUpgrade: h2c\r\n\r\n");
+        const req = (try s.receive()).?;
+        try testing.expectEqualStrings("h2c", req.upgradeTo().?);
+    }
+}
+
+test "upgrading hands the connection over" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nFRAMEBYTES");
+
+        const req = (try s.receive()).?;
+        try testing.expectEqualStrings("websocket", req.upgradeTo().?);
+
+        try s.upgrade(.{
+            .status = .switching_protocols,
+            .headers = &.{
+                .{ .name = "Upgrade", .value = "websocket" },
+                .{ .name = "Connection", .value = "Upgrade" },
+            },
+        });
+
+        const out = h.written();
+        try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 101 Switching Protocols\r\n"));
+        try testing.expect(std.mem.indexOf(u8, out, "Content-Length") == null);
+        try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n"));
+
+        try testing.expect(s.handedOver());
+        try testing.expect(!s.alive());
+        try testing.expectEqual(@as(?Request, null), try s.receive());
+
+        // Bytes sent before the 101 are still there for the new owner.
+        var rest: [32]u8 = undefined;
+        const n = try s.reader.readSliceShort(&rest);
+        try testing.expectEqualStrings("FRAMEBYTES", rest[0..n]);
+    }
 }
