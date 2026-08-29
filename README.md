@@ -134,6 +134,24 @@ to two error sets. Use `std.Io.Threaded`, which works, or a third-party
 runtime like [zio](https://github.com/lalinsky/zio) for io_uring. When the
 standard one grows sockets, nothing here has to change.
 
+## What a router needs
+
+```zig
+const t = req.parsedTarget() orelse return badRequest();
+// t.path is "/users/7", t.query is "tab=posts", t.form says which shape
+// the client used, t.authority is set for the absolute form a proxy sees.
+
+var pairs: martensite.target.Pairs = .init(t.query);
+while (pairs.next()) |p| { ... }
+
+var buf: [256]u8 = undefined;
+const decoded = try martensite.target.decode(t.path, &buf);
+```
+
+`decode` leaves `+` alone. It only means space in a form body, and
+decoding it inside a path breaks filenames. For headers that can show up
+more than once, `req.headerIter(name)` walks all of them.
+
 ## Building something on it
 
 That is what this is for, so there are two examples rather than one.
@@ -178,7 +196,14 @@ something the peer reads as part of the next response.
 
 ```
 zig build test
+zig build test -Dtest-filter="real socket"
 ```
+
+Some of those run over a real loopback socket rather than a buffer, because
+the buffer-backed ones are fast and have let three real bugs through: a head
+read after the buffer moved under it, a decode into read-only memory, and a
+reader that returned a message count where a byte count was wanted. Each was
+found by hand with curl, which is not a test suite.
 
 Responses get the same treatment in the other direction: a header name that
 is not a token, or a value carrying CR, LF or NUL, is `error.InvalidHeader`

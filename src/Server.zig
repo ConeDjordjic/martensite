@@ -10,6 +10,7 @@ const Io = std.Io;
 const scan = @import("scan.zig");
 const body = @import("body.zig");
 const chunked = @import("chunked.zig");
+const target_mod = @import("target.zig");
 const Response = @import("Response.zig");
 
 const Server = @This();
@@ -95,6 +96,21 @@ pub const Request = struct {
     pub fn target(r: Request) []const u8 {
         r.check();
         return r.head.target;
+    }
+
+    /// The request-target taken apart: path without the query, query,
+    /// and the authority when the client sent an absolute form.
+    /// Null if the target is not a shape HTTP allows.
+    pub fn parsedTarget(r: Request) ?target_mod.Target {
+        r.check();
+        return target_mod.parse(r.head.target);
+    }
+
+    /// Walks every header with this name, not just the first. Set-Cookie
+    /// and Accept both legitimately repeat.
+    pub fn headerIter(r: Request, name: []const u8) HeaderIterator {
+        r.check();
+        return .{ .rest = r.head.headers, .name = name };
     }
 
     pub fn headers(r: Request) []const scan.Header {
@@ -309,6 +325,20 @@ pub fn bodyReader(s: *Server, scratch: []u8) Io.Writer.Error!BodyReader {
         .err = null,
     };
 }
+
+pub const HeaderIterator = struct {
+    rest: []const scan.Header,
+    name: []const u8,
+
+    pub fn next(it: *HeaderIterator) ?[]const u8 {
+        while (it.rest.len != 0) {
+            const h = it.rest[0];
+            it.rest = it.rest[1..];
+            if (std.ascii.eqlIgnoreCase(h.name, it.name)) return h.value;
+        }
+        return null;
+    }
+};
 
 /// Whether the Connection header lists `token`. It is a comma separated
 /// list, so a substring search would match Upgrade inside a longer word.
@@ -1264,5 +1294,35 @@ test "upgrading hands the connection over" {
         var rest: [32]u8 = undefined;
         const n = try s.reader.readSliceShort(&rest);
         try testing.expectEqualStrings("FRAMEBYTES", rest[0..n]);
+    }
+}
+
+test "the target comes apart" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET /users/7?tab=posts&page=2 HTTP/1.1\r\n\r\n");
+        const req = (try s.receive()).?;
+        const t = req.parsedTarget().?;
+        try testing.expectEqualStrings("/users/7", t.path);
+        try testing.expectEqualStrings("tab=posts&page=2", t.query);
+
+        var pairs: martensite_target.Pairs = .init(t.query);
+        try testing.expectEqualStrings("tab", pairs.next().?.name);
+        try testing.expectEqualStrings("2", pairs.next().?.value);
+    }
+}
+
+const martensite_target = @import("target.zig");
+
+test "repeated headers all come back" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET / HTTP/1.1\r\nAccept: a\r\nX: 1\r\nAccept: b\r\n\r\n");
+        const req = (try s.receive()).?;
+
+        var it = req.headerIter("accept");
+        try testing.expectEqualStrings("a", it.next().?);
+        try testing.expectEqualStrings("b", it.next().?);
+        try testing.expectEqual(@as(?[]const u8, null), it.next());
     }
 }

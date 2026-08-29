@@ -6,6 +6,7 @@
 pub const scan = @import("scan.zig");
 pub const chunked = @import("chunked.zig");
 pub const body = @import("body.zig");
+pub const target = @import("target.zig");
 
 pub const Response = @import("Response.zig");
 pub const Server = @import("Server.zig");
@@ -19,7 +20,9 @@ test {
     _ = scan;
     _ = chunked;
     _ = body;
+    _ = target;
     _ = Response;
     _ = Server;
     _ = TimedReader;
+    _ = @import("integration_test.zig");
 }

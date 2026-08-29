@@ -16,7 +16,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    const tests = b.addTest(.{ .root_module = test_mod });
+    const filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this");
+    const tests = b.addTest(.{
+        .root_module = test_mod,
+        .filters = if (filter) |f| &.{f} else &.{},
+    });
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run the tests").dependOn(&run_tests.step);
 
