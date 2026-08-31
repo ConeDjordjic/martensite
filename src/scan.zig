@@ -8,6 +8,41 @@ pub const Header = struct {
     value: []const u8,
 };
 
+/// The methods we have names for. Anything else is still valid, and
+/// `head.method` always has the raw bytes.
+pub const Method = enum {
+    GET,
+    HEAD,
+    POST,
+    PUT,
+    DELETE,
+    CONNECT,
+    OPTIONS,
+    TRACE,
+    PATCH,
+
+    /// Null if it isn't one of the above.
+    pub fn parse(bytes: []const u8) ?Method {
+        return switch (bytes.len) {
+            3 => if (eq(bytes, "GET")) .GET else if (eq(bytes, "PUT")) .PUT else null,
+            4 => if (eq(bytes, "POST")) .POST else if (eq(bytes, "HEAD")) .HEAD else null,
+            5 => if (eq(bytes, "PATCH")) .PATCH else if (eq(bytes, "TRACE")) .TRACE else null,
+            6 => if (eq(bytes, "DELETE")) .DELETE else null,
+            7 => if (eq(bytes, "CONNECT")) .CONNECT else if (eq(bytes, "OPTIONS")) .OPTIONS else null,
+            else => null,
+        };
+    }
+
+    /// A HEAD response describes a body without sending one.
+    pub fn expectsBody(m: Method) bool {
+        return m != .HEAD;
+    }
+
+    fn eq(a: []const u8, comptime b: []const u8) bool {
+        return std.mem.eql(u8, a, b);
+    }
+};
+
 pub const Head = struct {
     method: []const u8,
     target: []const u8,
@@ -224,6 +259,18 @@ fn findTerminator(bytes: []const u8, last_len: usize) ?usize {
 }
 
 const testing = std.testing;
+
+test "methods" {
+    try testing.expectEqual(Method.GET, Method.parse("GET").?);
+    try testing.expectEqual(Method.OPTIONS, Method.parse("OPTIONS").?);
+    try testing.expectEqual(Method.PATCH, Method.parse("PATCH").?);
+    // Methods are case sensitive.
+    try testing.expectEqual(@as(?Method, null), Method.parse("get"));
+    try testing.expectEqual(@as(?Method, null), Method.parse("PROPFIND"));
+    try testing.expectEqual(@as(?Method, null), Method.parse(""));
+    try testing.expect(!Method.HEAD.expectsBody());
+    try testing.expect(Method.GET.expectsBody());
+}
 
 test "a plain GET" {
     var headers: [8]Header = undefined;

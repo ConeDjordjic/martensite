@@ -113,6 +113,24 @@ pub fn json(status: Status, s: []const u8) Response {
     };
 }
 
+pub fn html(status: Status, s: []const u8) Response {
+    return .{
+        .status = status,
+        .headers = &.{.{ .name = "Content-Type", .value = "text/html; charset=utf-8" }},
+        .body = s,
+    };
+}
+
+/// `storage` holds the Location header and has to outlive the write.
+///
+/// It is a parameter because a header array built from a runtime value
+/// lives on the stack of whatever built it. `text` and `json` get away with
+/// returning one only because everything in theirs is comptime known.
+pub fn redirect(status: Status, location: []const u8, storage: *[1]Header) Response {
+    storage[0] = .{ .name = "Location", .value = location };
+    return .{ .status = status, .headers = storage };
+}
+
 pub const Status = enum(u16) {
     @"continue" = 100,
     switching_protocols = 101,
@@ -276,6 +294,25 @@ test "statuses that cannot have a body do not get a length" {
         try testing.expect(std.mem.indexOf(u8, out, "ignored") == null);
         try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n"));
     }
+}
+
+test "redirect" {
+    var buf: [256]u8 = undefined;
+    var storage: [1]Header = undefined;
+    const out = try render(Response.redirect(.see_other, "/after", &storage), true, &buf);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 303 See Other\r\nLocation: /after\r\nContent-Length: 0\r\n\r\n",
+        out,
+    );
+}
+
+test "a location with a newline in it is refused" {
+    var buf: [256]u8 = undefined;
+    var storage: [1]Header = undefined;
+    try testing.expectError(
+        error.InvalidHeader,
+        render(Response.redirect(.found, "/a\r\nSet-Cookie: x=1", &storage), true, &buf),
+    );
 }
 
 test "an unnamed status still writes" {

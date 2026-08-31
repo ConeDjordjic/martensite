@@ -93,6 +93,13 @@ pub const Request = struct {
         return r.head.method;
     }
 
+    /// The method as an enum, or null for one martensite does not name.
+    /// `method()` always has the bytes.
+    pub fn knownMethod(r: Request) ?scan.Method {
+        r.check();
+        return scan.Method.parse(r.head.method);
+    }
+
     pub fn target(r: Request) []const u8 {
         r.check();
         return r.head.target;
@@ -1324,5 +1331,15 @@ test "repeated headers all come back" {
         try testing.expectEqualStrings("a", it.next().?);
         try testing.expectEqualStrings("b", it.next().?);
         try testing.expectEqual(@as(?[]const u8, null), it.next());
+    }
+}
+
+test "the method comes back as an enum when it is one we name" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "PROPFIND / HTTP/1.1\r\n\r\n");
+        const req = (try s.receive()).?;
+        try testing.expectEqual(@as(?scan.Method, null), req.knownMethod());
+        try testing.expectEqualStrings("PROPFIND", req.method());
     }
 }

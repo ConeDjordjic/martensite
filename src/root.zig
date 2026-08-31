@@ -14,6 +14,7 @@ pub const TimedReader = @import("TimedReader.zig");
 
 pub const Header = scan.Header;
 pub const Head = scan.Head;
+pub const Method = scan.Method;
 pub const Status = Response.Status;
 
 test {
