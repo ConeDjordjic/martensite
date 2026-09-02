@@ -238,7 +238,9 @@ pub const BodyReader = struct {
         while (true) {
             const buffered = s.reader.buffered();
             if (buffered.len != 0) switch (s.pending) {
-                .none => unreachable,
+                // A request body is never close-delimited: the connection
+                // closing is the client going away, not a framing device.
+                .none, .until_close => unreachable,
                 .length => {
                     const take = @min(@as(u64, limit.minInt(buffered.len)), b.left);
                     const n: usize = @intCast(take);
@@ -403,7 +405,7 @@ pub fn readBody(s: *Server, buf: []u8) (BodyError || Io.Writer.Error || error{Bo
     s.head_len = 0;
 
     switch (s.pending) {
-        .none => unreachable,
+        .none, .until_close => unreachable,
         .length => |n| {
             if (n > buf.len) return error.BodyTooLarge;
             const want: usize = @intCast(n);

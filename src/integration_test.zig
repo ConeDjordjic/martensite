@@ -384,3 +384,75 @@ test "100-continue over a real socket" {
         }
     }.f);
 }
+
+test "the client talks to the server over a real socket" {
+    const io = testing.io;
+    try exchange(io, 40100, plainHandler, struct {
+        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
+            const stream = address.connect(inner, .{ .mode = .stream }) catch return;
+            defer stream.close(inner);
+
+            var rbuf: [4096]u8 = undefined;
+            var wbuf: [4096]u8 = undefined;
+            var headers: [32]martensite.Header = undefined;
+            var head_buf: [2048]u8 = undefined;
+
+            var reader = stream.reader(inner, &rbuf);
+            var writer = stream.writer(inner, &wbuf);
+            var client: martensite.Client = .init(inner, &reader.interface, &writer.interface, .{
+                .headers = &headers,
+                .head_buf = &head_buf,
+            });
+
+            // Two requests down one connection, echoing a body on the second.
+            client.send(.{ .target = "/first", .headers = &.{
+                .{ .name = "Host", .value = "x" },
+            } }) catch return;
+            const first = (client.receive() catch return) orelse return;
+            std.debug.assert(first.status() == 200);
+            var buf: [256]u8 = undefined;
+            const b1 = client.readBody(&buf) catch return;
+            std.debug.assert(std.mem.eql(u8, b1, "/first"));
+
+            client.send(.{
+                .method = "POST",
+                .target = "/echo",
+                .headers = &.{.{ .name = "Host", .value = "x" }},
+                .body = "round trip",
+            }) catch return;
+            const second = (client.receive() catch return) orelse return;
+            std.debug.assert(second.status() == 200);
+            const b2 = client.readBody(&buf) catch return;
+            std.debug.assert(std.mem.eql(u8, b2, "round trip"));
+        }
+    }.f);
+}
+
+test "the client reads a chunked response from the server" {
+    const io = testing.io;
+    try exchange(io, 40200, plainHandler, struct {
+        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
+            const stream = address.connect(inner, .{ .mode = .stream }) catch return;
+            defer stream.close(inner);
+
+            var rbuf: [4096]u8 = undefined;
+            var wbuf: [4096]u8 = undefined;
+            var headers: [32]martensite.Header = undefined;
+            var head_buf: [2048]u8 = undefined;
+
+            var reader = stream.reader(inner, &rbuf);
+            var writer = stream.writer(inner, &wbuf);
+            var client: martensite.Client = .init(inner, &reader.interface, &writer.interface, .{
+                .headers = &headers,
+                .head_buf = &head_buf,
+            });
+
+            client.send(.{ .target = "/stream" }) catch return;
+            const res = (client.receive() catch return) orelse return;
+            std.debug.assert(std.mem.eql(u8, res.header("transfer-encoding").?, "chunked"));
+            var buf: [256]u8 = undefined;
+            const b = client.readBody(&buf) catch return;
+            std.debug.assert(std.mem.eql(u8, b, "0,1,2,3,4,"));
+        }
+    }.f);
+}

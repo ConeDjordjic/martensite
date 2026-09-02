@@ -10,6 +10,7 @@ pub const target = @import("target.zig");
 
 pub const Response = @import("Response.zig");
 pub const Server = @import("Server.zig");
+pub const Client = @import("Client.zig");
 pub const TimedReader = @import("TimedReader.zig");
 
 pub const Header = scan.Header;
@@ -24,6 +25,7 @@ test {
     _ = target;
     _ = Response;
     _ = Server;
+    _ = Client;
     _ = TimedReader;
     _ = @import("integration_test.zig");
 }

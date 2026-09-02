@@ -56,6 +56,20 @@ pub const Scanned = struct {
     len: usize,
 };
 
+/// A response head. The reason phrase is whatever the server sent, and
+/// it can be empty.
+pub const ResponseHead = struct {
+    status: u16,
+    reason: []const u8,
+    minor_version: u8,
+    headers: []const Header,
+};
+
+pub const ScannedResponse = struct {
+    head: ResponseHead,
+    len: usize,
+};
+
 pub const Error = error{
     /// These bytes are never going to be a head.
     Invalid,
@@ -92,6 +106,67 @@ pub fn request(bytes: []const u8, headers: []Header, last_len: usize) Error!?Sca
                 .head = .{
                     .method = method,
                     .target = target,
+                    .minor_version = minor_version,
+                    .headers = headers[0..n],
+                },
+                .len = s.i,
+            };
+        }
+        if (n == headers.len) return error.TooManyHeaders;
+        headers[n] = try s.header() orelse return null;
+        n += 1;
+    }
+}
+
+/// Scans a response head. Same rules as `request`.
+pub fn response(bytes: []const u8, headers: []Header, last_len: usize) Error!?ScannedResponse {
+    if (last_len != 0 and findTerminator(bytes, last_len) == null) return null;
+
+    var s: Scanner = .{ .bytes = bytes };
+
+    const minor_version = try s.version() orelse return null;
+    if (s.i >= bytes.len) return null;
+    if (bytes[s.i] != ' ') return error.Invalid;
+    s.i += 1;
+
+    if (bytes.len - s.i < 3) {
+        for (bytes[s.i..]) |c| if (c < '0' or c > '9') return error.Invalid;
+        return null;
+    }
+    var status: u16 = 0;
+    for (bytes[s.i..][0..3]) |c| {
+        if (c < '0' or c > '9') return error.Invalid;
+        status = status * 10 + (c - '0');
+    }
+    s.i += 3;
+
+    // The reason phrase is optional.
+    var reason: []const u8 = "";
+    if (s.i < bytes.len and bytes[s.i] == ' ') {
+        s.i += 1;
+        const start = s.i;
+        while (true) {
+            if (s.i >= bytes.len) return null;
+            const c = bytes[s.i];
+            if (c == '\r' or c == '\n') break;
+            // Printable plus tab. Reason phrases have spaces in them.
+            if (c < 0x20 and c != '\t') return error.Invalid;
+            if (c == 0x7f) return error.Invalid;
+            s.i += 1;
+        }
+        reason = bytes[start..s.i];
+    }
+    if (!try s.crlf()) return null;
+
+    var n: usize = 0;
+    while (true) {
+        if (s.i >= bytes.len) return null;
+        if (bytes[s.i] == '\r' or bytes[s.i] == '\n') {
+            if (!try s.crlf()) return null;
+            return .{
+                .head = .{
+                    .status = status,
+                    .reason = reason,
                     .minor_version = minor_version,
                     .headers = headers[0..n],
                 },
@@ -361,6 +436,56 @@ test "last_len skips what was already scanned" {
     try testing.expectEqual(@as(?Scanned, null), try request(partial, &headers, 0));
     const s = (try request(whole, &headers, partial.len)).?;
     try testing.expectEqual(whole.len, s.len);
+}
+
+test "a plain response" {
+    var headers: [8]Header = undefined;
+    const bytes = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+    const r = (try response(bytes, &headers, 0)).?;
+    try testing.expectEqual(@as(u16, 200), r.head.status);
+    try testing.expectEqualStrings("OK", r.head.reason);
+    try testing.expectEqual(@as(u8, 1), r.head.minor_version);
+    try testing.expectEqualStrings("3", r.head.headers[0].value);
+    try testing.expectEqualStrings("abc", bytes[r.len..]);
+}
+
+test "a reason phrase with spaces in it" {
+    var headers: [8]Header = undefined;
+    const r = (try response("HTTP/1.1 404 Not Found Here\r\n\r\n", &headers, 0)).?;
+    try testing.expectEqualStrings("Not Found Here", r.head.reason);
+}
+
+test "no reason phrase at all" {
+    var headers: [8]Header = undefined;
+    const r = (try response("HTTP/1.1 204\r\n\r\n", &headers, 0)).?;
+    try testing.expectEqual(@as(u16, 204), r.head.status);
+    try testing.expectEqualStrings("", r.head.reason);
+}
+
+test "an empty reason phrase after the space" {
+    var headers: [8]Header = undefined;
+    const r = (try response("HTTP/1.1 200 \r\n\r\n", &headers, 0)).?;
+    try testing.expectEqualStrings("", r.head.reason);
+}
+
+test "responses incomplete at every prefix" {
+    const bytes = "HTTP/1.1 301 Moved\r\nLocation: /x\r\n\r\n";
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        var headers: [8]Header = undefined;
+        try testing.expectEqual(@as(?ScannedResponse, null), try response(bytes[0..i], &headers, 0));
+    }
+}
+
+test "responses that are not" {
+    var headers: [8]Header = undefined;
+    for ([_][]const u8{
+        "HTTP/1.1 2000 OK\r\n\r\n",
+        "HTTP/1.1 20 OK\r\n\r\n",
+        "HTTP/1.1 abc OK\r\n\r\n",
+        "HTTP/1.1200 OK\r\n\r\n",
+        "GET / HTTP/1.1\r\n\r\n",
+    }) |c| try testing.expectError(error.Invalid, response(c, &headers, 0));
 }
 
 // The only two places we are stricter than a permissive parser. A test
