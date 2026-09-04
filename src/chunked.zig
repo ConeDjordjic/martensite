@@ -21,6 +21,14 @@ pub const Decoder = struct {
     /// decoding stops at the last chunk and the trailers stay in the buffer.
     consume_trailer: bool = false,
     hex_digits: u8 = 0,
+    /// Trailers get copied here as they arrive, because the input comes
+    /// in whatever pieces the socket gives us. Leave it empty to drop
+    /// them.
+    trailer_buf: []u8 = &.{},
+    /// How much of `trailer_buf` is used. If it overflows we drop the
+    /// rest instead of failing, and set `trailers_truncated` so nobody
+    /// mistakes a short set for a complete one.
+    trailer_len: usize = 0,
 
     const State = enum {
         size,
@@ -30,6 +38,7 @@ pub const Decoder = struct {
         data_cr,
         data_lf,
         trailer,
+        trailer_mid,
         trailer_cr,
         done,
     };
@@ -43,6 +52,8 @@ pub const Decoder = struct {
         /// message.
         leftover: usize,
         done: bool,
+        /// The trailer lines, raw. Points into `trailer_buf`.
+        trailers: []const u8 = "",
     };
 
     /// Decodes `buf` in place. Call it again with more bytes to carry on.
@@ -116,6 +127,9 @@ pub const Decoder = struct {
                     src += 1;
                     d.state = .size;
                 },
+                // A CR at the start of a trailer line is the blank
+                // line that ends the set. In the middle of a line it
+                // isn't. That is why there are two states.
                 .trailer => {
                     const c = buf[src];
                     if (c == '\r') {
@@ -125,15 +139,17 @@ pub const Decoder = struct {
                         src += 1;
                         d.state = .done;
                     } else {
-                        // Skip the line.
-                        while (src < buf.len and buf[src] != '\n') src += 1;
-                        if (src < buf.len) {
-                            src += 1;
-                            // A blank line after this one ends the trailers.
-                            d.state = .trailer;
-                            if (src < buf.len and (buf[src] == '\r' or buf[src] == '\n')) continue;
-                        }
+                        d.state = .trailer_mid;
                     }
+                },
+                .trailer_mid => {
+                    const start = src;
+                    while (src < buf.len and buf[src] != '\n') src += 1;
+                    if (src < buf.len) {
+                        src += 1;
+                        d.state = .trailer;
+                    }
+                    d.keep(buf[start..src]);
                 },
                 .trailer_cr => {
                     if (buf[src] != '\n') return error.Invalid;
@@ -148,7 +164,15 @@ pub const Decoder = struct {
             .decoded = dst,
             .leftover = buf.len - src,
             .done = d.state == .done,
+            .trailers = d.trailer_buf[0..d.trailer_len],
         };
+    }
+
+    fn keep(d: *Decoder, bytes: []const u8) void {
+        const room = d.trailer_buf.len - d.trailer_len;
+        const n = @min(room, bytes.len);
+        @memcpy(d.trailer_buf[d.trailer_len..][0..n], bytes[0..n]);
+        d.trailer_len += n;
     }
 
     fn afterSize(d: *Decoder) State {
@@ -236,6 +260,56 @@ test "rejects" {
 
 test "a size that cannot fit" {
     try testing.expectError(error.SizeOverflow, decodeAll("11111111111111111\r\n", false));
+}
+
+test "trailers come back when they are consumed" {
+    var buf: [128]u8 = undefined;
+    var tbuf: [128]u8 = undefined;
+    const input = "1\r\na\r\n0\r\nX-Sum: 42\r\nX-Other: y\r\n\r\n";
+    @memcpy(buf[0..input.len], input);
+    var d: Decoder = .{ .consume_trailer = true, .trailer_buf = &tbuf };
+    const r = try d.decode(buf[0..input.len]);
+    try testing.expect(r.done);
+    try testing.expectEqualStrings("a", buf[0..r.decoded]);
+    try testing.expectEqualStrings("X-Sum: 42\r\nX-Other: y\r\n", r.trailers);
+}
+
+test "trailers survive arriving one byte at a time" {
+    const input = "1\r\na\r\n0\r\nX-Sum: 42\r\nX-Other: y\r\n\r\n";
+    var buf: [128]u8 = undefined;
+    var tbuf: [128]u8 = undefined;
+    var d: Decoder = .{ .consume_trailer = true, .trailer_buf = &tbuf };
+    var out: usize = 0;
+    var last: []const u8 = "";
+    for (input) |c| {
+        buf[out] = c;
+        const r = try d.decode(buf[out .. out + 1]);
+        out += r.decoded;
+        last = r.trailers;
+    }
+    try testing.expectEqualStrings("X-Sum: 42\r\nX-Other: y\r\n", last);
+}
+
+test "no trailers is an empty slice, not a missing one" {
+    var buf: [64]u8 = undefined;
+    var tbuf: [64]u8 = undefined;
+    const input = "1\r\na\r\n0\r\n\r\n";
+    @memcpy(buf[0..input.len], input);
+    var d: Decoder = .{ .consume_trailer = true, .trailer_buf = &tbuf };
+    const r = try d.decode(buf[0..input.len]);
+    try testing.expect(r.done);
+    try testing.expectEqualStrings("", r.trailers);
+}
+
+test "trailers bigger than the buffer are dropped, not an error" {
+    var buf: [128]u8 = undefined;
+    var tbuf: [8]u8 = undefined;
+    const input = "0\r\nX-Very-Long-Name: and a long value too\r\n\r\n";
+    @memcpy(buf[0..input.len], input);
+    var d: Decoder = .{ .consume_trailer = true, .trailer_buf = &tbuf };
+    const r = try d.decode(buf[0..input.len]);
+    try testing.expect(r.done);
+    try testing.expectEqual(@as(usize, 8), r.trailers.len);
 }
 
 test "a bare LF cannot end a chunk size line" {

@@ -11,6 +11,7 @@ const scan = @import("scan.zig");
 const body = @import("body.zig");
 const chunked = @import("chunked.zig");
 const target_mod = @import("target.zig");
+const DateHeader = @import("Date.zig");
 const Response = @import("Response.zig");
 
 const Server = @This();
@@ -20,6 +21,8 @@ reader: *Io.Reader,
 writer: *Io.Writer,
 headers: []scan.Header,
 head_buf: []u8,
+trailer_buf: []u8,
+date: ?*DateHeader,
 
 /// Bytes of the current head still sitting at the front of the reader.
 head_len: usize = 0,
@@ -32,6 +35,9 @@ answered: bool = true,
 head_only: bool = false,
 /// Another protocol owns the connection now.
 handed_over: bool = false,
+/// Trailer lines the last chunked body carried, raw. Empty when there
+/// were none, and only valid until the next body read.
+trailers_raw: []const u8 = "",
 /// The peer said Expect: 100-continue and is waiting to be told to go
 /// ahead. Cleared once it has been.
 expect_continue: bool = false,
@@ -47,6 +53,12 @@ pub const Options = struct {
     /// reader past it and a later fill writes over it. Requests with no
     /// body never touch this, so it can be empty.
     head_buf: []u8 = &.{},
+    /// Holds trailer lines. Leaving it empty drops them, which is
+    /// usually fine.
+    trailer_buf: []u8 = &.{},
+    /// Pass one and responses get a Date header. It caches, so you get
+    /// one clock read per second instead of one per response.
+    date: ?*DateHeader = null,
 };
 
 pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) Server {
@@ -56,6 +68,8 @@ pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) Se
         .writer = writer,
         .headers = options.headers,
         .head_buf = options.head_buf,
+        .trailer_buf = options.trailer_buf,
+        .date = options.date,
     };
 }
 
@@ -170,6 +184,7 @@ pub fn receive(s: *Server) ReceiveError!?Request {
     s.head_len = 0;
 
     var last_len: usize = 0;
+    var filled = false;
     while (true) {
         const buffered = s.reader.buffered();
         if (buffered.len != 0) {
@@ -199,6 +214,14 @@ pub fn receive(s: *Server) ReceiveError!?Request {
                 error.TooManyHeaders => error.HeadTooLarge,
             };
             last_len = buffered.len;
+            // Incomplete, with nowhere to put the rest of it. Only once a
+            // fill has been tried, because a reader whose buffer is exactly
+            // its data looks full from the start and has simply ended.
+            //
+            // This is after the scan, not after the fill: a client that
+            // sends its head and a large body in one go fills the buffer
+            // with a head that is perfectly fine.
+            if (filled and buffered.len == s.reader.buffer.len) return error.HeadTooLarge;
         }
 
         s.reader.fillMore() catch |err| switch (err) {
@@ -209,8 +232,7 @@ pub fn receive(s: *Server) ReceiveError!?Request {
             },
             error.ReadFailed => return error.ReadFailed,
         };
-
-        if (s.reader.bufferedLen() == s.reader.buffer.len) return error.HeadTooLarge;
+        filled = true;
     }
 }
 
@@ -349,6 +371,22 @@ pub const HeaderIterator = struct {
     }
 };
 
+/// Trailer lines are header lines with a blank line after them, so the
+/// request scanner can read them with a synthetic request line in front.
+fn scanTrailers(raw: []const u8, storage: []scan.Header) scan.Error![]const scan.Header {
+    var buf: [8 * 1024]u8 = undefined;
+    const prefix = "T / HTTP/1.1\r\n";
+    // The blank line that ended the trailer section is not kept, so it has
+    // to go back on for the scanner to see a complete head.
+    const total = prefix.len + raw.len + 2;
+    if (total > buf.len) return error.TooManyHeaders;
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len..][0..raw.len], raw);
+    @memcpy(buf[prefix.len + raw.len ..][0..2], "\r\n");
+    const scanned = (try scan.request(buf[0..total], storage, 0)) orelse return error.Invalid;
+    return scanned.head.headers;
+}
+
 /// Whether the Connection header lists `token`. It is a comma separated
 /// list, so a substring search would match Upgrade inside a longer word.
 fn connectionHas(head: scan.Head, token: []const u8) bool {
@@ -417,7 +455,10 @@ pub fn readBody(s: *Server, buf: []u8) (BodyError || Io.Writer.Error || error{Bo
             return buf[0..want];
         },
         .chunked => {
-            var d: chunked.Decoder = .{ .consume_trailer = true };
+            var d: chunked.Decoder = .{
+                .consume_trailer = true,
+                .trailer_buf = s.trailer_buf,
+            };
             var out: usize = 0;
             while (true) {
                 const buffered = s.reader.buffered();
@@ -430,6 +471,7 @@ pub fn readBody(s: *Server, buf: []u8) (BodyError || Io.Writer.Error || error{Bo
                     out += r.decoded;
                     if (r.done) {
                         s.pending = .none;
+                        s.trailers_raw = r.trailers;
                         return buf[0..out];
                     }
                     if (r.leftover != 0) continue;
@@ -450,6 +492,8 @@ pub fn respond(s: *Server, r: Response) SendError!void {
     var out = r;
     // A HEAD gets the headers a GET would have got, and none of the body.
     if (s.head_only) out.head_only = true;
+    var dated: [32]Response.Header = undefined;
+    out.headers = s.withDate(r.headers, &dated) catch return error.WriteFailed;
     try out.write(s.writer, .{ .keep_alive = s.keep_alive });
     try s.writer.flush();
     s.answered = true;
@@ -474,29 +518,32 @@ pub fn respondStreaming(
 ) SendError!ResponseWriter {
     var head = r;
     head.body = "";
+    var dated: [32]Response.Header = undefined;
+    head.headers = s.withDate(r.headers, &dated) catch return error.WriteFailed;
 
     const length_header: [1]Response.Header = .{.{
         .name = "Transfer-Encoding",
         .value = "chunked",
     }};
     var with_chunked: [32]Response.Header = undefined;
+    const base = head.headers;
     if (options.content_length == null and head.status.mayHaveBody()) {
-        if (r.headers.len + 1 > with_chunked.len) return error.WriteFailed;
-        @memcpy(with_chunked[0..r.headers.len], r.headers);
-        with_chunked[r.headers.len] = length_header[0];
-        head.headers = with_chunked[0 .. r.headers.len + 1];
+        if (base.len + 1 > with_chunked.len) return error.WriteFailed;
+        @memcpy(with_chunked[0..base.len], base);
+        with_chunked[base.len] = length_header[0];
+        head.headers = with_chunked[0 .. base.len + 1];
     }
 
     var buf: [32]u8 = undefined;
     var with_length: [32]Response.Header = undefined;
     if (options.content_length) |n| {
-        if (r.headers.len + 1 > with_length.len) return error.WriteFailed;
-        @memcpy(with_length[0..r.headers.len], r.headers);
-        with_length[r.headers.len] = .{
+        if (base.len + 1 > with_length.len) return error.WriteFailed;
+        @memcpy(with_length[0..base.len], base);
+        with_length[base.len] = .{
             .name = "Content-Length",
             .value = std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable,
         };
-        head.headers = with_length[0 .. r.headers.len + 1];
+        head.headers = with_length[0 .. base.len + 1];
     }
 
     try head.writeHead(s.writer, .{ .keep_alive = s.keep_alive });
@@ -573,11 +620,28 @@ pub const ResponseWriter = struct {
 
     /// Ends the body and flushes. You have to call this.
     pub fn end(rw: *ResponseWriter) Io.Writer.Error!void {
+        return rw.endWithTrailers(&.{});
+    }
+
+    /// Terminates the body with trailers after it. Chunked only, since
+    /// there is nowhere to put them otherwise, and the peer will ignore
+    /// them unless the head announced them in a Trailer header.
+    pub fn endWithTrailers(rw: *ResponseWriter, fields: []const Response.Header) Io.Writer.Error!void {
         try rw.interface.flush();
         const out = rw.server.writer;
         switch (rw.mode) {
             .discard => {},
-            .chunked => try out.writeAll("0\r\n\r\n"),
+            .chunked => {
+                try out.writeAll("0\r\n");
+                for (fields) |f| {
+                    if (!validTrailer(f)) return error.WriteFailed;
+                    try out.writeAll(f.name);
+                    try out.writeAll(": ");
+                    try out.writeAll(f.value);
+                    try out.writeAll("\r\n");
+                }
+                try out.writeAll("\r\n");
+            },
             .length => |left| if (left != 0) {
                 // Short of what Content-Length promised: the peer would sit
                 // waiting for bytes that are not coming.
@@ -588,6 +652,47 @@ pub const ResponseWriter = struct {
         try out.flush();
     }
 };
+
+/// A trailer is a header, with the same rule about CRLF, plus the ones that
+/// may never appear after the body because something already acted on them.
+fn validTrailer(f: Response.Header) bool {
+    if (f.name.len == 0) return false;
+    for (f.name) |c| if (!scan.isTokenChar(c)) return false;
+    for (f.value) |c| {
+        if (c == '\r' or c == '\n' or c == 0) return false;
+    }
+    const forbidden = [_][]const u8{
+        "transfer-encoding", "content-length", "host",  "trailer",
+        "connection",        "te",             "range", "expect",
+    };
+    for (forbidden) |name| {
+        if (std.ascii.eqlIgnoreCase(f.name, name)) return false;
+    }
+    return true;
+}
+
+/// `headers` with a Date appended, when one was asked for and is not
+/// already there. `storage` has to outlive the write.
+fn withDate(s: *Server, headers: []const Response.Header, storage: []Response.Header) error{NoSpace}![]const Response.Header {
+    const d = s.date orelse return headers;
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "date")) return headers;
+    }
+    if (headers.len + 1 > storage.len) return error.NoSpace;
+    @memcpy(storage[0..headers.len], headers);
+    storage[headers.len] = .{ .name = "Date", .value = d.value(s.io) };
+    return storage[0 .. headers.len + 1];
+}
+
+/// Trailers the request body carried, scanned into `storage`.
+///
+/// Only chunked bodies can have them, and only after the body has been
+/// read. Empty otherwise. They are headers that arrive after the body, so
+/// nothing that decides framing or routing may be trusted from here.
+pub fn trailers(s: *Server, storage: []scan.Header) scan.Error![]const scan.Header {
+    if (s.trailers_raw.len == 0) return &.{};
+    return scanTrailers(s.trailers_raw, storage);
+}
 
 /// Can the connection carry another request? False while a streamed
 /// response is still open.
@@ -676,6 +781,7 @@ const Harness = struct {
     writer: Io.Writer,
     headers: [16]scan.Header,
     head_buf: [1024]u8,
+    trailer_buf: [512]u8,
     out: [8192]u8,
 
     fn init(h: *Harness, shape: Shape, input: []const u8) Server {
@@ -695,6 +801,7 @@ const Harness = struct {
         return .init(testing.io, reader, &h.writer, .{
             .headers = &h.headers,
             .head_buf = &h.head_buf,
+            .trailer_buf = &h.trailer_buf,
         });
     }
 
@@ -1344,4 +1451,163 @@ test "the method comes back as an enum when it is one we name" {
         try testing.expectEqual(@as(?scan.Method, null), req.knownMethod());
         try testing.expectEqualStrings("PROPFIND", req.method());
     }
+}
+
+test "request trailers" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(
+            shape,
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sum\r\n\r\n" ++
+                "5\r\nhello\r\n0\r\nX-Sum: 42\r\nX-Other: y\r\n\r\n",
+        );
+        _ = (try s.receive()).?;
+
+        var buf: [64]u8 = undefined;
+        try testing.expectEqualStrings("hello", try s.readBody(&buf));
+
+        var storage: [8]scan.Header = undefined;
+        const t = try s.trailers(&storage);
+        try testing.expectEqual(@as(usize, 2), t.len);
+        try testing.expectEqualStrings("X-Sum", t[0].name);
+        try testing.expectEqualStrings("42", t[0].value);
+        try testing.expectEqualStrings("y", t[1].value);
+    }
+}
+
+test "no trailers is an empty slice" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n");
+        _ = (try s.receive()).?;
+        var buf: [64]u8 = undefined;
+        _ = try s.readBody(&buf);
+        var storage: [8]scan.Header = undefined;
+        try testing.expectEqual(@as(usize, 0), (try s.trailers(&storage)).len);
+    }
+}
+
+test "writing trailers on a streamed response" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var scratch: [64]u8 = undefined;
+    var rw = try s.respondStreaming(.{
+        .headers = &.{.{ .name = "Trailer", .value = "X-Sum" }},
+    }, &scratch, .{});
+    try rw.interface.writeAll("body");
+    try rw.endWithTrailers(&.{.{ .name = "X-Sum", .value = "42" }});
+
+    try testing.expect(std.mem.endsWith(u8, h.written(), "4\r\nbody\r\n0\r\nX-Sum: 42\r\n\r\n"));
+}
+
+test "a trailer that would change the framing is refused" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var scratch: [64]u8 = undefined;
+    var rw = try s.respondStreaming(.{}, &scratch, .{});
+    try rw.interface.writeAll("body");
+    for ([_][]const u8{ "Content-Length", "Transfer-Encoding", "Connection", "Host" }) |name| {
+        try testing.expectError(
+            error.WriteFailed,
+            rw.endWithTrailers(&.{.{ .name = name, .value = "1" }}),
+        );
+    }
+}
+
+test "a Date header when one is asked for" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var date: DateHeader = .{};
+    s.date = &date;
+    _ = (try s.receive()).?;
+    try s.respond(.text(.ok, "hi"));
+
+    const out = h.written();
+    const at = std.mem.indexOf(u8, out, "Date: ").?;
+    try testing.expectEqualStrings(" GMT\r\n", out[at + 6 + 25 ..][0..6]);
+}
+
+test "no Date unless one is asked for" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+    try s.respond(.text(.ok, "hi"));
+    try testing.expect(std.mem.indexOf(u8, h.written(), "Date:") == null);
+}
+
+test "a caller's own Date is left alone" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var date: DateHeader = .{};
+    s.date = &date;
+    _ = (try s.receive()).?;
+    try s.respond(.{
+        .headers = &.{.{ .name = "Date", .value = "Sun, 06 Nov 1994 08:49:37 GMT" }},
+    });
+    const out = h.written();
+    try testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", out[std.mem.indexOf(u8, out, "Date: ").? + 6 ..][0..29]);
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOfPos(u8, out, std.mem.indexOf(u8, out, "Date:").? + 1, "Date:"));
+}
+
+test "a streamed response gets a Date too" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var date: DateHeader = .{};
+    s.date = &date;
+    _ = (try s.receive()).?;
+
+    var scratch: [64]u8 = undefined;
+    var rw = try s.respondStreaming(.{}, &scratch, .{});
+    try rw.interface.writeAll("x");
+    try rw.end();
+
+    const out = h.written();
+    try testing.expect(std.mem.indexOf(u8, out, "Date: ") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Transfer-Encoding: chunked") != null);
+}
+
+test "a head sent together with a body that fills the buffer" {
+    // No Expect, so the client sends it all at once and the read buffer
+    // fills up with a head that is perfectly fine.
+    const body_len = 4000;
+    var input: [4200]u8 = undefined;
+    var w: Io.Writer = .fixed(&input);
+    try w.print("POST /upload HTTP/1.1\r\nContent-Length: {d}\r\n\r\n", .{body_len});
+    try w.splatByteAll('x', body_len);
+
+    var buf: [512]u8 = undefined;
+    var src: std.testing.Reader = .init(&buf, &.{.{ .buffer = w.buffered() }});
+    var out: [512]u8 = undefined;
+    var ow: Io.Writer = .fixed(&out);
+    var headers: [8]scan.Header = undefined;
+    var head_buf: [512]u8 = undefined;
+    var s: Server = .init(testing.io, &src.interface, &ow, .{
+        .headers = &headers,
+        .head_buf = &head_buf,
+    });
+
+    const req = (try s.receive()).?;
+    try testing.expectEqualStrings("/upload", req.target());
+
+    var sink: [64]u8 = undefined;
+    var scratch: [64]u8 = undefined;
+    var counter: Io.Writer.Discarding = .init(&sink);
+    var b = try s.bodyReader(&scratch);
+    _ = try b.interface.streamRemaining(&counter.writer);
+    try testing.expectEqual(@as(u64, body_len), counter.count + counter.writer.end);
+}
+
+test "a head that genuinely does not fit is still refused" {
+    const long = "GET / HTTP/1.1\r\n" ++ ("X-Padding-Header: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n" ** 40) ++ "\r\n";
+    var buf: [256]u8 = undefined;
+    var src: std.testing.Reader = .init(&buf, &.{.{ .buffer = long }});
+    var out: [256]u8 = undefined;
+    var ow: Io.Writer = .fixed(&out);
+    var headers: [64]scan.Header = undefined;
+    var s: Server = .init(testing.io, &src.interface, &ow, .{ .headers = &headers });
+    try testing.expectError(error.HeadTooLarge, s.receive());
 }

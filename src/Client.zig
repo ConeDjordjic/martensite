@@ -153,6 +153,7 @@ pub fn receive(c: *Client) ReceiveError!?Response {
     c.head_len = 0;
 
     var last_len: usize = 0;
+    var filled = false;
     while (true) {
         const buffered = c.reader.buffered();
         if (buffered.len != 0) {
@@ -178,6 +179,14 @@ pub fn receive(c: *Client) ReceiveError!?Response {
                 error.TooManyHeaders => error.HeadTooLarge,
             };
             last_len = buffered.len;
+            // Incomplete, with nowhere to put the rest of it. Only once a
+            // fill has been tried, because a reader whose buffer is exactly
+            // its data looks full from the start and has simply ended.
+            //
+            // This is after the scan, not after the fill: a client that
+            // sends its head and a large body in one go fills the buffer
+            // with a head that is perfectly fine.
+            if (filled and buffered.len == c.reader.buffer.len) return error.HeadTooLarge;
         }
 
         c.reader.fillMore() catch |err| switch (err) {
@@ -187,8 +196,7 @@ pub fn receive(c: *Client) ReceiveError!?Response {
             },
             error.ReadFailed => return error.ReadFailed,
         };
-
-        if (c.reader.bufferedLen() == c.reader.buffer.len) return error.HeadTooLarge;
+        filled = true;
     }
 }
 

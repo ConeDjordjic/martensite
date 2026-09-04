@@ -134,6 +134,41 @@ to two error sets. Use `std.Io.Threaded`, which works, or a third-party
 runtime like [zio](https://github.com/lalinsky/zio) for io_uring. When the
 standard one grows sockets, nothing here has to change.
 
+## The client half
+
+Same shape as the server, same rules, and it is handed a reader and a writer
+rather than opening anything. No name resolution, no redirect following, no
+connection pool: those belong to a client library, not to the protocol.
+
+```zig
+var client: martensite.Client = .init(io, &reader.interface, &writer.interface, .{
+    .headers = &headers,
+    .head_buf = &head_buf,
+});
+try client.send(.{ .method = "POST", .target = "/things", .body = payload });
+const res = (try client.receive()) orelse return error.Closed;
+const body = try client.readBody(&buf);
+```
+
+Response framing is not request framing, and the difference is where bugs
+live. The method and the status decide before the headers get a say: a HEAD
+response describes a body that is not coming, 204 and 304 and 1xx never have
+one, what follows a 2xx CONNECT is a tunnel, and a response with neither
+Content-Length nor Transfer-Encoding runs until the connection closes, which
+is a framing a request can never have.
+
+## Trailers and Date
+
+Trailers on a chunked request body, once it has been read, arrive through
+`http.trailers(&storage)` — and only if you gave the server a `trailer_buf`
+to keep them in, since most servers do not want them. Writing them is
+`rw.endWithTrailers(...)`, which refuses any field that would change the
+framing after the fact.
+
+`Date` is opt-in. Hand the server a `martensite.Date` and every response gets
+one unless it already has it; it renders at most once a second rather than
+once a response.
+
 ## What a router needs
 
 ```zig

@@ -306,7 +306,7 @@ fn interestingLanes(chunk: V) @Vector(vector_len, bool) {
 }
 
 /// RFC 9110 token characters.
-fn isTokenChar(c: u8) bool {
+pub fn isTokenChar(c: u8) bool {
     return token_chars[c];
 }
 
