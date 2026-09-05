@@ -55,8 +55,7 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
         reader.startDeadline(.{ .duration = seconds(10) });
 
         const req = http.receive() catch |err| {
-            // ReadFailed only says the read did not happen; the reader
-            // knows whether the peer went quiet or the socket broke.
+            // ReadFailed does not say why. The reader does.
             const timed_out = err == error.ReadFailed and switch (reader.failure() orelse error.Unexpected) {
                 error.Timeout => true,
                 else => false,

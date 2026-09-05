@@ -38,7 +38,7 @@ fn bind(io: Io, seed: u16) !Bound {
     return error.NoFreePort;
 }
 
-/// Runs `handler` against one accepted connection while `client` talks to it.
+/// Runs `handler` on one connection while `client` talks to it.
 fn exchange(
     io: Io,
     seed: u16,
@@ -50,8 +50,8 @@ fn exchange(
 
     var group: Io.Group = .init;
     defer group.cancel(io);
-    // Not Group.async: that may wait until await, and the accept below is
-    // what we would be waiting in.
+    // Not Group.async, which might wait until await, and we await after
+    // the accept below.
     try group.concurrent(io, client, .{ io, bound.address });
 
     const stream = try bound.server.accept(io);
@@ -294,7 +294,7 @@ test "TimedReader bounds a whole head, not just each read of it" {
             var writer = stream.writer(inner, &wbuf);
             writer.interface.writeAll("GET / HTTP/1.1\r\n") catch return;
             writer.interface.flush() catch return;
-            // A header every 50ms, forever. Never finishes the head.
+            // A header every 50ms, never finishing.
             for (0..20) |_| {
                 millis(50).sleep(inner) catch return;
                 writer.interface.writeAll("X-Pad: y\r\n") catch return;
@@ -404,7 +404,7 @@ test "the client talks to the server over a real socket" {
                 .head_buf = &head_buf,
             });
 
-            // Two requests down one connection, echoing a body on the second.
+            // Two requests on one connection.
             client.send(.{ .target = "/first", .headers = &.{
                 .{ .name = "Host", .value = "x" },
             } }) catch return;

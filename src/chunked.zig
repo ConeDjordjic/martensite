@@ -17,8 +17,8 @@ pub const Decoder = struct {
     left: u64 = 0,
     /// Set once a chunk size of zero has been seen.
     saw_last: bool = false,
-    /// Whether to consume trailer lines after the last chunk. When false,
-    /// decoding stops at the last chunk and the trailers stay in the buffer.
+    /// Read trailer lines after the last chunk. When false, decoding stops
+    /// at the last chunk and they stay in the buffer.
     consume_trailer: bool = false,
     hex_digits: u8 = 0,
     /// Trailers get copied here as they arrive, because the input comes

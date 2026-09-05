@@ -22,7 +22,7 @@ pub const Error = error{
     UnsupportedEncoding,
 };
 
-/// Framing of a request body, by RFC 9112 section 6.
+/// Framing of a request body. RFC 9112 section 6.
 pub fn request(head: scan.Head) Error!Framing {
     var length: ?u64 = null;
     var transfer_encoding: ?[]const u8 = null;
@@ -53,17 +53,15 @@ pub fn request(head: scan.Head) Error!Framing {
     return .none;
 }
 
-/// Framing of a response body, which does not follow the same rules as a
-/// request's: the method and the status decide it before the headers get a
-/// say, and a response with neither header runs until the connection closes
-/// rather than being empty.
+/// Framing of a response body. The rules differ from a request: the method
+/// and the status decide first, and with neither header the body runs until
+/// the connection closes.
 pub fn response(head: scan.ResponseHead, request_method: []const u8) Error!Framing {
-    // A HEAD gets the headers a GET would have and no body, so a
-    // Content-Length on one describes a body that is not coming.
+    // A HEAD describes a body it doesn't actually send.
     if (eqlIgnoreCase(request_method, "HEAD")) return .none;
     if (head.status >= 100 and head.status < 200) return .none;
     if (head.status == 204 or head.status == 304) return .none;
-    // The tunnel after a successful CONNECT is not a body.
+    // A successful CONNECT is followed by a tunnel, not a body.
     if (eqlIgnoreCase(request_method, "CONNECT") and
         head.status >= 200 and head.status < 300) return .none;
 
@@ -107,7 +105,7 @@ pub fn keepAlive(head: scan.Head) bool {
     return head.minor_version >= 1;
 }
 
-/// The last coding must be chunked, and chunked may appear only once.
+/// chunked must be last, and may appear only once.
 fn endsWithChunked(value: []const u8) bool {
     var last: []const u8 = "";
     var count: usize = 0;
@@ -121,8 +119,8 @@ fn endsWithChunked(value: []const u8) bool {
     return count == 1 and eqlIgnoreCase(last, "chunked");
 }
 
-/// Digits only. No sign, no whitespace, no radix prefix: a Content-Length
-/// that two parsers read differently is a smuggled request.
+/// Digits only. If two parsers read a Content-Length differently you have
+/// a smuggled request.
 fn parseLength(value: []const u8) ?u64 {
     if (value.len == 0) return null;
     var n: u64 = 0;

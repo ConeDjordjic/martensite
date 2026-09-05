@@ -31,18 +31,15 @@ pending: body.Framing = .none,
 keep_alive: bool = true,
 /// Set once a response has gone out for the current request.
 answered: bool = true,
-/// The request was a HEAD, so a body must be described and not sent.
+/// A HEAD: describe the body, do not send it.
 head_only: bool = false,
 /// Another protocol owns the connection now.
 handed_over: bool = false,
-/// Trailer lines the last chunked body carried, raw. Empty when there
-/// were none, and only valid until the next body read.
+/// Raw trailer lines from the last chunked body.
 trailers_raw: []const u8 = "",
-/// The peer said Expect: 100-continue and is waiting to be told to go
-/// ahead. Cleared once it has been.
+/// The peer is waiting on a 100 Continue.
 expect_continue: bool = false,
-/// Bumped by every receive. A Request carries the value it was made with,
-/// so using a stale one is caught instead of reading whatever is there now.
+/// Bumped by every receive, so a stale Request is caught.
 generation: u32 = 0,
 
 pub const Options = struct {
@@ -73,30 +70,26 @@ pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) Se
     };
 }
 
-/// Everything here borrows the connection's buffers and is good until the
-/// next `receive`. Reading past that is checked in Debug and ReleaseSafe and
-/// unchecked in ReleaseFast, the same deal as an index out of range.
+/// Points into the connection's buffers and is valid until the next
+/// `receive`. Using it after that panics in Debug and ReleaseSafe.
 pub const Request = struct {
     head: scan.Head,
     framing: body.Framing,
     owner: *const Server,
     generation: u32,
 
-    /// The peer asked to switch protocols and named one. Whether the name
-    /// is one you implement is your business.
+    /// The protocol the peer wants to switch to.
     ///
-    /// Requires `Connection: upgrade` as well as an `Upgrade` header, since
-    /// an Upgrade on its own is a hop-by-hop header a proxy may have left
-    /// behind.
+    /// Also needs `Connection: upgrade`. An Upgrade header on its own is
+    /// hop-by-hop and might just be something a proxy left behind.
     pub fn upgradeTo(r: Request) ?[]const u8 {
         r.check();
         if (!connectionHas(r.head, "upgrade")) return null;
         return r.header("upgrade");
     }
 
-    /// The peer is holding the body back until it hears 100 Continue.
-    /// Reading the body sends it. Answering without reading does not, which
-    /// is how you turn a big upload away before it is sent.
+    /// The peer is waiting for a 100 Continue before it sends the body.
+    /// Reading the body sends one. Answering without reading does not.
     pub fn expectsContinue(r: Request) bool {
         r.check();
         return r.owner.expect_continue;
@@ -107,8 +100,7 @@ pub const Request = struct {
         return r.head.method;
     }
 
-    /// The method as an enum, or null for one martensite does not name.
-    /// `method()` always has the bytes.
+    /// The method as an enum, or null if it is not one we name.
     pub fn knownMethod(r: Request) ?scan.Method {
         r.check();
         return scan.Method.parse(r.head.method);
@@ -119,16 +111,13 @@ pub const Request = struct {
         return r.head.target;
     }
 
-    /// The request-target taken apart: path without the query, query,
-    /// and the authority when the client sent an absolute form.
-    /// Null if the target is not a shape HTTP allows.
+    /// The target taken apart. Null if it is not a shape HTTP allows.
     pub fn parsedTarget(r: Request) ?target_mod.Target {
         r.check();
         return target_mod.parse(r.head.target);
     }
 
-    /// Walks every header with this name, not just the first. Set-Cookie
-    /// and Accept both legitimately repeat.
+    /// Every header with this name, not just the first.
     pub fn headerIter(r: Request, name: []const u8) HeaderIterator {
         r.check();
         return .{ .rest = r.head.headers, .name = name };
@@ -147,7 +136,7 @@ pub const Request = struct {
         return null;
     }
 
-    /// Whether this request is still the one the connection is on.
+    /// Still the current request?
     pub fn live(r: Request) bool {
         return r.generation == r.owner.generation;
     }
@@ -162,8 +151,7 @@ pub const Request = struct {
 pub const ReceiveError = error{
     /// Not a request.
     BadRequest,
-    /// An Expect header asking for something that is not 100-continue.
-    /// RFC 9110 says answer 417.
+    /// An Expect we don't support. Answer 417.
     UnsupportedExpectation,
     /// The head didn't fit, or it had too many headers.
     HeadTooLarge,
@@ -214,13 +202,11 @@ pub fn receive(s: *Server) ReceiveError!?Request {
                 error.TooManyHeaders => error.HeadTooLarge,
             };
             last_len = buffered.len;
-            // Incomplete, with nowhere to put the rest of it. Only once a
-            // fill has been tried, because a reader whose buffer is exactly
-            // its data looks full from the start and has simply ended.
-            //
-            // This is after the scan, not after the fill: a client that
-            // sends its head and a large body in one go fills the buffer
-            // with a head that is perfectly fine.
+            // Incomplete with nowhere to put the rest. After the scan,
+            // not after the fill: a client that sends head and body in one
+            // go fills the buffer with a head that is fine. And only once
+            // a fill was tried, since a reader whose buffer is its data
+            // looks full from the start.
             if (filled and buffered.len == s.reader.buffer.len) return error.HeadTooLarge;
         }
 
@@ -236,16 +222,14 @@ pub fn receive(s: *Server) ReceiveError!?Request {
     }
 }
 
-/// The request body as an `Io.Reader`, so a body larger than memory can be
-/// streamed somewhere instead of landing in a buffer.
-///
-/// Decoding happens in the connection's read buffer, so this needs no buffer
-/// of its own and copies nothing that `readBody` would not have copied.
+/// The request body as an `Io.Reader`, for bodies too big to hold in
+/// memory.
 pub const BodyReader = struct {
     server: *Server,
     interface: Io.Reader,
-    /// Where chunked bytes get decoded. Ours, because the destination may
-    /// not have a buffer to lend and the source's may be read-only.
+    /// Where chunked bytes get decoded. It is ours because the
+    /// destination might have no buffer to lend us, and the source's
+    /// might be read-only.
     scratch: []u8,
     left: u64,
     decoder: chunked.Decoder,
@@ -327,11 +311,9 @@ pub const BodyReader = struct {
     }
 };
 
-/// A reader over the current request's body. Valid until the next `receive`,
-/// like everything else here.
+/// A reader over the request body, valid until the next `receive`.
 ///
-/// `scratch` is only used for chunked bodies and wants to be big enough to
-/// hold a chunk header plus some payload; a few hundred bytes is plenty.
+/// `scratch` is for chunked bodies only. A few hundred bytes is plenty.
 pub fn bodyReader(s: *Server, scratch: []u8) Io.Writer.Error!BodyReader {
     if (s.pending != .none) {
         try s.sendContinue();
@@ -371,13 +353,12 @@ pub const HeaderIterator = struct {
     }
 };
 
-/// Trailer lines are header lines with a blank line after them, so the
-/// request scanner can read them with a synthetic request line in front.
+/// Trailer lines are header lines, so the scanner reads them with a fake
+/// request line in front.
 fn scanTrailers(raw: []const u8, storage: []scan.Header) scan.Error![]const scan.Header {
     var buf: [8 * 1024]u8 = undefined;
     const prefix = "T / HTTP/1.1\r\n";
-    // The blank line that ended the trailer section is not kept, so it has
-    // to go back on for the scanner to see a complete head.
+    // The blank line is not kept, so put it back.
     const total = prefix.len + raw.len + 2;
     if (total > buf.len) return error.TooManyHeaders;
     @memcpy(buf[0..prefix.len], prefix);
@@ -387,8 +368,8 @@ fn scanTrailers(raw: []const u8, storage: []scan.Header) scan.Error![]const scan
     return scanned.head.headers;
 }
 
-/// Whether the Connection header lists `token`. It is a comma separated
-/// list, so a substring search would match Upgrade inside a longer word.
+/// Whether Connection lists `token`. It is comma separated, so a substring
+/// search would match inside a longer word.
 fn connectionHas(head: scan.Head, token: []const u8) bool {
     for (head.headers) |h| {
         if (!std.ascii.eqlIgnoreCase(h.name, "connection")) continue;
@@ -430,11 +411,10 @@ pub const BodyError = error{
     ReadFailed,
 } || Io.Cancelable;
 
-/// Reads the whole body into `buf`. Returns the part of `buf` it filled.
-/// Bodies larger than `buf` are an error rather than a truncation.
+/// Reads the whole body into `buf`. If it doesn't fit you get an error,
+/// not a short read.
 pub fn readBody(s: *Server, buf: []u8) (BodyError || Io.Writer.Error || error{BodyTooLarge})![]u8 {
-    // Nothing to get past for a request with no body, so the head is left
-    // where it is and stays readable without having been copied.
+    // No body to get past, so the head stays where it is.
     if (s.pending == .none) return buf[0..0];
 
     try s.sendContinue();
@@ -490,7 +470,7 @@ pub const SendError = Response.WriteError;
 /// Writes a response and flushes it.
 pub fn respond(s: *Server, r: Response) SendError!void {
     var out = r;
-    // A HEAD gets the headers a GET would have got, and none of the body.
+    // A HEAD gets the headers and none of the body.
     if (s.head_only) out.head_only = true;
     var dated: [32]Response.Header = undefined;
     out.headers = s.withDate(r.headers, &dated) catch return error.WriteFailed;
@@ -563,8 +543,8 @@ pub fn respondStreaming(
     };
 }
 
-/// Writes a response body a piece at a time. Chunked unless a length was
-/// given, in which case it is checked against what actually gets written.
+/// Writes a body a piece at a time. Uses chunked encoding unless you pass
+/// a length, which then gets checked against what you actually write.
 pub const ResponseWriter = struct {
     server: *Server,
     interface: Io.Writer,
@@ -572,8 +552,7 @@ pub const ResponseWriter = struct {
     mode: union(enum) {
         chunked,
         length: u64,
-        /// The status or the method says there is no body. Anything written
-        /// is dropped rather than corrupting the stream.
+        /// No body allowed. Writes are dropped.
         discard,
     },
 
@@ -581,7 +560,8 @@ pub const ResponseWriter = struct {
         const rw: *ResponseWriter = @alignCast(@fieldParentPtr("interface", io_w));
         const out = rw.server.writer;
 
-        // Whatever the interface buffered comes first, then the vectors.
+        // Buffered bytes first, then the vectors. Bytes out of the buffer
+    // don't count here: `drain` reports what it took from `data`.
         const buffered = io_w.buffered();
         var total: usize = buffered.len;
         try rw.emit(out, buffered);
@@ -604,8 +584,7 @@ pub const ResponseWriter = struct {
         switch (rw.mode) {
             .discard => {},
             .length => |*left| {
-                // Writing more than promised would be read as the start of
-                // the next response.
+                // Overrunning would be read as the next response.
                 if (bytes.len > left.*) return error.WriteFailed;
                 left.* -= bytes.len;
                 try out.writeAll(bytes);
@@ -623,9 +602,8 @@ pub const ResponseWriter = struct {
         return rw.endWithTrailers(&.{});
     }
 
-    /// Terminates the body with trailers after it. Chunked only, since
-    /// there is nowhere to put them otherwise, and the peer will ignore
-    /// them unless the head announced them in a Trailer header.
+    /// Ends the body with trailers. Chunked only, and the peer ignores
+    /// them unless the head announced them.
     pub fn endWithTrailers(rw: *ResponseWriter, fields: []const Response.Header) Io.Writer.Error!void {
         try rw.interface.flush();
         const out = rw.server.writer;
@@ -643,8 +621,7 @@ pub const ResponseWriter = struct {
                 try out.writeAll("\r\n");
             },
             .length => |left| if (left != 0) {
-                // Short of what Content-Length promised: the peer would sit
-                // waiting for bytes that are not coming.
+                // Short of Content-Length; the peer would wait forever.
                 rw.server.keep_alive = false;
                 return error.WriteFailed;
             },
@@ -653,8 +630,7 @@ pub const ResponseWriter = struct {
     }
 };
 
-/// A trailer is a header, with the same rule about CRLF, plus the ones that
-/// may never appear after the body because something already acted on them.
+/// Same rules as a header, minus the fields something already acted on.
 fn validTrailer(f: Response.Header) bool {
     if (f.name.len == 0) return false;
     for (f.name) |c| if (!scan.isTokenChar(c)) return false;
@@ -671,8 +647,8 @@ fn validTrailer(f: Response.Header) bool {
     return true;
 }
 
-/// `headers` with a Date appended, when one was asked for and is not
-/// already there. `storage` has to outlive the write.
+/// `headers` plus a Date, if one was asked for. `storage` must outlive
+/// the write.
 fn withDate(s: *Server, headers: []const Response.Header, storage: []Response.Header) error{NoSpace}![]const Response.Header {
     const d = s.date orelse return headers;
     for (headers) |h| {
@@ -684,11 +660,9 @@ fn withDate(s: *Server, headers: []const Response.Header, storage: []Response.He
     return storage[0 .. headers.len + 1];
 }
 
-/// Trailers the request body carried, scanned into `storage`.
-///
-/// Only chunked bodies can have them, and only after the body has been
-/// read. Empty otherwise. They are headers that arrive after the body, so
-/// nothing that decides framing or routing may be trusted from here.
+/// Trailers from the request body, scanned into `storage`. Chunked
+/// bodies only, and only after the body has been read. They arrive after
+/// the body, so don't use them for framing or routing.
 pub fn trailers(s: *Server, storage: []scan.Header) scan.Error![]const scan.Header {
     if (s.trailers_raw.len == 0) return &.{};
     return scanTrailers(s.trailers_raw, storage);
@@ -700,7 +674,8 @@ pub fn alive(s: *const Server) bool {
     return s.keep_alive and !s.handed_over;
 }
 
-/// Answers the handshake and stops treating the connection as HTTP.
+/// Answers the handshake and stops speaking HTTP. The reader and writer
+/// are yours after this.
 ///
 /// Anything the peer sent after the head is still sitting in the reader,
 /// since clients often send their first frame without waiting for the
@@ -724,8 +699,7 @@ pub fn handedOver(s: *const Server) bool {
     return s.handed_over;
 }
 
-/// Copies the head out of the reader's buffer and re-points every slice in
-/// it at the copy, so it stays readable once the body has moved things.
+/// Copies the head out of the reader's buffer and re-points its slices.
 fn keepHead(s: *Server, bytes: []const u8, head: scan.Head) error{HeadTooLarge}!scan.Head {
     if (bytes.len > s.head_buf.len) return error.HeadTooLarge;
     const dst = s.head_buf[0..bytes.len];
@@ -750,8 +724,8 @@ fn keepHead(s: *Server, bytes: []const u8, head: scan.Head) error{HeadTooLarge}!
     return out;
 }
 
-/// Drops whatever the previous request left behind so the next head starts at
-/// a message boundary.
+/// Drops whatever the last request left behind, so the next head starts
+/// in the right place.
 fn finishPrevious(s: *Server) ReceiveError!void {
     switch (s.pending) {
         .none => {},

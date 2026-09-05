@@ -10,12 +10,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const options = b.addOptions();
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
+    test_mod.addOptions("build_options", options);
     const filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this");
     const tests = b.addTest(.{
         .root_module = test_mod,

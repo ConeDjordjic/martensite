@@ -11,8 +11,7 @@ headers: []const Header = &.{},
 body: []const u8 = "",
 /// False closes the connection after this response.
 keep_alive: bool = true,
-/// Suppress the body, for HEAD. Content-Length still describes what a GET
-/// would have returned.
+/// Drop the body but keep its Content-Length. For HEAD.
 head_only: bool = false,
 
 pub const Header = struct {
@@ -21,8 +20,7 @@ pub const Header = struct {
 };
 
 pub const WriteOptions = struct {
-    /// Whether the connection is being kept alive, decided by the caller from
-    /// the request.
+    /// Decided by the caller from the request.
     keep_alive: bool,
 };
 
@@ -37,8 +35,7 @@ pub fn write(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void 
     if (!r.head_only and r.status.mayHaveBody()) try w.writeAll(r.body);
 }
 
-/// Status line and headers, stopping at the blank line. Separate so a body
-/// can be streamed after it.
+/// Status line and headers, up to the blank line.
 pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void {
     const alive = options.keep_alive and r.keep_alive;
 
@@ -55,8 +52,8 @@ pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!v
         try w.writeAll("\r\n");
     }
 
-    // 1xx, 204 and 304 have no body, and a Content-Length on one of them is
-    // how a peer ends up reading the next response as this one's body.
+    // 1xx, 204 and 304 have no body. A Content-Length on one makes the
+    // peer read the next response as this one's.
     if (r.status.mayHaveBody() and
         !r.hasHeader("content-length") and
         !r.hasHeader("transfer-encoding"))
@@ -121,11 +118,6 @@ pub fn html(status: Status, s: []const u8) Response {
     };
 }
 
-/// `storage` holds the Location header and has to outlive the write.
-///
-/// It is a parameter because a header array built from a runtime value
-/// lives on the stack of whatever built it. `text` and `json` get away with
-/// returning one only because everything in theirs is comptime known.
 pub fn redirect(status: Status, location: []const u8, storage: *[1]Header) Response {
     storage[0] = .{ .name = "Location", .value = location };
     return .{ .status = status, .headers = storage };
@@ -175,7 +167,7 @@ pub const Status = enum(u16) {
 
     _,
 
-    /// Whether a response with this status is allowed a body at all.
+    /// Whether this status is allowed to have a body.
     pub fn mayHaveBody(s: Status) bool {
         const code = @intFromEnum(s);
         if (code >= 100 and code < 200) return false;

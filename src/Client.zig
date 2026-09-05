@@ -20,8 +20,7 @@ head_buf: []u8,
 
 head_len: usize = 0,
 pending: body.Framing = .none,
-/// The method of the request this is a response to, which changes the
-/// framing rules.
+/// The method we sent, which changes the framing rules.
 sent_method: []const u8 = "",
 generation: u32 = 0,
 
@@ -49,15 +48,14 @@ pub const Request = struct {
     target: []const u8 = "/",
     headers: []const Header = &.{},
     body: []const u8 = "",
-    /// Sent unless a Content-Length or Transfer-Encoding is already in
-    /// `headers`. A GET with no body gets no Content-Length at all.
+    /// Send a Content-Length, unless `headers` already has framing in it.
     send_length: bool = true,
 };
 
 pub const SendError = Io.Writer.Error || error{
     /// A bad header name, or CR, LF or NUL in a value.
     InvalidHeader,
-    /// The method or target cannot go in a request line.
+    /// The method or target doesn't fit in a request line.
     InvalidRequest,
 };
 
@@ -103,8 +101,7 @@ pub const ReceiveError = error{
     ReadFailed,
 } || Io.Cancelable;
 
-/// Everything here borrows the connection's buffers and is good until the
-/// next `receive`.
+/// Points into the connection's buffers and is valid until the next `receive`.
 pub const Response = struct {
     head: scan.ResponseHead,
     framing: body.Framing,
@@ -145,7 +142,7 @@ pub const Response = struct {
     }
 };
 
-/// Reads the next response head. Null if the peer closed cleanly first.
+/// Reads the next response head, or null if the peer closed cleanly.
 pub fn receive(c: *Client) ReceiveError!?Response {
     try c.finishPrevious();
 
@@ -201,7 +198,7 @@ pub fn receive(c: *Client) ReceiveError!?Response {
 }
 
 pub const BodyError = error{
-    /// The peer stopped sending halfway through the body.
+    /// The peer stopped before the body was complete.
     Incomplete,
     BadChunk,
     ReadFailed,
