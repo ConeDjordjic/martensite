@@ -94,8 +94,13 @@ fn receive(r: *TimedReader, dest: []u8) Io.Reader.Error!usize {
 
 fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
     const r: *TimedReader = @alignCast(@fieldParentPtr("interface", io_r));
-    var buffers: [1][]u8 = undefined;
-    const count, const size = try io_r.writableVector(&buffers, data);
+    // writableVector appends our own buffer after the caller's vectors
+    // and doesn't check capacity, so it needs one slot more than it is
+    // given. With a one-slot array here it wrote past the end on every
+    // read of a body bigger than the buffer.
+    var buffers: [2][]u8 = undefined;
+    const first = if (data.len == 0) data[0..0] else data[0..1];
+    const count, const size = try io_r.writableVector(&buffers, first);
     _ = count;
     const dest = buffers[0];
     std.debug.assert(dest.len > 0);

@@ -115,6 +115,57 @@ fn send(io: Io, address: net.IpAddress, request: []const u8, out: []u8) ![]u8 {
     return w.buffered();
 }
 
+/// Like plainHandler, but through TimedReader and with a buffer smaller
+/// than the bodies it reads.
+fn timedHandler(io: Io, stream: net.Stream) !void {
+    var read_buf: [1024]u8 = undefined;
+    var write_buf: [4096]u8 = undefined;
+    var headers: [32]martensite.Header = undefined;
+    var head_buf: [4096]u8 = undefined;
+
+    var reader: TimedReader = .init(io, stream, &read_buf, .{ .duration = seconds(5) });
+    var writer = stream.writer(io, &write_buf);
+    var http: Server = .init(io, &reader.interface, &writer.interface, .{
+        .headers = &headers,
+        .head_buf = &head_buf,
+    });
+
+    while (true) {
+        const req = (try http.receive()) orelse return;
+        _ = req;
+        var body_buf: [64 * 1024]u8 = undefined;
+        const body = try http.readBody(&body_buf);
+        var line: [32]u8 = undefined;
+        try http.respond(.text(.ok, try std.fmt.bufPrint(&line, "{d}", .{body.len})));
+        if (!http.alive()) return;
+    }
+}
+
+test "a body larger than the TimedReader buffer" {
+    // Regression test. readVec handed writableVector a one-slot array,
+    // and writableVector appends the reader's own buffer without
+    // checking. Once the buffer drained it wrote index 1 of a length-1
+    // array and panicked. Anything posting more than the read buffer hit
+    // this.
+    const io = testing.io;
+    try exchange(io, 39600, timedHandler, struct {
+        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
+            const size = 8000;
+            var request: [size + 128]u8 = undefined;
+            const head = std.fmt.bufPrint(
+                &request,
+                "POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\n\r\n",
+                .{size},
+            ) catch return;
+            @memset(request[head.len..][0..size], 'x');
+
+            var out: [4096]u8 = undefined;
+            const reply = send(inner, address, request[0 .. head.len + size], &out) catch return;
+            std.debug.assert(std.mem.endsWith(u8, reply, "8000"));
+        }
+    }.f);
+}
+
 test "a real request over a real socket" {
     const io = testing.io;
     try exchange(io, 39100, plainHandler, struct {

@@ -139,7 +139,9 @@ zig build test
 zig build test -Dtest-filter="real socket"
 ```
 
-Request smuggling is largely a framing problem:
+Some tests run over a real socket rather than a buffer.
+
+Framing is where request smuggling lives, so:
 
 - `Content-Length` and `Transfer-Encoding` together: rejected.
 - Either header twice with different values: rejected.
@@ -148,6 +150,8 @@ Request smuggling is largely a framing problem:
 - A bare LF where a chunk size line needs CRLF: rejected.
 - A CR in a trailer line with no LF after it: rejected.
 - Response header values with CR, LF or NUL in them: rejected.
+
+Repeated spaces in a request line and folded headers are rejected too.
 
 ## Not here
 

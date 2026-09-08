@@ -10,20 +10,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const options = b.addOptions();
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    test_mod.addOptions("build_options", options);
     const filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this");
+    const test_step = b.step("test", "Run the tests");
+
     const tests = b.addTest(.{
-        .root_module = test_mod,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
         .filters = if (filter) |f| &.{f} else &.{},
     });
-    const run_tests = b.addRunArtifact(tests);
-    b.step("test", "Run the tests").dependOn(&run_tests.step);
+    test_step.dependOn(&b.addRunArtifact(tests).step);
 
     const ws = b.addExecutable(.{
         .name = "websocket",
