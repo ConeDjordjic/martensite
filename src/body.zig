@@ -57,13 +57,15 @@ pub fn request(head: scan.Head) Error!Framing {
 /// and the status decide first, and with neither header the body runs until
 /// the connection closes.
 pub fn response(head: scan.ResponseHead, request_method: []const u8) Error!Framing {
+    // Methods are case sensitive, so this asks the one place that knows
+    // them rather than comparing loosely and disagreeing with the Server.
+    const method = scan.Method.parse(request_method);
     // A HEAD describes a body it doesn't actually send.
-    if (eqlIgnoreCase(request_method, "HEAD")) return .none;
+    if (method) |m| if (!m.expectsBody()) return .none;
     if (head.status >= 100 and head.status < 200) return .none;
     if (head.status == 204 or head.status == 304) return .none;
     // A successful CONNECT is followed by a tunnel, not a body.
-    if (eqlIgnoreCase(request_method, "CONNECT") and
-        head.status >= 200 and head.status < 300) return .none;
+    if (method == .CONNECT and head.status >= 200 and head.status < 300) return .none;
 
     var length: ?u64 = null;
     var transfer_encoding: ?[]const u8 = null;
@@ -91,18 +93,22 @@ pub fn response(head: scan.ResponseHead, request_method: []const u8) Error!Frami
 
 /// Whether the connection can carry another request after this one.
 pub fn keepAlive(head: scan.Head) bool {
-    var explicit: ?bool = null;
+    if (connectionHas(head, "close")) return false;
+    if (connectionHas(head, "keep-alive")) return true;
+    return head.minor_version >= 1;
+}
+
+/// Whether Connection lists `token`. It is comma separated, so a plain
+/// substring search would find "close" inside "not-close".
+pub fn connectionHas(head: scan.Head, token: []const u8) bool {
     for (head.headers) |h| {
         if (!eqlIgnoreCase(h.name, "connection")) continue;
         var it = std.mem.splitScalar(u8, h.value, ',');
         while (it.next()) |raw| {
-            const token = std.mem.trim(u8, raw, " \t");
-            if (eqlIgnoreCase(token, "close")) return false;
-            if (eqlIgnoreCase(token, "keep-alive")) explicit = true;
+            if (eqlIgnoreCase(std.mem.trim(u8, raw, " \t"), token)) return true;
         }
     }
-    if (explicit) |v| return v;
-    return head.minor_version >= 1;
+    return false;
 }
 
 /// chunked must be last, and may appear only once.

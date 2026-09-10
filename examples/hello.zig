@@ -35,7 +35,7 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
     var headers: [64]martensite.Header = undefined;
-    var head_buf: [8 * 1024]u8 = undefined;
+    var head_buf: [16 * 1024]u8 = undefined;
     var date: martensite.Date = .{};
 
     // A plain stream.reader works too, but then a silent peer ties this
@@ -44,26 +44,19 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
         .duration = seconds(5),
     });
     var writer = stream.writer(io, &write_buf);
-    var http: martensite.Server = .init(io, &reader.interface, &writer.interface, .{
+    var http: martensite.Server = martensite.Server.init(io, &reader.interface, &writer.interface, .{
         .headers = &headers,
         .head_buf = &head_buf,
         .date = &date,
-    });
+        .failure = reader.failureSource(),
+    }) catch return;
 
     while (true) {
         // This one is for the whole head, not for a single read.
         reader.startDeadline(.{ .duration = seconds(10) });
 
         const req = http.receive() catch |err| {
-            // ReadFailed does not say why. The reader does.
-            const timed_out = err == error.ReadFailed and switch (reader.failure() orelse error.Unexpected) {
-                error.Timeout => true,
-                else => false,
-            };
-            _ = http.respond(if (timed_out)
-                .{ .status = .request_timeout, .keep_alive = false }
-            else
-                errorResponse(err)) catch {};
+            _ = http.respond(errorResponse(err)) catch {};
             return;
         } orelse return;
 
@@ -108,6 +101,9 @@ fn seconds(n: i64) Io.Clock.Duration {
 
 fn errorResponse(err: anyerror) martensite.Response {
     return switch (err) {
+        // The reader was given as a failure source, so a peer that went
+        // quiet arrives as a timeout rather than an unexplained read.
+        error.Timeout => .{ .status = .request_timeout, .keep_alive = false },
         error.HeadTooLarge => .{ .status = .request_header_fields_too_large, .keep_alive = false },
         error.UnsupportedExpectation => .{ .status = .expectation_failed, .keep_alive = false },
         error.BodyTooLarge => .{ .status = .payload_too_large, .keep_alive = false },

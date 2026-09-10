@@ -38,7 +38,7 @@ In ReleaseFast there is no check, so you just read a stale pointer. Use
 ## A server
 
 ```zig
-var http: martensite.Server = .init(io, &reader.interface, &writer.interface, .{
+var http: martensite.Server = try .init(io, &reader.interface, &writer.interface, .{
     .headers = &headers,
     .head_buf = &head_buf,
 });
@@ -51,37 +51,69 @@ while (true) {
 }
 ```
 
-`head_buf` holds the head for the duration of a body read. Requests with no
-body never touch it.
+`head_buf` is where the head is kept while you read a body. A request
+without a body never uses it, so you can pass an empty slice. If you do
+pass one, it has to be at least as big as the reader's buffer. Otherwise
+the same request could be accepted or rejected depending on whether it
+happened to have a body, which is confusing to debug. `init` rejects that
+combination right away instead of letting it show up later as a
+`HeadTooLarge`.
+
+One request gets one response. A second `respond` for the same request is
+`error.AlreadyAnswered`, because it would go out as the answer to a
+request the peer has not sent yet.
+
+If the handler never reads the body, the connection ends. Reading a body
+you already rejected is up to you, so you have to say how much of it you
+will take:
+
+```zig
+.max_drain = 64 * 1024,   // default is 0: don't read it, close instead
+```
 
 For bodies that are too big to buffer, stream them:
 
 ```zig
-var b = try http.bodyReader(&scratch);
+var b = try http.bodyReader(&decode_buf);
 _ = try b.interface.streamRemaining(&file_writer.interface);
 ```
+
+`decode_buf` is where chunked bytes are decoded on their way out; a few
+hundred bytes is plenty, and a counted body never touches it.
 
 Responses work the same way. You get chunked encoding when you don't give
 a length:
 
 ```zig
-var rw = try http.respondStreaming(.{}, &scratch, .{});
+var rw = try http.respondStreaming(.{}, &out_buf, .{});
 try rw.interface.print("data: {d}\n\n", .{n});
 try rw.end();
 ```
+
+`out_buf` is the response writer's buffer, so its size is the biggest
+piece that goes out in one write. With chunked encoding that is the chunk
+size on the wire. Note this is not the same kind of buffer as the one
+`bodyReader` takes, even though it sits in the same argument position.
 
 `examples/hello.zig` is a complete server in about eighty lines.
 
 ## A client
 
 ```zig
-var client: martensite.Client = .init(io, &reader.interface, &writer.interface, .{
+var client: martensite.Client = try .init(io, &reader.interface, &writer.interface, .{
     .headers = &headers,
     .head_buf = &head_buf,
 });
 try client.send(.{ .method = "POST", .target = "/things", .body = payload });
 const res = (try client.receive()) orelse return error.Closed;
 const body = try client.readBody(&buf);
+```
+
+And responses too big to buffer stream like request bodies:
+
+```zig
+var b = client.bodyReader(&decode_buf);
+_ = try b.interface.streamRemaining(&file_writer.interface);
 ```
 
 Name resolution, redirects and connection pooling are out of scope. Those
@@ -131,6 +163,18 @@ The first one bounds a single read, the second bounds a whole message.
 Without them a peer can hold a connection open forever. With the settings
 above, a silent peer gets a 408 after 5 seconds, and one sending a header
 per second is dropped after 11.
+
+`std.Io.Reader` only reports `error.ReadFailed`, so a peer that went
+quiet and a peer that went away look the same. If you give `Server`
+somewhere to ask, it can tell them apart:
+
+```zig
+.failure = reader.failureSource(),   // then receive() can return error.Timeout
+```
+
+Without it a timeout stays `error.ReadFailed`. Anything that is not a
+timeout stays `error.ReadFailed` either way, because they all end up in
+the same place: stop serving this connection.
 
 ## Correctness
 

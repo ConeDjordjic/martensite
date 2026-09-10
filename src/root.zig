@@ -13,6 +13,7 @@ pub const Date = @import("Date.zig");
 pub const Server = @import("Server.zig");
 pub const Client = @import("Client.zig");
 pub const TimedReader = @import("TimedReader.zig");
+pub const FailureSource = @import("FailureSource.zig");
 
 pub const Header = scan.Header;
 pub const Head = scan.Head;
@@ -29,5 +30,8 @@ test {
     _ = Server;
     _ = Client;
     _ = TimedReader;
+    _ = FailureSource;
+    // Not exported, but we still want to run its tests.
+    _ = @import("HeadWindow.zig");
     _ = @import("integration_test.zig");
 }

@@ -6,6 +6,7 @@
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
+const FailureSource = @import("FailureSource.zig");
 
 const TimedReader = @This();
 
@@ -49,6 +50,16 @@ pub fn startDeadline(r: *TimedReader, total: Io.Timeout) void {
 
 /// Why the last read failed.
 pub fn failure(r: *const TimedReader) ?Error {
+    return r.err;
+}
+
+/// The same thing, in the form Server and Client want.
+pub fn failureSource(r: *TimedReader) FailureSource {
+    return .{ .ctx = r, .cause = cause };
+}
+
+fn cause(ctx: *anyopaque) ?anyerror {
+    const r: *TimedReader = @ptrCast(@alignCast(ctx));
     return r.err;
 }
 

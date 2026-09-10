@@ -4,6 +4,8 @@
 const std = @import("std");
 const Io = std.Io;
 
+const scan = @import("scan.zig");
+
 const Response = @This();
 
 status: Status = .ok,
@@ -22,6 +24,18 @@ pub const Header = struct {
 pub const WriteOptions = struct {
     /// Decided by the caller from the request.
     keep_alive: bool,
+    /// Written as a Date header unless the caller already gave us one.
+    date: ?[]const u8 = null,
+    /// How the body is framed. `from_body` describes the `body` field,
+    /// which is what you want for a complete response. A streamed
+    /// response says how it will frame the bytes written later.
+    framing: Framing = .from_body,
+};
+
+pub const Framing = union(enum) {
+    from_body,
+    length: u64,
+    chunked,
 };
 
 pub const WriteError = Io.Writer.Error || error{
@@ -36,7 +50,18 @@ pub fn write(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void 
 }
 
 /// Status line and headers, up to the blank line.
+///
+/// Every header is checked before any byte is written. A head that is
+/// refused leaves the writer untouched, because a partial head becomes the
+/// prefix of whatever the caller sends next, and that is a response split.
 pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void {
+    for (r.headers) |h| {
+        if (!validName(h.name) or !validValue(h.value)) return error.InvalidHeader;
+    }
+    if (options.date) |d| {
+        if (!validValue(d)) return error.InvalidHeader;
+    }
+
     const alive = options.keep_alive and r.keep_alive;
 
     try w.writeAll("HTTP/1.1 ");
@@ -45,7 +70,6 @@ pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!v
     try w.writeAll("\r\n");
 
     for (r.headers) |h| {
-        if (!validName(h.name) or !validValue(h.value)) return error.InvalidHeader;
         try w.writeAll(h.name);
         try w.writeAll(": ");
         try w.writeAll(h.value);
@@ -58,7 +82,18 @@ pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!v
         !r.hasHeader("content-length") and
         !r.hasHeader("transfer-encoding"))
     {
-        try w.print("Content-Length: {d}\r\n", .{r.body.len});
+        switch (options.framing) {
+            .from_body => try w.print("Content-Length: {d}\r\n", .{r.body.len}),
+            .length => |n| try w.print("Content-Length: {d}\r\n", .{n}),
+            .chunked => try w.writeAll("Transfer-Encoding: chunked\r\n"),
+        }
+    }
+    if (options.date) |d| {
+        if (!r.hasHeader("date")) {
+            try w.writeAll("Date: ");
+            try w.writeAll(d);
+            try w.writeAll("\r\n");
+        }
     }
     if (!alive) try w.writeAll("Connection: close\r\n");
 
@@ -67,7 +102,7 @@ pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!v
 
 fn validName(name: []const u8) bool {
     if (name.len == 0) return false;
-    for (name) |c| if (!token_chars[c]) return false;
+    for (name) |c| if (!scan.isTokenChar(c)) return false;
     return true;
 }
 
@@ -78,14 +113,6 @@ fn validValue(value: []const u8) bool {
     return true;
 }
 
-const token_chars = blk: {
-    var t = [_]bool{false} ** 256;
-    for ("!#$%&'*+-.^_`|~") |c| t[c] = true;
-    for ('0'..'9' + 1) |c| t[c] = true;
-    for ('a'..'z' + 1) |c| t[c] = true;
-    for ('A'..'Z' + 1) |c| t[c] = true;
-    break :blk t;
-};
 
 fn hasHeader(r: Response, name: []const u8) bool {
     for (r.headers) |h| {
@@ -116,11 +143,6 @@ pub fn html(status: Status, s: []const u8) Response {
         .headers = &.{.{ .name = "Content-Type", .value = "text/html; charset=utf-8" }},
         .body = s,
     };
-}
-
-pub fn redirect(status: Status, location: []const u8, storage: *[1]Header) Response {
-    storage[0] = .{ .name = "Location", .value = location };
-    return .{ .status = status, .headers = storage };
 }
 
 pub const Status = enum(u16) {
@@ -288,27 +310,24 @@ test "statuses that cannot have a body do not get a length" {
     }
 }
 
-test "redirect" {
-    var buf: [256]u8 = undefined;
-    var storage: [1]Header = undefined;
-    const out = try render(Response.redirect(.see_other, "/after", &storage), true, &buf);
-    try testing.expectEqualStrings(
-        "HTTP/1.1 303 See Other\r\nLocation: /after\r\nContent-Length: 0\r\n\r\n",
-        out,
-    );
-}
 
-test "a location with a newline in it is refused" {
-    var buf: [256]u8 = undefined;
-    var storage: [1]Header = undefined;
-    try testing.expectError(
-        error.InvalidHeader,
-        render(Response.redirect(.found, "/a\r\nSet-Cookie: x=1", &storage), true, &buf),
-    );
-}
 
 test "an unnamed status still writes" {
     var buf: [256]u8 = undefined;
     const out = try render(.{ .status = @enumFromInt(599) }, true, &buf);
     try testing.expectEqualStrings("HTTP/1.1 599 Unknown\r\nContent-Length: 0\r\n\r\n", out);
+}
+
+test "a refused header leaves the writer untouched" {
+    var out: [512]u8 = undefined;
+    var w: Io.Writer = .fixed(&out);
+    const r: Response = .{ .status = .ok, .headers = &.{
+        .{ .name = "X-Good", .value = "1" },
+        .{ .name = "X-Bad", .value = "a\r\nInjected: yes" },
+    }, .body = "hi" };
+
+    try testing.expectError(error.InvalidHeader, r.write(&w, .{ .keep_alive = true }));
+    // Half a head left in the writer becomes the start of whatever goes
+    // out next.
+    try testing.expectEqual(@as(usize, 0), w.buffered().len);
 }

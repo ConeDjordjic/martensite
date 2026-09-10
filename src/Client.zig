@@ -9,35 +9,47 @@ const Io = std.Io;
 const scan = @import("scan.zig");
 const body = @import("body.zig");
 const chunked = @import("chunked.zig");
+const HeadWindow = @import("HeadWindow.zig");
 
 const Client = @This();
 
 io: Io,
 reader: *Io.Reader,
 writer: *Io.Writer,
-headers: []scan.Header,
-head_buf: []u8,
-
-head_len: usize = 0,
-pending: body.Framing = .none,
+/// Owns where the reader is: head, body, drain.
+window: HeadWindow,
 /// The method we sent, which changes the framing rules.
 sent_method: []const u8 = "",
-generation: u32 = 0,
 
 pub const Options = struct {
     /// Storage for the response's headers.
     headers: []scan.Header,
     /// Where the head is kept while a body is being read.
     head_buf: []u8 = &.{},
+    /// How much of an unread body we will read to keep the connection.
+    /// Zero, which is the default, closes it instead.
+    max_drain: u64 = 0,
 };
 
-pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) Client {
+pub const InitError = error{
+    /// `head_buf` is smaller than the reader's buffer, so a head the
+    /// reader can hold has nowhere to be kept while its body is read.
+    HeadBufferTooSmall,
+};
+
+pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) InitError!Client {
+    // An empty head_buf is a choice: responses with no body never need one.
+    if (options.head_buf.len != 0 and options.head_buf.len < reader.buffer.len)
+        return error.HeadBufferTooSmall;
     return .{
         .io = io,
         .reader = reader,
         .writer = writer,
-        .headers = options.headers,
-        .head_buf = options.head_buf,
+        .window = .init(reader, .{
+            .headers = options.headers,
+            .head_buf = options.head_buf,
+            .max_drain = options.max_drain,
+        }),
     };
 }
 
@@ -132,7 +144,7 @@ pub const Response = struct {
     }
 
     pub fn live(r: Response) bool {
-        return r.generation == r.owner.generation;
+        return r.generation == r.owner.window.generation;
     }
 
     fn check(r: Response) void {
@@ -144,165 +156,48 @@ pub const Response = struct {
 
 /// Reads the next response head, or null if the peer closed cleanly.
 pub fn receive(c: *Client) ReceiveError!?Response {
-    try c.finishPrevious();
+    const taken = (c.window.takeResponse(c.sent_method) catch |err| return switch (err) {
+        error.Invalid => error.BadResponse,
+        else => |e| e,
+    }) orelse return null;
 
-    c.reader.toss(c.head_len);
-    c.head_len = 0;
-
-    var last_len: usize = 0;
-    var filled = false;
-    while (true) {
-        const buffered = c.reader.buffered();
-        if (buffered.len != 0) {
-            if (scan.response(buffered, c.headers, last_len)) |maybe| {
-                if (maybe) |scanned| {
-                    const framing = try body.response(scanned.head, c.sent_method);
-                    c.head_len = scanned.len;
-                    c.pending = framing;
-                    const head = switch (framing) {
-                        .none => scanned.head,
-                        else => try c.keepHead(buffered[0..scanned.len], scanned.head),
-                    };
-                    c.generation +%= 1;
-                    return .{
-                        .head = head,
-                        .framing = framing,
-                        .owner = c,
-                        .generation = c.generation,
-                    };
-                }
-            } else |err| return switch (err) {
-                error.Invalid => error.BadResponse,
-                error.TooManyHeaders => error.HeadTooLarge,
-            };
-            last_len = buffered.len;
-            // Incomplete, with nowhere to put the rest of it. Only once a
-            // fill has been tried, because a reader whose buffer is exactly
-            // its data looks full from the start and has simply ended.
-            //
-            // This is after the scan, not after the fill: a client that
-            // sends its head and a large body in one go fills the buffer
-            // with a head that is perfectly fine.
-            if (filled and buffered.len == c.reader.buffer.len) return error.HeadTooLarge;
-        }
-
-        c.reader.fillMore() catch |err| switch (err) {
-            error.EndOfStream => {
-                if (c.reader.bufferedLen() == 0) return null;
-                return error.BadResponse;
-            },
-            error.ReadFailed => return error.ReadFailed,
-        };
-        filled = true;
-    }
+    return .{
+        .head = taken.head,
+        .framing = taken.framing,
+        .owner = c,
+        .generation = c.window.generation,
+    };
 }
 
-pub const BodyError = error{
-    /// The peer stopped before the body was complete.
-    Incomplete,
-    BadChunk,
-    ReadFailed,
-} || Io.Cancelable;
+pub const BodyError = HeadWindow.BodyError;
 
-/// Reads the whole body into `buf`.
+/// Reads the whole body into `buf`. If it doesn't fit you get an error,
+/// not a short read.
 pub fn readBody(c: *Client, buf: []u8) (BodyError || error{BodyTooLarge})![]u8 {
-    if (c.pending == .none) return buf[0..0];
-
-    c.reader.toss(c.head_len);
-    c.head_len = 0;
-
-    switch (c.pending) {
-        .none => unreachable,
-        .length => |n| {
-            if (n > buf.len) return error.BodyTooLarge;
-            const want: usize = @intCast(n);
-            c.reader.readSliceAll(buf[0..want]) catch |err| switch (err) {
-                error.EndOfStream => return error.Incomplete,
-                error.ReadFailed => return error.ReadFailed,
-            };
-            c.pending = .none;
-            return buf[0..want];
-        },
-        .until_close => {
-            var w: Io.Writer = .fixed(buf);
-            _ = c.reader.streamRemaining(&w) catch |err| switch (err) {
-                error.WriteFailed => return error.BodyTooLarge,
-                error.ReadFailed => return error.ReadFailed,
-            };
-            c.pending = .none;
-            return w.buffered();
-        },
-        .chunked => {
-            var d: chunked.Decoder = .{ .consume_trailer = true };
-            var out: usize = 0;
-            while (true) {
-                const buffered = c.reader.buffered();
-                if (buffered.len != 0) {
-                    const take = @min(buffered.len, buf.len - out);
-                    if (take == 0) return error.BodyTooLarge;
-                    @memcpy(buf[out..][0..take], buffered[0..take]);
-                    const r = d.decode(buf[out..][0..take]) catch return error.BadChunk;
-                    c.reader.toss(take - r.leftover);
-                    out += r.decoded;
-                    if (r.done) {
-                        c.pending = .none;
-                        return buf[0..out];
-                    }
-                    if (r.leftover != 0) continue;
-                }
-                c.reader.fillMore() catch |err| switch (err) {
-                    error.EndOfStream => return error.Incomplete,
-                    error.ReadFailed => return error.ReadFailed,
-                };
-            }
-        },
-    }
+    const got = try c.window.readBody(buf);
+    return got.bytes;
 }
 
-fn keepHead(c: *Client, bytes: []const u8, head: scan.ResponseHead) error{HeadTooLarge}!scan.ResponseHead {
-    if (bytes.len > c.head_buf.len) return error.HeadTooLarge;
-    const dst = c.head_buf[0..bytes.len];
-    @memcpy(dst, bytes);
+/// The response body as an `Io.Reader`, for bodies too big to hold in
+/// memory.
+pub const BodyReader = HeadWindow.BodyReader;
 
-    const base = bytes.ptr;
-    const move = struct {
-        fn f(from: []const u8, old: [*]const u8, new: []u8) []const u8 {
-            const offset = @intFromPtr(from.ptr) - @intFromPtr(old);
-            return new[offset..][0..from.len];
-        }
-    }.f;
-
-    var out = head;
-    out.reason = move(head.reason, base, dst);
-    for (c.headers[0..head.headers.len]) |*h| {
-        h.name = move(h.name, base, dst);
-        h.value = move(h.value, base, dst);
-    }
-    out.headers = c.headers[0..head.headers.len];
-    return out;
+/// A reader over the response body, valid until the next `receive`.
+///
+/// `decode_buf` is the reader's own memory. It is what the reader
+/// buffers into, and where a chunked body decodes on the way out. A few
+/// hundred bytes is plenty, and two is the minimum.
+pub fn bodyReader(c: *Client, decode_buf: []u8) BodyReader {
+    return c.window.bodyReader(decode_buf);
 }
 
-fn finishPrevious(c: *Client) ReceiveError!void {
-    switch (c.pending) {
-        .none => {},
-        else => {
-            var sink: [4096]u8 = undefined;
-            while (true) {
-                _ = c.readBody(&sink) catch |err| switch (err) {
-                    error.BodyTooLarge => continue,
-                    else => {
-                        c.pending = .none;
-                        return;
-                    },
-                };
-                return;
-            }
-        },
-    }
+/// Whether the connection may carry another exchange.
+pub fn alive(c: *const Client) bool {
+    return c.window.usable();
 }
 
 fn isToken(bytes: []const u8) bool {
-    for (bytes) |ch| if (!token_chars[ch]) return false;
+    for (bytes) |ch| if (!scan.isTokenChar(ch)) return false;
     return true;
 }
 
@@ -313,14 +208,6 @@ fn hasControl(bytes: []const u8) bool {
     return false;
 }
 
-const token_chars = blk: {
-    var t = [_]bool{false} ** 256;
-    for ("!#$%&'*+-.^_`|~") |ch| t[ch] = true;
-    for ('0'..'9' + 1) |ch| t[ch] = true;
-    for ('a'..'z' + 1) |ch| t[ch] = true;
-    for ('A'..'Z' + 1) |ch| t[ch] = true;
-    break :blk t;
-};
 
 const testing = std.testing;
 
@@ -328,16 +215,16 @@ const Harness = struct {
     reader: Io.Reader,
     writer: Io.Writer,
     headers: [16]scan.Header,
-    head_buf: [2048]u8,
+    head_buf: [16 * 1024]u8,
     out: [4096]u8,
 
     fn init(h: *Harness, input: []const u8) Client {
         h.reader = .fixed(input);
         h.writer = .fixed(&h.out);
-        return .init(testing.io, &h.reader, &h.writer, .{
+        return Client.init(testing.io, &h.reader, &h.writer, .{
             .headers = &h.headers,
             .head_buf = &h.head_buf,
-        });
+        }) catch unreachable;
     }
 
     fn sent(h: *Harness) []const u8 {
@@ -458,6 +345,8 @@ test "two responses on one connection" {
 test "an unread body is dropped before the next response" {
     var h: Harness = undefined;
     var c = h.init("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloHTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+    // Reading a body the caller skipped is opt-in now.
+    c.window.max_drain = 64 * 1024;
     try c.send(.{});
     _ = (try c.receive()).?;
     const second = (try c.receive()).?;

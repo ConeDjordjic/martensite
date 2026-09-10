@@ -72,7 +72,7 @@ fn plainHandler(io: Io, stream: net.Stream) !void {
 
     var reader = stream.reader(io, &read_buf);
     var writer = stream.writer(io, &write_buf);
-    var http: Server = .init(io, &reader.interface, &writer.interface, .{
+    var http: Server = try .init(io, &reader.interface, &writer.interface, .{
         .headers = &headers,
         .head_buf = &head_buf,
     });
@@ -125,7 +125,7 @@ fn timedHandler(io: Io, stream: net.Stream) !void {
 
     var reader: TimedReader = .init(io, stream, &read_buf, .{ .duration = seconds(5) });
     var writer = stream.writer(io, &write_buf);
-    var http: Server = .init(io, &reader.interface, &writer.interface, .{
+    var http: Server = try .init(io, &reader.interface, &writer.interface, .{
         .headers = &headers,
         .head_buf = &head_buf,
     });
@@ -252,7 +252,7 @@ test "TimedReader reads a whole request, byte count and all" {
 
             var reader: TimedReader = .init(inner, stream, &read_buf, .{ .duration = seconds(5) });
             var writer = stream.writer(inner, &write_buf);
-            var http: Server = .init(inner, &reader.interface, &writer.interface, .{
+            var http: Server = try .init(inner, &reader.interface, &writer.interface, .{
                 .headers = &headers,
                 .head_buf = &head_buf,
             });
@@ -290,7 +290,7 @@ test "TimedReader gives up on a peer that says nothing" {
 
             var reader: TimedReader = .init(inner, stream, &read_buf, .{ .duration = millis(150) });
             var writer = stream.writer(inner, &write_buf);
-            var http: Server = .init(inner, &reader.interface, &writer.interface, .{
+            var http: Server = try .init(inner, &reader.interface, &writer.interface, .{
                 .headers = &headers,
                 .head_buf = &head_buf,
             });
@@ -329,7 +329,7 @@ test "TimedReader bounds a whole head, not just each read of it" {
             // not.
             reader.startDeadline(.{ .duration = millis(300) });
             var writer = stream.writer(inner, &write_buf);
-            var http: Server = .init(inner, &reader.interface, &writer.interface, .{
+            var http: Server = try .init(inner, &reader.interface, &writer.interface, .{
                 .headers = &headers,
                 .head_buf = &head_buf,
             });
@@ -366,7 +366,7 @@ test "upgrade over a real socket keeps the early bytes" {
 
             var reader = stream.reader(inner, &read_buf);
             var writer = stream.writer(inner, &write_buf);
-            var http: Server = .init(inner, &reader.interface, &writer.interface, .{
+            var http: Server = try .init(inner, &reader.interface, &writer.interface, .{
                 .headers = &headers,
                 .head_buf = &head_buf,
             });
@@ -446,14 +446,14 @@ test "the client talks to the server over a real socket" {
             var rbuf: [4096]u8 = undefined;
             var wbuf: [4096]u8 = undefined;
             var headers: [32]martensite.Header = undefined;
-            var head_buf: [2048]u8 = undefined;
+            var head_buf: [4096]u8 = undefined;
 
             var reader = stream.reader(inner, &rbuf);
             var writer = stream.writer(inner, &wbuf);
-            var client: martensite.Client = .init(inner, &reader.interface, &writer.interface, .{
+            var client: martensite.Client = martensite.Client.init(inner, &reader.interface, &writer.interface, .{
                 .headers = &headers,
                 .head_buf = &head_buf,
-            });
+            }) catch unreachable;
 
             // Two requests on one connection.
             client.send(.{ .target = "/first", .headers = &.{
@@ -489,14 +489,14 @@ test "the client reads a chunked response from the server" {
             var rbuf: [4096]u8 = undefined;
             var wbuf: [4096]u8 = undefined;
             var headers: [32]martensite.Header = undefined;
-            var head_buf: [2048]u8 = undefined;
+            var head_buf: [4096]u8 = undefined;
 
             var reader = stream.reader(inner, &rbuf);
             var writer = stream.writer(inner, &wbuf);
-            var client: martensite.Client = .init(inner, &reader.interface, &writer.interface, .{
+            var client: martensite.Client = martensite.Client.init(inner, &reader.interface, &writer.interface, .{
                 .headers = &headers,
                 .head_buf = &head_buf,
-            });
+            }) catch unreachable;
 
             client.send(.{ .target = "/stream" }) catch return;
             const res = (client.receive() catch return) orelse return;

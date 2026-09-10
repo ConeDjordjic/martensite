@@ -12,35 +12,56 @@ const body = @import("body.zig");
 const chunked = @import("chunked.zig");
 const target_mod = @import("target.zig");
 const DateHeader = @import("Date.zig");
+const HeadWindow = @import("HeadWindow.zig");
+const FailureSource = @import("FailureSource.zig");
 const Response = @import("Response.zig");
 
 const Server = @This();
 
 io: Io,
+/// Kept around for the handover. Reading through it is the window's job.
 reader: *Io.Reader,
 writer: *Io.Writer,
-headers: []scan.Header,
-head_buf: []u8,
-trailer_buf: []u8,
+/// Owns where the reader is: head, body, drain.
+window: HeadWindow,
 date: ?*DateHeader,
+/// Where to ask why a read failed, if the reader keeps track of that.
+failure: ?FailureSource,
 
-/// Bytes of the current head still sitting at the front of the reader.
-head_len: usize = 0,
-/// Framing of the body nobody has read yet.
-pending: body.Framing = .none,
 keep_alive: bool = true,
-/// Set once a response has gone out for the current request.
-answered: bool = true,
-/// A HEAD: describe the body, do not send it.
+phase: Phase = .ready,
+/// A HEAD: describe the body, do not send it. Only meaningful while a
+/// request is in hand.
 head_only: bool = false,
-/// Another protocol owns the connection now.
-handed_over: bool = false,
-/// Raw trailer lines from the last chunked body.
-trailers_raw: []const u8 = "",
 /// The peer is waiting on a 100 Continue.
 expect_continue: bool = false,
-/// Bumped by every receive, so a stale Request is caught.
-generation: u32 = 0,
+
+/// Where the connection is in the request/response cycle.
+///
+/// A single value answers both "can I read another head" and "can I
+/// write a response", so there are no two flags to drift apart and
+/// disagree. It does not answer "will the connection outlive this
+/// message". That one is `keep_alive`, which the peer sets with its
+/// `Connection` header and a failed write can take back. `alive()` is
+/// where the two meet.
+///
+/// `Client.Phase` is the mirror of this, with the two middle states in
+/// the opposite order.
+pub const Phase = enum {
+    /// No request in hand, either before the first one or after the
+    /// last one was answered. Responding here gives you a standalone
+    /// final response, which is what an error path wants.
+    ready,
+    /// A request came in and hasn't been answered yet.
+    unanswered,
+    /// Already answered. A second response would be read as the answer
+    /// to a request the peer hasn't sent yet.
+    answered,
+    /// Another protocol owns the connection.
+    handed_over,
+    /// Nothing more will be read or written here.
+    done,
+};
 
 pub const Options = struct {
     /// Storage for the request's headers. Anything over this is
@@ -56,17 +77,40 @@ pub const Options = struct {
     /// Pass one and responses get a Date header. It caches, so you get
     /// one clock read per second instead of one per response.
     date: ?*DateHeader = null,
+    /// How much of an unread body we will read to keep the connection.
+    /// Zero, which is the default, closes it instead. Answering without
+    /// reading is common, and reading a body you already rejected is
+    /// your call.
+    max_drain: u64 = 0,
+    /// Pass one and `receive` can tell a quiet peer from a dead one.
+    /// `TimedReader.failureSource()` gives you one.
+    failure: ?FailureSource = null,
 };
 
-pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) Server {
+pub const InitError = error{
+    /// `head_buf` is smaller than the reader's buffer, so a head the
+    /// reader can hold has nowhere to be kept while its body is read.
+    /// The two limits have to agree, or the same request succeeds or
+    /// fails depending on whether it carries a body.
+    HeadBufferTooSmall,
+};
+
+pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) InitError!Server {
+    // An empty head_buf is a choice: requests with no body never need one.
+    if (options.head_buf.len != 0 and options.head_buf.len < reader.buffer.len)
+        return error.HeadBufferTooSmall;
     return .{
         .io = io,
         .reader = reader,
         .writer = writer,
-        .headers = options.headers,
-        .head_buf = options.head_buf,
-        .trailer_buf = options.trailer_buf,
+        .window = .init(reader, .{
+            .headers = options.headers,
+            .head_buf = options.head_buf,
+            .trailer_buf = options.trailer_buf,
+            .max_drain = options.max_drain,
+        }),
         .date = options.date,
+        .failure = options.failure,
     };
 }
 
@@ -84,7 +128,7 @@ pub const Request = struct {
     /// hop-by-hop and might just be something a proxy left behind.
     pub fn upgradeTo(r: Request) ?[]const u8 {
         r.check();
-        if (!connectionHas(r.head, "upgrade")) return null;
+        if (!body.connectionHas(r.head, "upgrade")) return null;
         return r.header("upgrade");
     }
 
@@ -138,7 +182,7 @@ pub const Request = struct {
 
     /// Still the current request?
     pub fn live(r: Request) bool {
-        return r.generation == r.owner.generation;
+        return r.generation == r.owner.window.generation;
     }
 
     fn check(r: Request) void {
@@ -159,184 +203,61 @@ pub const ReceiveError = error{
     Ambiguous,
     UnsupportedEncoding,
     ReadFailed,
+    /// The peer went quiet. You only get this if `Options.failure` was
+    /// set.
+    Timeout,
 } || Io.Cancelable;
 
 /// Reads the next request head, or null if the peer closed cleanly. An
 /// unread body left over from the last request gets dropped first.
 pub fn receive(s: *Server) ReceiveError!?Request {
-    if (s.handed_over) return null;
-    if (!s.keep_alive) return null;
-    try s.finishPrevious();
-
-    s.reader.toss(s.head_len);
-    s.head_len = 0;
-
-    var last_len: usize = 0;
-    var filled = false;
-    while (true) {
-        const buffered = s.reader.buffered();
-        if (buffered.len != 0) {
-            if (scan.request(buffered, s.headers, last_len)) |maybe| {
-                if (maybe) |scanned| {
-                    const framing = try body.request(scanned.head);
-                    s.expect_continue = try expectsContinue(scanned.head);
-                    s.head_only = std.mem.eql(u8, scanned.head.method, "HEAD");
-                    s.head_len = scanned.len;
-                    s.pending = framing;
-                    s.keep_alive = body.keepAlive(scanned.head);
-                    s.answered = false;
-                    const head = switch (framing) {
-                        .none => scanned.head,
-                        else => try s.keepHead(buffered[0..scanned.len], scanned.head),
-                    };
-                    s.generation +%= 1;
-                    return .{
-                        .head = head,
-                        .framing = framing,
-                        .owner = s,
-                        .generation = s.generation,
-                    };
-                }
-            } else |err| return switch (err) {
-                error.Invalid => error.BadRequest,
-                error.TooManyHeaders => error.HeadTooLarge,
-            };
-            last_len = buffered.len;
-            // Incomplete with nowhere to put the rest. After the scan,
-            // not after the fill: a client that sends head and body in one
-            // go fills the buffer with a head that is fine. And only once
-            // a fill was tried, since a reader whose buffer is its data
-            // looks full from the start.
-            if (filled and buffered.len == s.reader.buffer.len) return error.HeadTooLarge;
-        }
-
-        s.reader.fillMore() catch |err| switch (err) {
-            error.EndOfStream => {
-                // Clean close between requests is not an error.
-                if (s.reader.bufferedLen() == 0) return null;
-                return error.BadRequest;
-            },
-            error.ReadFailed => return error.ReadFailed,
-        };
-        filled = true;
+    switch (s.phase) {
+        .handed_over, .done => return null,
+        else => {},
     }
+    if (!s.keep_alive) return null;
+
+    const taken = (s.window.takeRequest() catch |err| {
+        // No request in hand, so nothing about the last one may colour
+        // the response an error path is about to write.
+        s.forgetRequest();
+        return switch (err) {
+            error.Invalid => error.BadRequest,
+            error.ReadFailed => s.readFailure(),
+            else => |e| e,
+        };
+    }) orelse {
+        s.forgetRequest();
+        s.phase = .done;
+        return null;
+    };
+
+    s.expect_continue = try expectsContinue(taken.head);
+    s.head_only = scan.Method.parse(taken.head.method) == .HEAD;
+    s.keep_alive = body.keepAlive(taken.head);
+    s.phase = .unanswered;
+
+    return .{
+        .head = taken.head,
+        .framing = taken.framing,
+        .owner = s,
+        .generation = s.window.generation,
+    };
 }
 
 /// The request body as an `Io.Reader`, for bodies too big to hold in
 /// memory.
-pub const BodyReader = struct {
-    server: *Server,
-    interface: Io.Reader,
-    /// Where chunked bytes get decoded. It is ours because the
-    /// destination might have no buffer to lend us, and the source's
-    /// might be read-only.
-    scratch: []u8,
-    left: u64,
-    decoder: chunked.Decoder,
-    finished: bool,
-    err: ?BodyError,
-
-    fn stream(io_r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
-        const b: *BodyReader = @alignCast(@fieldParentPtr("interface", io_r));
-        const s = b.server;
-        if (b.finished) return error.EndOfStream;
-
-        while (true) {
-            const buffered = s.reader.buffered();
-            if (buffered.len != 0) switch (s.pending) {
-                // A request body is never close-delimited: the connection
-                // closing is the client going away, not a framing device.
-                .none, .until_close => unreachable,
-                .length => {
-                    const take = @min(@as(u64, limit.minInt(buffered.len)), b.left);
-                    const n: usize = @intCast(take);
-                    try w.writeAll(buffered[0..n]);
-                    s.reader.toss(n);
-                    b.left -= take;
-                    if (b.left == 0) b.complete();
-                    return n;
-                },
-                .chunked => {
-                    const take = @min(limit.minInt(buffered.len), b.scratch.len);
-                    @memcpy(b.scratch[0..take], buffered[0..take]);
-                    const r = b.decoder.decode(b.scratch[0..take]) catch {
-                        b.fail(error.BadChunk);
-                        return error.ReadFailed;
-                    };
-                    // Whatever the decoder did not consume stays in the
-                    // source and comes round again.
-                    s.reader.toss(take - r.leftover);
-                    if (r.done) b.complete();
-                    if (r.decoded != 0) {
-                        try w.writeAll(b.scratch[0..r.decoded]);
-                        return r.decoded;
-                    }
-                    if (b.finished) return error.EndOfStream;
-                    // No output and nothing consumed means the decoder is
-                    // mid-header and needs bytes it has not seen.
-                    if (r.leftover == take) break;
-                    continue;
-                },
-            };
-            break;
-        }
-
-        s.reader.fillMore() catch |err| switch (err) {
-            error.EndOfStream => {
-                b.fail(error.Incomplete);
-                return error.ReadFailed;
-            },
-            error.ReadFailed => {
-                b.fail(error.ReadFailed);
-                return error.ReadFailed;
-            },
-        };
-        return 0;
-    }
-
-    fn complete(b: *BodyReader) void {
-        b.finished = true;
-        b.server.pending = .none;
-    }
-
-    fn fail(b: *BodyReader, e: BodyError) void {
-        b.err = e;
-        b.finished = true;
-        b.server.keep_alive = false;
-    }
-
-    /// What actually went wrong, once the interface says ReadFailed.
-    pub fn failure(b: *const BodyReader) ?BodyError {
-        return b.err;
-    }
-};
+pub const BodyReader = HeadWindow.BodyReader;
 
 /// A reader over the request body, valid until the next `receive`.
 ///
-/// `scratch` is for chunked bodies only. A few hundred bytes is plenty.
-pub fn bodyReader(s: *Server, scratch: []u8) Io.Writer.Error!BodyReader {
-    if (s.pending != .none) {
-        try s.sendContinue();
-        s.reader.toss(s.head_len);
-        s.head_len = 0;
-    }
-    return .{
-        .server = s,
-        .interface = .{
-            .vtable = &.{ .stream = BodyReader.stream },
-            .buffer = &.{},
-            .seek = 0,
-            .end = 0,
-        },
-        .scratch = scratch,
-        .left = switch (s.pending) {
-            .length => |n| n,
-            else => 0,
-        },
-        .decoder = .{ .consume_trailer = true },
-        .finished = s.pending == .none,
-        .err = null,
-    };
+/// `decode_buf` is the reader's own memory. It is what the reader
+/// buffers into, and where a chunked body gets decoded on the way out.
+/// It is not the size of the body and not the connection's buffer. A few
+/// hundred bytes is plenty, and two is the minimum.
+pub fn bodyReader(s: *Server, decode_buf: []u8) Io.Writer.Error!BodyReader {
+    try s.sendContinue();
+    return s.window.bodyReader(decode_buf);
 }
 
 pub const HeaderIterator = struct {
@@ -368,19 +289,6 @@ fn scanTrailers(raw: []const u8, storage: []scan.Header) scan.Error![]const scan
     return scanned.head.headers;
 }
 
-/// Whether Connection lists `token`. It is comma separated, so a substring
-/// search would match inside a longer word.
-fn connectionHas(head: scan.Head, token: []const u8) bool {
-    for (head.headers) |h| {
-        if (!std.ascii.eqlIgnoreCase(h.name, "connection")) continue;
-        var it = std.mem.splitScalar(u8, h.value, ',');
-        while (it.next()) |raw| {
-            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw, " \t"), token)) return true;
-        }
-    }
-    return false;
-}
-
 /// Tells a waiting peer to send its body. `readBody` and `bodyReader`
 /// do this for you.
 pub fn sendContinue(s: *Server) Io.Writer.Error!void {
@@ -403,80 +311,69 @@ fn expectsContinue(head: scan.Head) error{UnsupportedExpectation}!bool {
     return found;
 }
 
-pub const BodyError = error{
-    /// The peer stopped sending halfway through the body.
-    Incomplete,
-    /// The chunked encoding is malformed.
-    BadChunk,
-    ReadFailed,
-} || Io.Cancelable;
+pub const BodyError = HeadWindow.BodyError;
 
 /// Reads the whole body into `buf`. If it doesn't fit you get an error,
 /// not a short read.
 pub fn readBody(s: *Server, buf: []u8) (BodyError || Io.Writer.Error || error{BodyTooLarge})![]u8 {
-    // No body to get past, so the head stays where it is.
-    if (s.pending == .none) return buf[0..0];
-
     try s.sendContinue();
+    const got = try s.window.readBody(buf);
+    return got.bytes;
+}
 
-    s.reader.toss(s.head_len);
-    s.head_len = 0;
+pub const SendError = Response.WriteError || error{
+    /// Already answered. A second response would be read as the answer
+    /// to a request the peer hasn't sent yet.
+    AlreadyAnswered,
+};
 
-    switch (s.pending) {
-        .none, .until_close => unreachable,
-        .length => |n| {
-            if (n > buf.len) return error.BodyTooLarge;
-            const want: usize = @intCast(n);
-            s.reader.readSliceAll(buf[0..want]) catch |err| switch (err) {
-                error.EndOfStream => return error.Incomplete,
-                error.ReadFailed => return error.ReadFailed,
-            };
-            s.pending = .none;
-            return buf[0..want];
+/// `error.ReadFailed` says nothing about why. Ask the reader, if it was
+/// the kind that keeps an answer.
+fn readFailure(s: *Server) ReceiveError {
+    const f = s.failure orelse return error.ReadFailed;
+    const cause = f.last() orelse return error.ReadFailed;
+    return switch (cause) {
+        error.Timeout => error.Timeout,
+        // Everything else ends the same way: stop serving this
+        // connection. Naming them would grow every caller's switch for
+        // no decision they could make differently.
+        else => error.ReadFailed,
+    };
+}
+
+/// Forgets the last request, so nothing about it leaks into a response
+/// written with no request in hand.
+fn forgetRequest(s: *Server) void {
+    s.head_only = false;
+    s.expect_continue = false;
+    s.keep_alive = false;
+    if (s.phase == .unanswered or s.phase == .answered) s.phase = .ready;
+}
+
+/// Checks that a response can be written and records that one was. It
+/// also settles any 100 Continue we owed, because once an answer is on
+/// the wire a 100 would be a second response.
+fn startResponse(s: *Server) error{AlreadyAnswered}!void {
+    switch (s.phase) {
+        .unanswered => s.phase = .answered,
+        // Standalone final response. It closes, because there is
+        // nothing left to keep the connection for.
+        .ready => {
+            s.keep_alive = false;
+            s.phase = .done;
         },
-        .chunked => {
-            var d: chunked.Decoder = .{
-                .consume_trailer = true,
-                .trailer_buf = s.trailer_buf,
-            };
-            var out: usize = 0;
-            while (true) {
-                const buffered = s.reader.buffered();
-                if (buffered.len != 0) {
-                    const take = @min(buffered.len, buf.len - out);
-                    if (take == 0) return error.BodyTooLarge;
-                    @memcpy(buf[out..][0..take], buffered[0..take]);
-                    const r = d.decode(buf[out..][0..take]) catch return error.BadChunk;
-                    s.reader.toss(take - r.leftover);
-                    out += r.decoded;
-                    if (r.done) {
-                        s.pending = .none;
-                        s.trailers_raw = r.trailers;
-                        return buf[0..out];
-                    }
-                    if (r.leftover != 0) continue;
-                }
-                s.reader.fillMore() catch |err| switch (err) {
-                    error.EndOfStream => return error.Incomplete,
-                    error.ReadFailed => return error.ReadFailed,
-                };
-            }
-        },
+        .answered, .handed_over, .done => return error.AlreadyAnswered,
     }
 }
 
-pub const SendError = Response.WriteError;
-
 /// Writes a response and flushes it.
 pub fn respond(s: *Server, r: Response) SendError!void {
+    try s.startResponse();
     var out = r;
     // A HEAD gets the headers and none of the body.
     if (s.head_only) out.head_only = true;
-    var dated: [32]Response.Header = undefined;
-    out.headers = s.withDate(r.headers, &dated) catch return error.WriteFailed;
-    try out.write(s.writer, .{ .keep_alive = s.keep_alive });
+    try out.write(s.writer, .{ .keep_alive = s.keep_alive, .date = s.dateValue() });
     try s.writer.flush();
-    s.answered = true;
     if (!r.keep_alive) s.keep_alive = false;
 }
 
@@ -493,52 +390,30 @@ pub const StreamOptions = struct {
 pub fn respondStreaming(
     s: *Server,
     r: Response,
-    scratch: []u8,
+    out_buf: []u8,
     options: StreamOptions,
 ) SendError!ResponseWriter {
+    try s.startResponse();
+
     var head = r;
     head.body = "";
-    var dated: [32]Response.Header = undefined;
-    head.headers = s.withDate(r.headers, &dated) catch return error.WriteFailed;
 
-    const length_header: [1]Response.Header = .{.{
-        .name = "Transfer-Encoding",
-        .value = "chunked",
-    }};
-    var with_chunked: [32]Response.Header = undefined;
-    const base = head.headers;
-    if (options.content_length == null and head.status.mayHaveBody()) {
-        if (base.len + 1 > with_chunked.len) return error.WriteFailed;
-        @memcpy(with_chunked[0..base.len], base);
-        with_chunked[base.len] = length_header[0];
-        head.headers = with_chunked[0 .. base.len + 1];
-    }
-
-    var buf: [32]u8 = undefined;
-    var with_length: [32]Response.Header = undefined;
-    if (options.content_length) |n| {
-        if (base.len + 1 > with_length.len) return error.WriteFailed;
-        @memcpy(with_length[0..base.len], base);
-        with_length[base.len] = .{
-            .name = "Content-Length",
-            .value = std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable,
-        };
-        head.headers = with_length[0 .. base.len + 1];
-    }
-
-    try head.writeHead(s.writer, .{ .keep_alive = s.keep_alive });
-    s.answered = true;
+    try head.writeHead(s.writer, .{
+        .keep_alive = s.keep_alive,
+        .date = s.dateValue(),
+        .framing = if (options.content_length) |n| .{ .length = n } else .chunked,
+    });
     if (!r.keep_alive) s.keep_alive = false;
 
     return .{
         .server = s,
-        .scratch = scratch,
+        .scratch = out_buf,
         .mode = if (!head.status.mayHaveBody() or s.head_only)
             .discard
         else if (options.content_length) |n| .{ .length = n } else .chunked,
         .interface = .{
             .vtable = &.{ .drain = ResponseWriter.drain },
-            .buffer = scratch,
+            .buffer = out_buf,
         },
     };
 }
@@ -647,31 +522,25 @@ fn validTrailer(f: Response.Header) bool {
     return true;
 }
 
-/// `headers` plus a Date, if one was asked for. `storage` must outlive
-/// the write.
-fn withDate(s: *Server, headers: []const Response.Header, storage: []Response.Header) error{NoSpace}![]const Response.Header {
-    const d = s.date orelse return headers;
-    for (headers) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "date")) return headers;
-    }
-    if (headers.len + 1 > storage.len) return error.NoSpace;
-    @memcpy(storage[0..headers.len], headers);
-    storage[headers.len] = .{ .name = "Date", .value = d.value(s.io) };
-    return storage[0 .. headers.len + 1];
+/// Today's date, if the caller asked for one. `writeHead` drops it if
+/// the response already has a Date.
+fn dateValue(s: *Server) ?[]const u8 {
+    const d = s.date orelse return null;
+    return d.value(s.io);
 }
 
 /// Trailers from the request body, scanned into `storage`. Chunked
 /// bodies only, and only after the body has been read. They arrive after
 /// the body, so don't use them for framing or routing.
 pub fn trailers(s: *Server, storage: []scan.Header) scan.Error![]const scan.Header {
-    if (s.trailers_raw.len == 0) return &.{};
-    return scanTrailers(s.trailers_raw, storage);
+    if (s.window.trailers_raw.len == 0) return &.{};
+    return scanTrailers(s.window.trailers_raw, storage);
 }
 
 /// Can the connection carry another request? False while a streamed
 /// response is still open.
 pub fn alive(s: *const Server) bool {
-    return s.keep_alive and !s.handed_over;
+    return s.keep_alive and s.phase != .handed_over and s.phase != .done and s.window.usable();
 }
 
 /// Answers the handshake and stops speaking HTTP. The reader and writer
@@ -681,62 +550,21 @@ pub fn alive(s: *const Server) bool {
 /// since clients often send their first frame without waiting for the
 /// 101.
 pub fn upgrade(s: *Server, response: Response) SendError!void {
-    s.reader.toss(s.head_len);
-    s.head_len = 0;
-    s.pending = .none;
+    try s.startResponse();
+    s.window.releaseHead();
+    s.window.pending = .none;
 
     var r = response;
     r.keep_alive = true;
     try r.write(s.writer, .{ .keep_alive = true });
     try s.writer.flush();
 
-    s.answered = true;
-    s.handed_over = true;
+    s.phase = .handed_over;
 }
 
 /// Has it been handed to another protocol?
 pub fn handedOver(s: *const Server) bool {
-    return s.handed_over;
-}
-
-/// Copies the head out of the reader's buffer and re-points its slices.
-fn keepHead(s: *Server, bytes: []const u8, head: scan.Head) error{HeadTooLarge}!scan.Head {
-    if (bytes.len > s.head_buf.len) return error.HeadTooLarge;
-    const dst = s.head_buf[0..bytes.len];
-    @memcpy(dst, bytes);
-
-    const base = bytes.ptr;
-    const move = struct {
-        fn f(from: []const u8, old: [*]const u8, new: []u8) []const u8 {
-            const offset = @intFromPtr(from.ptr) - @intFromPtr(old);
-            return new[offset..][0..from.len];
-        }
-    }.f;
-
-    var out = head;
-    out.method = move(head.method, base, dst);
-    out.target = move(head.target, base, dst);
-    for (s.headers[0..head.headers.len]) |*h| {
-        h.name = move(h.name, base, dst);
-        h.value = move(h.value, base, dst);
-    }
-    out.headers = s.headers[0..head.headers.len];
-    return out;
-}
-
-/// Drops whatever the last request left behind, so the next head starts
-/// in the right place.
-fn finishPrevious(s: *Server) ReceiveError!void {
-    switch (s.pending) {
-        .none => {},
-        else => {
-            var sink: [4096]u8 = undefined;
-            _ = s.readBody(&sink) catch {
-                s.keep_alive = false;
-                return;
-            };
-        },
-    }
+    return s.phase == .handed_over;
 }
 
 const testing = std.testing;
@@ -754,9 +582,10 @@ const Harness = struct {
     small: [512]u8,
     writer: Io.Writer,
     headers: [16]scan.Header,
-    head_buf: [1024]u8,
+    head_buf: [16 * 1024]u8,
     trailer_buf: [512]u8,
     out: [8192]u8,
+    tight: [16]u8,
 
     fn init(h: *Harness, shape: Shape, input: []const u8) Server {
         h.writer = .fixed(&h.out);
@@ -772,11 +601,29 @@ const Harness = struct {
                 break :blk &h.trickle.interface;
             },
         };
-        return .init(testing.io, reader, &h.writer, .{
+        return Server.init(testing.io, reader, &h.writer, .{
             .headers = &h.headers,
             .head_buf = &h.head_buf,
             .trailer_buf = &h.trailer_buf,
-        });
+        }) catch unreachable;
+    }
+
+    /// Same, but willing to read a body the handler never touched. The
+    /// default refuses, so a test that wants the drain has to say so.
+    fn initDraining(h: *Harness, shape: Shape, input: []const u8) Server {
+        var s = h.init(shape, input);
+        s.window.max_drain = 64 * 1024;
+        return s;
+    }
+
+    /// Same, but the response has almost nowhere to go. A `fixed` writer
+    /// with room to spare cannot fail partway through a head, so nothing
+    /// built on one ever exercises a write that gives out mid-response.
+    fn initTight(h: *Harness, shape: Shape, input: []const u8) Server {
+        var s = h.init(shape, input);
+        h.writer = .fixed(&h.tight);
+        s.writer = &h.writer;
+        return s;
     }
 
     fn written(h: *Harness) []const u8 {
@@ -849,7 +696,7 @@ test "a chunked body" {
 test "an unread body is dropped before the next request" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n\r\n");
+        var s = h.initDraining(shape, "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n\r\n");
 
         _ = (try s.receive()).?;
         try s.respond(.{});
@@ -862,7 +709,7 @@ test "an unread body is dropped before the next request" {
 test "an unread chunked body is dropped too" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+        var s = h.initDraining(shape, "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
 
         _ = (try s.receive()).?;
         try s.respond(.{});
@@ -975,7 +822,7 @@ test "a body with nowhere to keep the head" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var s = h.init(shape, "POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi");
-        s.head_buf = &.{};
+        s.window.head_buf = &.{};
         try testing.expectError(error.HeadTooLarge, s.receive());
     }
 }
@@ -984,7 +831,7 @@ test "no body means no copy and no head_buf needed" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var s = h.init(shape, "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n");
-        s.head_buf = &.{};
+        s.window.head_buf = &.{};
 
         const req = (try s.receive()).?;
         try testing.expectEqualStrings("/plain", req.target());
@@ -1079,7 +926,7 @@ test "streaming a body bigger than any buffer here" {
     var w: Io.Writer = .fixed(&out);
     var headers: [8]scan.Header = undefined;
     var head_buf: [256]u8 = undefined;
-    var s: Server = .init(testing.io, &src.interface, &w, .{
+    var s: Server = try .init(testing.io, &src.interface, &w, .{
         .headers = &headers,
         .head_buf = &head_buf,
     });
@@ -1559,7 +1406,7 @@ test "a head sent together with a body that fills the buffer" {
     var ow: Io.Writer = .fixed(&out);
     var headers: [8]scan.Header = undefined;
     var head_buf: [512]u8 = undefined;
-    var s: Server = .init(testing.io, &src.interface, &ow, .{
+    var s: Server = try .init(testing.io, &src.interface, &ow, .{
         .headers = &headers,
         .head_buf = &head_buf,
     });
@@ -1582,6 +1429,174 @@ test "a head that genuinely does not fit is still refused" {
     var out: [256]u8 = undefined;
     var ow: Io.Writer = .fixed(&out);
     var headers: [64]scan.Header = undefined;
-    var s: Server = .init(testing.io, &src.interface, &ow, .{ .headers = &headers });
+    var s: Server = try .init(testing.io, &src.interface, &ow, .{ .headers = &headers });
     try testing.expectError(error.HeadTooLarge, s.receive());
+}
+
+test "an unread body is never scanned as the next request" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        // Bigger than any sink the drain might use, and made of token
+        // characters so a scanner reading it finds a request line.
+        const stuffing = "x" ** 600;
+        var s = h.init(shape, "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 600\r\n\r\n" ++
+            stuffing ++ "GET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+
+        const first = (try s.receive()).?;
+        try testing.expectEqualStrings("/a", first.target());
+
+        try s.respond(.{ .status = .unauthorized });
+
+        // The body's bytes must never reach the scanner. Either the drain
+        // consumed all of them and /b is a real request, or the
+        // connection is finished. Never a request line made of body.
+        if (try s.receive()) |second| {
+            try testing.expectEqualStrings("GET", second.method());
+            try testing.expectEqualStrings("/b", second.target());
+        } else {
+            try testing.expect(!s.alive());
+        }
+    }
+}
+
+test "a response the writer cannot hold fails instead of half-arriving" {
+    var h: Harness = undefined;
+    var s = h.initTight(.whole, "GET /hi HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    const req = (try s.receive()).?;
+    try testing.expectEqualStrings("/hi", req.target());
+
+    // 16 bytes of room and a longer status line. Part of a head is on
+    // the wire and can't be taken back, so the question is what happens
+    // next.
+    try testing.expectError(error.WriteFailed, s.respond(Response.text(.ok, "yes")));
+}
+
+test "a response with more headers than the old splice buffer held" {
+    var h: Harness = undefined;
+    var date: DateHeader = .{};
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    s.date = &date;
+
+    var many: [40]Response.Header = undefined;
+    for (&many, 0..) |*f, i| {
+        _ = i;
+        f.* = .{ .name = "X-Pad", .value = "1" };
+    }
+
+    _ = (try s.receive()).?;
+    // This used to be error.WriteFailed at 32 or more.
+    try s.respond(.{ .status = .ok, .headers = &many, .body = "hi" });
+
+    const out = h.written();
+    try testing.expect(std.mem.indexOf(u8, out, "Date: ") != null);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, out, i, "X-Pad: 1")) |at| : (i = at + 1) count += 1;
+    try testing.expectEqual(@as(usize, 40), count);
+}
+
+test "one request gets one response" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    _ = (try s.receive()).?;
+    try s.respond(.text(.ok, "first"));
+    // A second response gets read as the answer to a request the peer
+    // never sent, and then the connection is out of step.
+    try testing.expectError(error.AlreadyAnswered, s.respond(.text(.ok, "second")));
+    try testing.expect(std.mem.indexOf(u8, h.written(), "second") == null);
+}
+
+test "a response written with no request in hand forgets the last one" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n" ++ "!!! bad\r\n\r\n");
+
+    _ = (try s.receive()).?;
+    try s.respond(.text(.ok, "dropped for HEAD"));
+    try testing.expect(std.mem.indexOf(u8, h.written(), "dropped for HEAD") == null);
+
+    try testing.expectError(error.BadRequest, s.receive());
+
+    // This is not the answer to a HEAD, so it keeps its body, and it
+    // closes because there is nothing left to keep the connection for.
+    try s.respond(.text(.bad_request, "explanation"));
+    const out = h.written();
+    try testing.expect(std.mem.indexOf(u8, out, "explanation") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Connection: close") != null);
+    try testing.expect(!s.alive());
+}
+
+test "a head_buf that cannot hold what the reader can is refused at init" {
+    var read_buf: [4096]u8 = undefined;
+    var src: std.testing.Reader = .init(&read_buf, &.{});
+    var out: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&out);
+    var headers: [8]scan.Header = undefined;
+    var head_buf: [128]u8 = undefined;
+
+    // A head between 128 and 4096 bytes scans fine and then has nowhere
+    // to live once a body turns up behind it.
+    try testing.expectError(error.HeadBufferTooSmall, Server.init(testing.io, &src.interface, &w, .{
+        .headers = &headers,
+        .head_buf = &head_buf,
+    }));
+
+    _ = try Server.init(testing.io, &src.interface, &w, .{ .headers = &headers });
+}
+
+/// A reader that only ever fails, and remembers why.
+const FailingReader = struct {
+    interface: Io.Reader,
+    buf: [64]u8 = undefined,
+    why: anyerror = error.Timeout,
+
+    fn init(f: *FailingReader) void {
+        f.interface = .{
+            .vtable = &.{ .stream = failStream },
+            .buffer = &f.buf,
+            .seek = 0,
+            .end = 0,
+        };
+    }
+
+    fn failStream(_: *Io.Reader, _: *Io.Writer, _: Io.Limit) Io.Reader.StreamError!usize {
+        return error.ReadFailed;
+    }
+
+    fn cause(ctx: *anyopaque) ?anyerror {
+        const f: *FailingReader = @ptrCast(@alignCast(ctx));
+        return f.why;
+    }
+
+    fn source(f: *FailingReader) FailureSource {
+        return .{ .ctx = f, .cause = cause };
+    }
+};
+
+test "a peer that went quiet is told apart from one that went away" {
+    var out: [64]u8 = undefined;
+    var headers: [8]scan.Header = undefined;
+
+    for ([_]anyerror{ error.Timeout, error.ConnectionResetByPeer }) |why| {
+        var f: FailingReader = .{ .interface = undefined, .why = why };
+        f.init();
+        var w: Io.Writer = .fixed(&out);
+        var s = try Server.init(testing.io, &f.interface, &w, .{
+            .headers = &headers,
+            .failure = f.source(),
+        });
+        try testing.expectError(
+            if (why == error.Timeout) error.Timeout else error.ReadFailed,
+            s.receive(),
+        );
+    }
+
+    // With no failure source there is nobody to ask, so it stays a read
+    // that didn't say why.
+    var f: FailingReader = .{ .interface = undefined };
+    f.init();
+    var w: Io.Writer = .fixed(&out);
+    var s = try Server.init(testing.io, &f.interface, &w, .{ .headers = &headers });
+    try testing.expectError(error.ReadFailed, s.receive());
 }
