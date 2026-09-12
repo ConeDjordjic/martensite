@@ -143,6 +143,24 @@ pub const Response = struct {
         return r.head.headers;
     }
 
+    /// How many bytes the body has, when `Content-Length` said so.
+    ///
+    /// Null means the length is not knowable in advance: a chunked body,
+    /// one that runs until the connection closes, or no body at all.
+    pub fn contentLength(r: Response) ?u64 {
+        r.check();
+        return switch (r.framing) {
+            .length => |n| n,
+            else => null,
+        };
+    }
+
+    /// Whether there is a body to read at all.
+    pub fn hasBody(r: Response) bool {
+        r.check();
+        return r.framing != .none;
+    }
+
     pub fn live(r: Response) bool {
         return r.generation == r.owner.window.generation;
     }
@@ -382,4 +400,22 @@ test "a smuggling response is refused" {
     var c = h.init("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello");
     try c.send(.{});
     try testing.expectError(error.Ambiguous, c.receive());
+}
+
+test "a response says how long its body is" {
+    var h: Harness = undefined;
+    var c = h.init("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    try c.send(.{});
+    const res = (try c.receive()).?;
+    try testing.expectEqual(@as(?u64, 5), res.contentLength());
+    try testing.expect(res.hasBody());
+}
+
+test "a chunked response has no length to report" {
+    var h: Harness = undefined;
+    var c = h.init("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    try c.send(.{});
+    const res = (try c.receive()).?;
+    try testing.expectEqual(@as(?u64, null), res.contentLength());
+    try testing.expect(res.hasBody());
 }

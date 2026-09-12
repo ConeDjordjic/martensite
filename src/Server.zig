@@ -161,6 +161,27 @@ pub const Request = struct {
         return target_mod.parse(r.head.target);
     }
 
+    /// How many bytes the body has, when `Content-Length` said so.
+    ///
+    /// Null means the length is not knowable in advance: a chunked body,
+    /// or no body at all. `readBody` needs a buffer big enough for the
+    /// whole body, and this is how you size one without guessing at the
+    /// largest request you are willing to serve.
+    pub fn contentLength(r: Request) ?u64 {
+        r.check();
+        return switch (r.framing) {
+            .length => |n| n,
+            else => null,
+        };
+    }
+
+    /// Whether there is a body to read at all. A chunked body says yes
+    /// without saying how long.
+    pub fn hasBody(r: Request) bool {
+        r.check();
+        return r.framing != .none;
+    }
+
     /// Every header with this name, not just the first.
     pub fn headerIter(r: Request, name: []const u8) HeaderIterator {
         r.check();
@@ -1599,4 +1620,44 @@ test "a peer that went quiet is told apart from one that went away" {
     var w: Io.Writer = .fixed(&out);
     var s = try Server.init(testing.io, &f.interface, &w, .{ .headers = &headers });
     try testing.expectError(error.ReadFailed, s.receive());
+}
+
+test "the body's length is knowable before reading it" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+
+        const req = (try s.receive()).?;
+        try testing.expectEqual(@as(?u64, 5), req.contentLength());
+        try testing.expect(req.hasBody());
+
+        // This is the point of knowing the length: size the buffer to
+        // this body, not to the biggest one we would accept.
+        var exact: [5]u8 = undefined;
+        const n: usize = @intCast(req.contentLength().?);
+        try testing.expectEqualStrings("hello", try s.readBody(exact[0..n]));
+    }
+}
+
+test "a chunked body has no length to report" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "5\r\nhello\r\n0\r\n\r\n");
+
+        const req = (try s.receive()).?;
+        try testing.expectEqual(@as(?u64, null), req.contentLength());
+        try testing.expect(req.hasBody());
+    }
+}
+
+test "a request with no body reports neither" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+
+        const req = (try s.receive()).?;
+        try testing.expectEqual(@as(?u64, null), req.contentLength());
+        try testing.expect(!req.hasBody());
+    }
 }

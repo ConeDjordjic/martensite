@@ -59,6 +59,23 @@ happened to have a body, which is confusing to debug. `init` rejects that
 combination right away instead of letting it show up later as a
 `HeadTooLarge`.
 
+`readBody` needs a buffer that fits the whole body. If the request uses
+`Content-Length` you know the size before reading anything:
+
+```zig
+const n = req.contentLength() orelse return tooVague();
+if (n > max_body) return tooLarge();
+const buf = try arena.alloc(u8, n);      // this body, not the largest one
+const body = try http.readBody(buf);
+```
+
+If you skip that, the only safe size is the biggest request you are
+willing to serve, and then every small request pays for it.
+`contentLength` returns null for a chunked body, because there the length
+is not known until you read it, and also for a request with no body at
+all. Use `req.hasBody()` to tell those two apart. `Client.Response` has
+both methods too.
+
 One request gets one response. A second `respond` for the same request is
 `error.AlreadyAnswered`, because it would go out as the answer to a
 request the peer has not sent yet.
