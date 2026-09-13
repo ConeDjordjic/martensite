@@ -56,10 +56,10 @@ pub fn write(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void 
 /// prefix of whatever the caller sends next, and that is a response split.
 pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void {
     for (r.headers) |h| {
-        if (!validName(h.name) or !validValue(h.value)) return error.InvalidHeader;
+        if (!scan.validFieldName(h.name) or !scan.validFieldValue(h.value)) return error.InvalidHeader;
     }
     if (options.date) |d| {
-        if (!validValue(d)) return error.InvalidHeader;
+        if (!scan.validFieldValue(d)) return error.InvalidHeader;
     }
 
     const alive = options.keep_alive and r.keep_alive;
@@ -100,18 +100,6 @@ pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!v
     try w.writeAll("\r\n");
 }
 
-fn validName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    for (name) |c| if (!scan.isTokenChar(c)) return false;
-    return true;
-}
-
-fn validValue(value: []const u8) bool {
-    for (value) |c| {
-        if (c == '\r' or c == '\n' or c == 0) return false;
-    }
-    return true;
-}
 
 
 fn hasHeader(r: Response, name: []const u8) bool {
@@ -289,6 +277,19 @@ test "a header value cannot carry a newline" {
             .headers = &.{.{ .name = "X-Thing", .value = bad }},
         }, true, &buf));
     }
+}
+
+test "a value the Scanner refuses is not written" {
+    var buf: [256]u8 = undefined;
+    // One rule for both sides, so a head we write is one we can read.
+    for ([_][]const u8{ "a\x01b", "a\x7fb", "\x0bx" }) |bad| {
+        try testing.expectError(error.InvalidHeader, render(.{
+            .headers = &.{.{ .name = "X-Thing", .value = bad }},
+        }, true, &buf));
+    }
+    // Tab is legal in a value and the Scanner keeps it.
+    const out = try render(.{ .headers = &.{.{ .name = "X-Thing", .value = "a\tb" }} }, true, &buf);
+    try testing.expect(std.mem.indexOf(u8, out, "X-Thing: a\tb") != null);
 }
 
 test "a header name has to be a token" {

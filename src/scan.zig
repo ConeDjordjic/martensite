@@ -97,25 +97,16 @@ pub fn request(bytes: []const u8, headers: []Header, last_len: usize) Error!?Sca
     const minor_version = try s.version() orelse return null;
     if (!try s.crlf()) return null;
 
-    var n: usize = 0;
-    while (true) {
-        if (s.i >= bytes.len) return null;
-        if (bytes[s.i] == '\r' or bytes[s.i] == '\n') {
-            if (!try s.crlf()) return null;
-            return .{
-                .head = .{
-                    .method = method,
-                    .target = target,
-                    .minor_version = minor_version,
-                    .headers = headers[0..n],
-                },
-                .len = s.i,
-            };
-        }
-        if (n == headers.len) return error.TooManyHeaders;
-        headers[n] = try s.header() orelse return null;
-        n += 1;
-    }
+    const n = try s.headerLines(headers) orelse return null;
+    return .{
+        .head = .{
+            .method = method,
+            .target = target,
+            .minor_version = minor_version,
+            .headers = headers[0..n],
+        },
+        .len = s.i,
+    };
 }
 
 /// Scans a response head. Same rules as `request`.
@@ -158,25 +149,31 @@ pub fn response(bytes: []const u8, headers: []Header, last_len: usize) Error!?Sc
     }
     if (!try s.crlf()) return null;
 
+    const n = try s.headerLines(headers) orelse return null;
+    return .{
+        .head = .{
+            .status = status,
+            .reason = reason,
+            .minor_version = minor_version,
+            .headers = headers[0..n],
+        },
+        .len = s.i,
+    };
+}
+
+/// Scans trailer lines, which are header lines with no start line and
+/// no blank line after them. They arrive whole, so half a line is
+/// `Invalid` and not "come back with more".
+pub fn trailers(bytes: []const u8, storage: []Header) Error![]const Header {
+    var s: Scanner = .{ .bytes = bytes };
     var n: usize = 0;
-    while (true) {
-        if (s.i >= bytes.len) return null;
-        if (bytes[s.i] == '\r' or bytes[s.i] == '\n') {
-            if (!try s.crlf()) return null;
-            return .{
-                .head = .{
-                    .status = status,
-                    .reason = reason,
-                    .minor_version = minor_version,
-                    .headers = headers[0..n],
-                },
-                .len = s.i,
-            };
-        }
-        if (n == headers.len) return error.TooManyHeaders;
-        headers[n] = try s.header() orelse return null;
+    while (s.i < bytes.len) {
+        if (bytes[s.i] == '\r' or bytes[s.i] == '\n') break;
+        if (n == storage.len) return error.TooManyHeaders;
+        storage[n] = try s.header() orelse return error.Invalid;
         n += 1;
     }
+    return storage[0..n];
 }
 
 const Scanner = struct {
@@ -228,6 +225,22 @@ const Scanner = struct {
             return true;
         }
         return error.Invalid;
+    }
+
+    /// Header lines up to and including the blank line that ends them.
+    /// Null if the bytes could still turn into a whole block.
+    fn headerLines(s: *Scanner, storage: []Header) Error!?usize {
+        var n: usize = 0;
+        while (true) {
+            if (s.i >= s.bytes.len) return null;
+            if (s.bytes[s.i] == '\r' or s.bytes[s.i] == '\n') {
+                if (!try s.crlf()) return null;
+                return n;
+            }
+            if (n == storage.len) return error.TooManyHeaders;
+            storage[n] = try s.header() orelse return null;
+            n += 1;
+        }
     }
 
     fn header(s: *Scanner) Error!?Header {
@@ -303,6 +316,25 @@ fn interestingLanes(chunk: V) @Vector(vector_len, bool) {
     const tab = chunk == @as(V, @splat('\t'));
     const del = chunk == @as(V, @splat(0x7f));
     return (low & ~tab) | del;
+}
+
+/// Whether a field name can be written. It has to be a non-empty token,
+/// which is what `header` reads back.
+pub fn validFieldName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| if (!isTokenChar(c)) return false;
+    return true;
+}
+
+/// Whether a field value can be written. This is exactly what
+/// `scanValue` accepts, so we can't write a head our own Scanner would
+/// reject.
+pub fn validFieldValue(value: []const u8) bool {
+    for (value) |c| {
+        if (c < 0x20 and c != '\t') return false;
+        if (c == 0x7f) return false;
+    }
+    return true;
 }
 
 /// RFC 9110 token characters.

@@ -31,21 +31,16 @@ pub const Options = struct {
     max_drain: u64 = 0,
 };
 
-pub const InitError = error{
-    /// `head_buf` is smaller than the reader's buffer, so a head the
-    /// reader can hold has nowhere to be kept while its body is read.
-    HeadBufferTooSmall,
-};
+/// The window's, forwarded. It owns `head_buf` and the rules about how
+/// big it has to be.
+pub const InitError = HeadWindow.InitError;
 
 pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) InitError!Client {
-    // An empty head_buf is a choice: responses with no body never need one.
-    if (options.head_buf.len != 0 and options.head_buf.len < reader.buffer.len)
-        return error.HeadBufferTooSmall;
     return .{
         .io = io,
         .reader = reader,
         .writer = writer,
-        .window = .init(reader, .{
+        .window = try .init(reader, .{
             .headers = options.headers,
             .head_buf = options.head_buf,
             .max_drain = options.max_drain,
@@ -72,10 +67,22 @@ pub const SendError = Io.Writer.Error || error{
 };
 
 /// Writes a request and flushes it.
+///
+/// Every header gets checked before a byte is written. A rejected
+/// request leaves the writer untouched, because half a request line
+/// becomes the start of whatever gets sent next, and then you have split
+/// one request into two.
 pub fn send(c: *Client, r: Request) SendError!void {
-    if (r.method.len == 0 or !isToken(r.method)) return error.InvalidRequest;
+    if (!scan.validFieldName(r.method)) return error.InvalidRequest;
     if (r.target.len == 0 or hasControl(r.target) or
         std.mem.indexOfScalar(u8, r.target, ' ') != null) return error.InvalidRequest;
+
+    var framed = false;
+    for (r.headers) |h| {
+        if (!scan.validFieldName(h.name) or !scan.validFieldValue(h.value)) return error.InvalidHeader;
+        if (std.ascii.eqlIgnoreCase(h.name, "content-length") or
+            std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) framed = true;
+    }
 
     const w = c.writer;
     try w.writeAll(r.method);
@@ -83,11 +90,7 @@ pub fn send(c: *Client, r: Request) SendError!void {
     try w.writeAll(r.target);
     try w.writeAll(" HTTP/1.1\r\n");
 
-    var framed = false;
     for (r.headers) |h| {
-        if (!isToken(h.name) or h.name.len == 0 or hasControl(h.value)) return error.InvalidHeader;
-        if (std.ascii.eqlIgnoreCase(h.name, "content-length") or
-            std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) framed = true;
         try w.writeAll(h.name);
         try w.writeAll(": ");
         try w.writeAll(h.value);
@@ -214,11 +217,6 @@ pub fn alive(c: *const Client) bool {
     return c.window.usable();
 }
 
-fn isToken(bytes: []const u8) bool {
-    for (bytes) |ch| if (!scan.isTokenChar(ch)) return false;
-    return true;
-}
-
 fn hasControl(bytes: []const u8) bool {
     for (bytes) |ch| {
         if (ch < 0x20 or ch == 0x7f) return true;
@@ -236,12 +234,23 @@ const Harness = struct {
     head_buf: [16 * 1024]u8,
     out: [4096]u8,
 
+    /// Test knobs. All of them go through `Options`.
+    const Setup = struct {
+        /// Read a body the caller ignored. Off by default.
+        max_drain: u64 = 0,
+    };
+
     fn init(h: *Harness, input: []const u8) Client {
+        return h.initWith(input, .{});
+    }
+
+    fn initWith(h: *Harness, input: []const u8, setup: Setup) Client {
         h.reader = .fixed(input);
         h.writer = .fixed(&h.out);
         return Client.init(testing.io, &h.reader, &h.writer, .{
             .headers = &h.headers,
             .head_buf = &h.head_buf,
+            .max_drain = setup.max_drain,
         }) catch unreachable;
     }
 
@@ -276,6 +285,32 @@ test "a caller's own framing is left alone" {
         .body = "5\r\nhello\r\n0\r\n\r\n",
     });
     try testing.expect(std.mem.indexOf(u8, h.sent(), "Content-Length") == null);
+}
+
+test "the head_buf rule reaches the Client too" {
+    var read_buf: [4096]u8 = undefined;
+    var src: std.testing.Reader = .init(&read_buf, &.{});
+    var out: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&out);
+    var headers: [8]scan.Header = undefined;
+    var head_buf: [128]u8 = undefined;
+
+    try testing.expectError(error.HeadBufferTooSmall, Client.init(testing.io, &src.interface, &w, .{
+        .headers = &headers,
+        .head_buf = &head_buf,
+    }));
+}
+
+test "a refused header leaves the writer untouched" {
+    var h: Harness = undefined;
+    var c = h.init("");
+    try testing.expectError(error.InvalidHeader, c.send(.{
+        .target = "/a",
+        .headers = &.{ .{ .name = "Host", .value = "example.com" }, .{ .name = "X", .value = "a\r\nY: 2" } },
+    }));
+    // A request line already on the wire would be the prefix of the next
+    // send: a request split.
+    try testing.expectEqualStrings("", h.sent());
 }
 
 test "a request line that cannot be written" {
@@ -362,9 +397,11 @@ test "two responses on one connection" {
 
 test "an unread body is dropped before the next response" {
     var h: Harness = undefined;
-    var c = h.init("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloHTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-    // Reading a body the caller skipped is opt-in now.
-    c.window.max_drain = 64 * 1024;
+    // Reading a body the caller skipped is opt-in.
+    var c = h.initWith(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloHTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+        .{ .max_drain = 64 * 1024 },
+    );
     try c.send(.{});
     _ = (try c.receive()).?;
     const second = (try c.receive()).?;

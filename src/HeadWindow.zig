@@ -45,7 +45,18 @@ pub const Options = struct {
     max_drain: u64 = 0,
 };
 
-pub fn init(reader: *Io.Reader, options: Options) HeadWindow {
+pub const InitError = error{
+    /// `head_buf` is smaller than the reader's buffer, so a head the
+    /// reader can hold has nowhere to go while its body is read. The two
+    /// limits have to agree, otherwise the same message passes or fails
+    /// depending on whether it happens to have a body.
+    HeadBufferTooSmall,
+};
+
+pub fn init(reader: *Io.Reader, options: Options) InitError!HeadWindow {
+    // Empty is fine, because a message with no body never needs one.
+    if (options.head_buf.len != 0 and options.head_buf.len < reader.buffer.len)
+        return error.HeadBufferTooSmall;
     return .{
         .reader = reader,
         .headers = options.headers,
@@ -53,6 +64,18 @@ pub fn init(reader: *Io.Reader, options: Options) HeadWindow {
         .trailer_buf = options.trailer_buf,
         .max_drain = options.max_drain,
     };
+}
+
+/// Trailers from the last chunked body, scanned into `storage`. They
+/// point into `trailer_buf` and stay valid until the next take. Empty if
+/// the message had none, or if no `trailer_buf` was given.
+///
+/// `TooManyHeaders` means one of the buffers was too small: `storage`
+/// for the scanned headers, or `trailer_buf` for the lines. We never
+/// hand back a truncated set as if it were complete.
+pub fn trailers(w: *const HeadWindow, storage: []scan.Header) scan.Error![]const scan.Header {
+    if (w.trailers_raw.len == 0) return &.{};
+    return scan.trailers(w.trailers_raw, storage);
 }
 
 /// Can we take another head from where the reader is now?
@@ -439,6 +462,14 @@ pub fn bodyReader(w: *HeadWindow, decode_buf: []u8) BodyReader {
     };
 }
 
+/// Gives up the connection. The head bytes go and we expect no body.
+/// Whatever the peer sent after the head stays in the reader for
+/// whoever owns it next.
+pub fn handOver(w: *HeadWindow) void {
+    w.releaseHead();
+    w.pending = .none;
+}
+
 /// Drops the head bytes so the body starts at the front of the reader.
 /// Safe to call twice, since callers get here by more than one route.
 pub fn releaseHead(w: *HeadWindow) void {
@@ -513,16 +544,32 @@ const Fixture = struct {
                 break :blk &f.trickle.interface;
             },
         };
-        return .init(reader, .{
+        return HeadWindow.init(reader, .{
             .headers = &f.headers,
             .head_buf = &f.head_buf,
             .trailer_buf = &f.trailer_buf,
             .max_drain = max_drain,
-        });
+        }) catch unreachable;
     }
 };
 
 const shapes = [_]Shape{ .whole, .split };
+
+test "a head_buf smaller than the reader is refused here, not by the caller" {
+    var read_buf: [4096]u8 = undefined;
+    var src: std.testing.Reader = .init(&read_buf, &.{});
+    var headers: [8]scan.Header = undefined;
+    var head_buf: [128]u8 = undefined;
+
+    // A head between 128 and 4096 bytes scans fine and then has nowhere
+    // to live once a body turns up behind it.
+    try testing.expectError(error.HeadBufferTooSmall, HeadWindow.init(&src.interface, .{
+        .headers = &headers,
+        .head_buf = &head_buf,
+    }));
+
+    _ = try HeadWindow.init(&src.interface, .{ .headers = &headers });
+}
 
 test "a head and its body" {
     for (shapes) |shape| {
