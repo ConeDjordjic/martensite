@@ -22,12 +22,13 @@ pub const Error = error{
     UnsupportedEncoding,
 };
 
-/// Framing of a request body. RFC 9112 section 6.
-pub fn request(head: scan.Head) Error!Framing {
+/// What the head says about the length of its body, or null if it says
+/// nothing. One pass for both kinds of head, so they can't drift apart.
+fn announced(headers: []const scan.Header) Error!?Framing {
     var length: ?u64 = null;
     var transfer_encoding: ?[]const u8 = null;
 
-    for (head.headers) |h| {
+    for (headers) |h| {
         if (eqlIgnoreCase(h.name, "content-length")) {
             const v = parseLength(h.value) orelse return error.Ambiguous;
             // Repeating is only fine if it agrees.
@@ -50,7 +51,14 @@ pub fn request(head: scan.Head) Error!Framing {
     }
 
     if (length) |v| return if (v == 0) .none else .{ .length = v };
-    return .none;
+    return null;
+}
+
+/// Framing of a request body. RFC 9112 section 6.
+pub fn request(head: scan.Head) Error!Framing {
+    // A request with no framing header has no body. There is no
+    // connection close to end one with.
+    return try announced(head.headers) orelse .none;
 }
 
 /// Framing of a response body. The rules differ from a request: the method
@@ -67,28 +75,8 @@ pub fn response(head: scan.ResponseHead, request_method: []const u8) Error!Frami
     // A successful CONNECT is followed by a tunnel, not a body.
     if (method == .CONNECT and head.status >= 200 and head.status < 300) return .none;
 
-    var length: ?u64 = null;
-    var transfer_encoding: ?[]const u8 = null;
-    for (head.headers) |h| {
-        if (eqlIgnoreCase(h.name, "content-length")) {
-            const v = parseLength(h.value) orelse return error.Ambiguous;
-            if (length) |prev| {
-                if (prev != v) return error.Ambiguous;
-            }
-            length = v;
-        } else if (eqlIgnoreCase(h.name, "transfer-encoding")) {
-            if (transfer_encoding != null) return error.Ambiguous;
-            transfer_encoding = h.value;
-        }
-    }
-
-    if (transfer_encoding) |te| {
-        if (length != null) return error.Ambiguous;
-        if (!endsWithChunked(te)) return error.UnsupportedEncoding;
-        return .chunked;
-    }
-    if (length) |v| return if (v == 0) .none else .{ .length = v };
-    return .until_close;
+    // With neither header the body runs until the connection closes.
+    return try announced(head.headers) orelse .until_close;
 }
 
 /// Whether the connection can carry another request after this one.

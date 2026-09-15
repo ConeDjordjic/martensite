@@ -180,6 +180,55 @@ fn take(w: *HeadWindow, comptime kind: Kind, sent_method: []const u8) TakeError!
     }
 }
 
+/// One pass of the chunked decoder over whatever the reader has.
+///
+/// The bytes get copied into `dest` and decoded there, because a
+/// reader's buffer might be memory we can't write to. `dest` limits how
+/// much we decode in one pass, not how big a body can be. Anything the
+/// decoder didn't consume stays in the reader for the next pass.
+///
+/// All three body paths go through here. The only difference between
+/// them is where the decoded bytes end up.
+const Step = struct {
+    /// Source bytes looked at, consumed or not.
+    looked: usize,
+    /// The decoded bytes, at the front of `dest`.
+    decoded: usize,
+    outcome: enum {
+        /// Some source was consumed and the body carries on.
+        more,
+        /// Halfway through a header and wants more bytes. Fill the
+        /// reader instead of spinning.
+        need_fill,
+        /// The last chunk is in. `trailers_raw` is set.
+        done,
+        /// The chunked encoding is malformed.
+        bad,
+    },
+};
+
+fn decodeStep(w: *HeadWindow, d: *chunked.Decoder, dest: []u8) Step {
+    const buffered = w.reader.buffered();
+    const want = @min(buffered.len, dest.len);
+    if (want == 0) return .{ .looked = 0, .decoded = 0, .outcome = .need_fill };
+
+    @memcpy(dest[0..want], buffered[0..want]);
+    const r = d.decode(dest[0..want]) catch
+        return .{ .looked = want, .decoded = 0, .outcome = .bad };
+
+    const used = want - r.leftover;
+    w.reader.toss(used);
+    if (r.done) {
+        w.trailers_raw = r.trailers;
+        return .{ .looked = want, .decoded = r.decoded, .outcome = .done };
+    }
+    return .{
+        .looked = want,
+        .decoded = r.decoded,
+        .outcome = if (used == 0) .need_fill else .more,
+    };
+}
+
 /// Reads whatever body the caller didn't, so the next head starts in the
 /// right place. It needs no buffer: a counted body is discarded straight
 /// through the reader, and a chunked one decodes in place, in bytes we
@@ -218,32 +267,24 @@ fn drainPending(w: *HeadWindow) void {
             var d: chunked.Decoder = .{ .consume_trailer = true };
             var read: u64 = 0;
             while (true) {
-                const buffered = w.reader.buffered();
-                if (buffered.len != 0) {
-                    const want = @min(buffered.len, stage.len);
-                    read += want;
-                    if (read > w.max_drain) {
-                        w.finished = true;
-                        return;
-                    }
-                    @memcpy(stage[0..want], buffered[0..want]);
-                    const r = d.decode(stage[0..want]) catch {
-                        w.finished = true;
-                        return;
-                    };
-                    w.reader.toss(want - r.leftover);
-                    if (r.done) {
-                        w.pending = .none;
-                        return;
-                    }
-                    // Nothing consumed means the decoder is mid-header and
-                    // wants bytes it has not seen. Fill rather than spin.
-                    if (r.leftover != want) continue;
-                }
-                w.reader.fillMore() catch {
+                const st = w.decodeStep(&d, &stage);
+                read += st.looked;
+                if (st.outcome == .bad or read > w.max_drain) {
                     w.finished = true;
                     return;
-                };
+                }
+                switch (st.outcome) {
+                    .done => {
+                        w.pending = .none;
+                        return;
+                    },
+                    .more => continue,
+                    .need_fill => w.reader.fillMore() catch {
+                        w.finished = true;
+                        return;
+                    },
+                    .bad => unreachable,
+                }
             }
         },
     }
@@ -299,26 +340,24 @@ pub fn readBody(w: *HeadWindow, buf: []u8) (BodyError || error{BodyTooLarge})!Bo
             };
             var out: usize = 0;
             while (true) {
-                const buffered = w.reader.buffered();
-                if (buffered.len != 0) {
-                    const want = @min(buffered.len, buf.len - out);
-                    if (want == 0) return error.BodyTooLarge;
-                    @memcpy(buf[out..][0..want], buffered[0..want]);
-                    const r = d.decode(buf[out..][0..want]) catch
-                        return w.giveUp(error.BadChunk);
-                    w.reader.toss(want - r.leftover);
-                    out += r.decoded;
-                    if (r.done) {
+                // Bytes waiting with nowhere to put them: the body does
+                // not fit, which is an error and not a short read.
+                if (out == buf.len and w.reader.buffered().len != 0) return error.BodyTooLarge;
+
+                const st = w.decodeStep(&d, buf[out..]);
+                out += st.decoded;
+                switch (st.outcome) {
+                    .bad => return w.giveUp(error.BadChunk),
+                    .done => {
                         w.pending = .none;
-                        w.trailers_raw = r.trailers;
-                        return .{ .bytes = buf[0..out], .trailers = r.trailers };
-                    }
-                    if (r.leftover != want) continue;
+                        return .{ .bytes = buf[0..out], .trailers = w.trailers_raw };
+                    },
+                    .more => continue,
+                    .need_fill => w.reader.fillMore() catch |err| switch (err) {
+                        error.EndOfStream => return w.giveUp(error.Incomplete),
+                        error.ReadFailed => return w.giveUp(error.ReadFailed),
+                    },
                 }
-                w.reader.fillMore() catch |err| switch (err) {
-                    error.EndOfStream => return w.giveUp(error.Incomplete),
-                    error.ReadFailed => return w.giveUp(error.ReadFailed),
-                };
             }
         },
     }
@@ -370,27 +409,19 @@ pub const BodyReader = struct {
                     return n;
                 },
                 .chunked => {
-                    const want = @min(limit.minInt(buffered.len), b.scratch.len);
-                    @memcpy(b.scratch[0..want], buffered[0..want]);
-                    const r = b.decoder.decode(b.scratch[0..want]) catch {
+                    const room = @min(limit.minInt(buffered.len), b.scratch.len);
+                    const st = w.decodeStep(&b.decoder, b.scratch[0..room]);
+                    if (st.outcome == .bad) {
                         b.fail(error.BadChunk);
                         return error.ReadFailed;
-                    };
-                    // Whatever the decoder did not consume stays in the
-                    // source and comes round again.
-                    w.reader.toss(want - r.leftover);
-                    if (r.done) {
-                        w.trailers_raw = r.trailers;
-                        b.complete();
                     }
-                    if (r.decoded != 0) {
-                        try out.writeAll(b.scratch[0..r.decoded]);
-                        return r.decoded;
+                    if (st.outcome == .done) b.complete();
+                    if (st.decoded != 0) {
+                        try out.writeAll(b.scratch[0..st.decoded]);
+                        return st.decoded;
                     }
                     if (b.finished) return error.EndOfStream;
-                    // No output and nothing consumed means the decoder is
-                    // mid-header and needs bytes it has not seen.
-                    if (r.leftover == want) break;
+                    if (st.outcome == .need_fill) break;
                     continue;
                 },
             };
