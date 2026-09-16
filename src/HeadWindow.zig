@@ -111,19 +111,19 @@ pub fn Taken(comptime kind: Kind) type {
 
 /// The next request head, or null if there isn't going to be one.
 pub fn takeRequest(w: *HeadWindow) TakeError!?Taken(.request) {
-    return w.take(.request, "");
+    return w.take(.request, null);
 }
 
 /// The next response head. `sent_method` decides the framing, since a
 /// HEAD is answered with a length and no body.
-pub fn takeResponse(w: *HeadWindow, sent_method: []const u8) TakeError!?Taken(.response) {
+pub fn takeResponse(w: *HeadWindow, sent_method: ?scan.Method) TakeError!?Taken(.response) {
     return w.take(.response, sent_method);
 }
 
 /// Cleans up after the last head before we scan anything. There is no
 /// separate call for it, so a caller can't read a flag the drain hasn't
 /// set yet.
-fn take(w: *HeadWindow, comptime kind: Kind, sent_method: []const u8) TakeError!?Taken(kind) {
+fn take(w: *HeadWindow, comptime kind: Kind, sent_method: ?scan.Method) TakeError!?Taken(kind) {
     if (w.finished) return null;
     w.drainPending();
     if (w.finished) return null;
@@ -549,32 +549,18 @@ fn keepHead(
 
 const testing = std.testing;
 
-/// How the bytes arrive. `split` hands over one byte per read, which is the
-/// shape that has caught every real bug in this area.
-const Shape = enum { whole, split };
+const arrival = @import("arrival.zig");
+const Shape = arrival.Shape;
+const shapes = arrival.shapes;
 
 const Fixture = struct {
-    fixed: Io.Reader,
-    trickle: std.testing.Reader,
-    calls: [8192]std.testing.Reader.Call,
-    small: [512]u8,
+    source: arrival.Source(8192, 512),
     headers: [16]scan.Header,
     head_buf: [1024]u8,
     trailer_buf: [512]u8,
 
     fn init(f: *Fixture, shape: Shape, input: []const u8, max_drain: u64) HeadWindow {
-        const reader = switch (shape) {
-            .whole => blk: {
-                f.fixed = .fixed(input);
-                break :blk &f.fixed;
-            },
-            .split => blk: {
-                std.debug.assert(input.len <= f.calls.len);
-                for (f.calls[0..input.len], 0..) |*c, i| c.* = .{ .buffer = input[i..][0..1] };
-                f.trickle = .init(&f.small, f.calls[0..input.len]);
-                break :blk &f.trickle.interface;
-            },
-        };
+        const reader = f.source.reader(shape, input);
         return HeadWindow.init(reader, .{
             .headers = &f.headers,
             .head_buf = &f.head_buf,
@@ -583,8 +569,6 @@ const Fixture = struct {
         }) catch unreachable;
     }
 };
-
-const shapes = [_]Shape{ .whole, .split };
 
 test "a head_buf smaller than the reader is refused here, not by the caller" {
     var read_buf: [4096]u8 = undefined;

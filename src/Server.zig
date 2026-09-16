@@ -602,17 +602,12 @@ pub fn handedOver(s: *const Server) bool {
 
 const testing = std.testing;
 
-/// How the bytes arrive. `whole` is one buffer already in memory, which is
-/// convenient and nothing like a socket. `split` hands over one byte per
-/// read, so the reader refills and rebases constantly, which is the shape
-/// that has caught every real bug in this file.
-const Shape = enum { whole, split };
+const arrival = @import("arrival.zig");
+const Shape = arrival.Shape;
+const shapes = arrival.shapes;
 
 const Harness = struct {
-    fixed: Io.Reader,
-    trickle: std.testing.Reader,
-    calls: [1024]std.testing.Reader.Call,
-    small: [512]u8,
+    source: arrival.Source(1024, 512),
     writer: Io.Writer,
     headers: [16]scan.Header,
     head_buf: [16 * 1024]u8,
@@ -647,18 +642,7 @@ const Harness = struct {
 
     fn initWith(h: *Harness, shape: Shape, input: []const u8, setup: Setup) Server {
         h.writer = if (setup.tight_writer) .fixed(&h.tight) else .fixed(&h.out);
-        const reader = switch (shape) {
-            .whole => blk: {
-                h.fixed = .fixed(input);
-                break :blk &h.fixed;
-            },
-            .split => blk: {
-                std.debug.assert(input.len <= h.calls.len);
-                for (h.calls[0..input.len], 0..) |*c, i| c.* = .{ .buffer = input[i..][0..1] };
-                h.trickle = .init(&h.small, h.calls[0..input.len]);
-                break :blk &h.trickle.interface;
-            },
-        };
+        const reader = h.source.reader(shape, input);
         return Server.init(testing.io, reader, &h.writer, .{
             .headers = &h.headers,
             .head_buf = if (setup.keep_head) &h.head_buf else &.{},
@@ -671,8 +655,6 @@ const Harness = struct {
         return h.writer.buffered();
     }
 };
-
-const shapes = [_]Shape{ .whole, .split };
 
 test "one request and one response" {
     for (shapes) |shape| {
@@ -1282,13 +1264,11 @@ test "the target comes apart" {
         try testing.expectEqualStrings("/users/7", t.path);
         try testing.expectEqualStrings("tab=posts&page=2", t.query);
 
-        var pairs: martensite_target.Pairs = .init(t.query);
+        var pairs: target_mod.Pairs = .init(t.query);
         try testing.expectEqualStrings("tab", pairs.next().?.name);
         try testing.expectEqualStrings("2", pairs.next().?.value);
     }
 }
-
-const martensite_target = @import("target.zig");
 
 test "repeated headers all come back" {
     for (shapes) |shape| {
@@ -1689,41 +1669,12 @@ test "a head_buf that cannot hold what the reader can is refused at init" {
     _ = try Server.init(testing.io, &src.interface, &w, .{ .headers = &headers });
 }
 
-/// A reader that only ever fails, and remembers why.
-const FailingReader = struct {
-    interface: Io.Reader,
-    buf: [64]u8 = undefined,
-    why: anyerror = error.Timeout,
-
-    fn init(f: *FailingReader) void {
-        f.interface = .{
-            .vtable = &.{ .stream = failStream },
-            .buffer = &f.buf,
-            .seek = 0,
-            .end = 0,
-        };
-    }
-
-    fn failStream(_: *Io.Reader, _: *Io.Writer, _: Io.Limit) Io.Reader.StreamError!usize {
-        return error.ReadFailed;
-    }
-
-    fn cause(ctx: *anyopaque) ?anyerror {
-        const f: *FailingReader = @ptrCast(@alignCast(ctx));
-        return f.why;
-    }
-
-    fn source(f: *FailingReader) FailureSource {
-        return .{ .ctx = f, .cause = cause };
-    }
-};
-
 test "a peer that went quiet is told apart from one that went away" {
     var out: [64]u8 = undefined;
     var headers: [8]scan.Header = undefined;
 
     for ([_]anyerror{ error.Timeout, error.ConnectionResetByPeer }) |why| {
-        var f: FailingReader = .{ .interface = undefined, .why = why };
+        var f: arrival.Failing = .{ .why = why };
         f.init();
         var w: Io.Writer = .fixed(&out);
         var s = try Server.init(testing.io, &f.interface, &w, .{
@@ -1738,7 +1689,7 @@ test "a peer that went quiet is told apart from one that went away" {
 
     // With no failure source there is nobody to ask, so it stays a read
     // that didn't say why.
-    var f: FailingReader = .{ .interface = undefined };
+    var f: arrival.Failing = .{};
     f.init();
     var w: Io.Writer = .fixed(&out);
     var s = try Server.init(testing.io, &f.interface, &w, .{ .headers = &headers });

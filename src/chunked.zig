@@ -15,11 +15,9 @@ pub const Decoder = struct {
     state: State = .size,
     /// Bytes the chunk we are reading still owes us.
     left: u64 = 0,
-    /// Set once a chunk size of zero has been seen.
-    saw_last: bool = false,
-    /// Read trailer lines after the last chunk. When false, decoding stops
-    /// at the last chunk and they stay in the buffer.
-    consume_trailer: bool = false,
+    /// Read the trailer lines after the last chunk. False stops at the
+    /// last chunk and leaves them in the buffer for someone else.
+    consume_trailer: bool = true,
     hex_digits: u8 = 0,
     /// Trailers get copied here as they arrive, because the input comes
     /// in whatever pieces the socket gives us. Leave it empty to drop
@@ -177,7 +175,6 @@ pub const Decoder = struct {
 
     fn afterSize(d: *Decoder) State {
         if (d.left == 0) {
-            d.saw_last = true;
             return if (d.consume_trailer) .trailer else .done;
         }
         return .data;

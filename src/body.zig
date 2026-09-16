@@ -61,13 +61,13 @@ pub fn request(head: scan.Head) Error!Framing {
     return try announced(head.headers) orelse .none;
 }
 
-/// Framing of a response body. The rules differ from a request: the method
-/// and the status decide first, and with neither header the body runs until
-/// the connection closes.
-pub fn response(head: scan.ResponseHead, request_method: []const u8) Error!Framing {
-    // Methods are case sensitive, so this asks the one place that knows
-    // them rather than comparing loosely and disagreeing with the Server.
-    const method = scan.Method.parse(request_method);
+/// Framing of a response body. The rules are different from a request:
+/// the method and status decide first, and with neither header the body
+/// runs until close. `method` is the request's method, parsed, and null
+/// for anything we don't have a name for. We take the enum instead of
+/// the bytes so we don't have to hold a slice of the request until its
+/// response arrives.
+pub fn response(head: scan.ResponseHead, method: ?scan.Method) Error!Framing {
     // A HEAD describes a body it doesn't actually send.
     if (method) |m| if (!m.expectsBody()) return .none;
     if (head.status >= 100 and head.status < 200) return .none;
@@ -226,7 +226,7 @@ fn parseResponse(bytes: []const u8, headers: []scan.Header) scan.ResponseHead {
 
 test "a response with a length" {
     var h: [8]scan.Header = undefined;
-    const f = try response(parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n", &h), "GET");
+    const f = try response(parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n", &h), .GET);
     try testing.expectEqual(@as(u64, 9), f.length);
 }
 
@@ -234,7 +234,7 @@ test "a response with neither header runs until close" {
     var h: [8]scan.Header = undefined;
     try testing.expectEqual(
         Framing.until_close,
-        try response(parseResponse("HTTP/1.0 200 OK\r\n\r\n", &h), "GET"),
+        try response(parseResponse("HTTP/1.0 200 OK\r\n\r\n", &h), .GET),
     );
 }
 
@@ -245,7 +245,7 @@ test "the status can say there is no body whatever the headers claim" {
         "HTTP/1.1 304 Not Modified\r\nContent-Length: 9\r\n\r\n",
         "HTTP/1.1 100 Continue\r\nContent-Length: 9\r\n\r\n",
     }) |bytes| {
-        try testing.expectEqual(Framing.none, try response(parseResponse(bytes, &h), "GET"));
+        try testing.expectEqual(Framing.none, try response(parseResponse(bytes, &h), .GET));
     }
 }
 
@@ -253,7 +253,7 @@ test "a HEAD response describes a body that is not coming" {
     var h: [8]scan.Header = undefined;
     try testing.expectEqual(
         Framing.none,
-        try response(parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n", &h), "HEAD"),
+        try response(parseResponse("HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n", &h), .HEAD),
     );
 }
 
@@ -261,11 +261,11 @@ test "what follows a CONNECT is a tunnel, not a body" {
     var h: [8]scan.Header = undefined;
     try testing.expectEqual(
         Framing.none,
-        try response(parseResponse("HTTP/1.1 200 OK\r\n\r\n", &h), "CONNECT"),
+        try response(parseResponse("HTTP/1.1 200 OK\r\n\r\n", &h), .CONNECT),
     );
     try testing.expectEqual(
         Framing.until_close,
-        try response(parseResponse("HTTP/1.1 502 Bad Gateway\r\n\r\n", &h), "CONNECT"),
+        try response(parseResponse("HTTP/1.1 502 Bad Gateway\r\n\r\n", &h), .CONNECT),
     );
 }
 
@@ -274,7 +274,7 @@ test "a response can smuggle too" {
     try testing.expectError(error.Ambiguous, response(parseResponse(
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
         &h,
-    ), "GET"));
+    ), .GET));
 }
 
 test "keep alive defaults by version" {
