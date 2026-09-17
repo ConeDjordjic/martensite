@@ -11,6 +11,7 @@ const body = @import("body.zig");
 const chunked = @import("chunked.zig");
 const HeadWindow = @import("HeadWindow.zig");
 const FailureSource = @import("FailureSource.zig");
+const Message = @import("Message.zig");
 
 const Client = @This();
 
@@ -23,6 +24,9 @@ window: HeadWindow,
 /// and no body. We keep the enum instead of the bytes so that nothing
 /// holds a slice of the caller's request after the send.
 sent_method: ?scan.Method = null,
+/// What the last response said about doing another exchange. A server
+/// saying `close` is just as final as a client saying it.
+keep_alive: bool = true,
 /// Where to ask why a read failed, if the reader keeps track of that.
 failure: ?FailureSource = null,
 phase: Phase = .ready,
@@ -123,7 +127,7 @@ pub fn send(c: *Client, r: Request) SendError!void {
         .sent => return error.ExchangeOpen,
         .done => return error.Closed,
     }
-    if (!c.window.usable()) return error.Closed;
+    if (!c.keep_alive or !c.window.usable()) return error.Closed;
     if (!scan.validFieldName(r.method)) return error.InvalidRequest;
     if (r.target.len == 0 or hasControl(r.target) or
         std.mem.indexOfScalar(u8, r.target, ' ') != null) return error.InvalidRequest;
@@ -173,64 +177,11 @@ pub const ReceiveError = error{
     Timeout,
 } || Io.Cancelable;
 
-/// Points into the connection's buffers and is valid until the next `receive`.
-pub const Response = struct {
-    head: scan.ResponseHead,
-    framing: body.Framing,
-    owner: *const Client,
-    generation: u32,
+/// Points into the connection's buffers and is valid until the next
+/// `receive`. Using it after that panics in Debug and ReleaseSafe.
+pub const Response = Message.Message(.response, Client);
 
-    pub fn status(r: Response) u16 {
-        r.check();
-        return r.head.status;
-    }
-
-    pub fn reason(r: Response) []const u8 {
-        r.check();
-        return r.head.reason;
-    }
-
-    pub fn header(r: Response, name: []const u8) ?[]const u8 {
-        r.check();
-        for (r.head.headers) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
-        }
-        return null;
-    }
-
-    pub fn headers(r: Response) []const scan.Header {
-        r.check();
-        return r.head.headers;
-    }
-
-    /// How many bytes the body has, when `Content-Length` said so.
-    ///
-    /// Null means the length is not knowable in advance: a chunked body,
-    /// one that runs until the connection closes, or no body at all.
-    pub fn contentLength(r: Response) ?u64 {
-        r.check();
-        return switch (r.framing) {
-            .length => |n| n,
-            else => null,
-        };
-    }
-
-    /// Whether there is a body to read at all.
-    pub fn hasBody(r: Response) bool {
-        r.check();
-        return r.framing != .none;
-    }
-
-    pub fn live(r: Response) bool {
-        return r.generation == r.owner.window.generation;
-    }
-
-    fn check(r: Response) void {
-        if (std.debug.runtime_safety and !r.live()) {
-            @panic("response outlived the receive that produced it");
-        }
-    }
-};
+pub const HeaderIterator = Message.HeaderIterator;
 
 /// Reads the next response head, or null if the peer closed cleanly.
 ///
@@ -253,13 +204,18 @@ pub fn receive(c: *Client) ReceiveError!?Response {
     const taken = (c.window.takeResponse(c.sent_method) catch |err| return switch (err) {
         error.Invalid => error.BadResponse,
         error.ReadFailed => c.readFailure(),
-        else => |e| e,
+        error.HeadTooLarge => error.HeadTooLarge,
+        error.Ambiguous => error.Ambiguous,
+        error.UnsupportedEncoding => error.UnsupportedEncoding,
+        error.Canceled => error.Canceled,
     }) orelse {
         c.phase = .done;
         return null;
     };
 
     const interim = taken.head.status >= 100 and taken.head.status < 200;
+    // An interim response frames nothing. The real one is still coming.
+    if (!interim) c.keep_alive = body.keepAlive(.of(taken.head));
     c.phase = if (interim) .sent else .received;
 
     return .{
@@ -293,7 +249,7 @@ pub const BodyError = HeadWindow.BodyError;
 
 /// Reads the whole body into `buf`. If it doesn't fit you get an error,
 /// not a short read.
-pub fn readBody(c: *Client, buf: []u8) (BodyError || error{BodyTooLarge})![]u8 {
+pub fn readBody(c: *Client, buf: []u8) BodyError![]u8 {
     const got = try c.window.readBody(buf);
     return got.bytes;
 }
@@ -318,7 +274,7 @@ pub fn alive(c: *const Client) bool {
         .sent, .done => return false,
         .ready, .received => {},
     }
-    return c.window.usable();
+    return c.keep_alive and c.window.usable();
 }
 
 fn hasControl(bytes: []const u8) bool {
@@ -413,6 +369,68 @@ test "the head_buf rule reaches the Client too" {
         .headers = &headers,
         .head_buf = &head_buf,
     }));
+}
+
+test "a response answers the questions a request does" {
+    var h: Harness = undefined;
+    var c = h.init("HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nContent-Length: 2\r\nSet-Cookie: b=2\r\n\r\nhi");
+    try c.send(.{});
+    const res = (try c.receive()).?;
+
+    try testing.expectEqual(@as(?u64, 2), res.contentLength());
+    try testing.expect(res.hasBody());
+    try testing.expectEqual(@as(usize, 3), res.headers().len);
+
+    // Both of them, which the Client had no way to ask before.
+    var it = res.headerIter("set-cookie");
+    try testing.expectEqualStrings("a=1", it.next().?);
+    try testing.expectEqualStrings("b=2", it.next().?);
+    try testing.expectEqual(@as(?[]const u8, null), it.next());
+}
+
+test "a server that says close ends the connection" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var c = h.initShaped(
+            shape,
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi",
+            .{},
+        );
+        try c.send(.{});
+        _ = (try c.receive()).?;
+        var buf: [8]u8 = undefined;
+        try testing.expectEqualStrings("hi", try c.readBody(&buf));
+
+        try testing.expect(!c.alive());
+        try testing.expectError(error.Closed, c.send(.{}));
+    }
+}
+
+test "an HTTP/1.0 response without keep-alive ends the connection" {
+    var h: Harness = undefined;
+    var c = h.init("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
+    try c.send(.{});
+    _ = (try c.receive()).?;
+    try testing.expect(!c.alive());
+}
+
+test "a body that ran to the close leaves nothing to send on" {
+    var h: Harness = undefined;
+    var c = h.init("HTTP/1.0 200 OK\r\n\r\neverything after the head");
+    try c.send(.{});
+    _ = (try c.receive()).?;
+    var buf: [64]u8 = undefined;
+    _ = try c.readBody(&buf);
+    try testing.expect(!c.alive());
+}
+
+test "an interim response does not decide the connection" {
+    var h: Harness = undefined;
+    var c = h.init("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    try c.send(.{});
+    _ = (try c.receive()).?;
+    _ = (try c.receive()).?;
+    try testing.expect(c.alive());
 }
 
 test "one exchange at a time" {

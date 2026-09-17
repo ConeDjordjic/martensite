@@ -295,6 +295,9 @@ pub const BodyError = error{
     Incomplete,
     /// The chunked encoding is malformed.
     BadChunk,
+    /// The body doesn't fit in the buffer it was given. Only `readBody`
+    /// returns this.
+    BodyTooLarge,
     ReadFailed,
 } || Io.Cancelable;
 
@@ -307,7 +310,7 @@ pub const Body = struct {
 
 /// Reads the whole body into `buf`. If it doesn't fit you get an error,
 /// not a short read.
-pub fn readBody(w: *HeadWindow, buf: []u8) (BodyError || error{BodyTooLarge})!Body {
+pub fn readBody(w: *HeadWindow, buf: []u8) BodyError!Body {
     if (w.pending == .none) return .{ .bytes = buf[0..0] };
 
     w.releaseHead();
@@ -331,6 +334,9 @@ pub fn readBody(w: *HeadWindow, buf: []u8) (BodyError || error{BodyTooLarge})!Bo
                 error.ReadFailed => return w.giveUp(error.ReadFailed),
             };
             w.pending = .none;
+            // The body ended because the connection did. There is no
+            // next message on a socket that is going away.
+            w.finished = true;
             return .{ .bytes = out.buffered() };
         },
         .chunked => {
@@ -432,6 +438,7 @@ pub const BodyReader = struct {
             error.EndOfStream => {
                 if (w.pending == .until_close) {
                     b.complete();
+                    w.finished = true;
                     return error.EndOfStream;
                 }
                 b.fail(error.Incomplete);

@@ -15,6 +15,7 @@ const DateHeader = @import("Date.zig");
 const HeadWindow = @import("HeadWindow.zig");
 const FailureSource = @import("FailureSource.zig");
 const Response = @import("Response.zig");
+const Message = @import("Message.zig");
 
 const Server = @This();
 
@@ -114,108 +115,17 @@ pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) In
 
 /// Points into the connection's buffers and is valid until the next
 /// `receive`. Using it after that panics in Debug and ReleaseSafe.
-pub const Request = struct {
-    head: scan.Head,
-    framing: body.Framing,
-    owner: *const Server,
-    generation: u32,
+pub const Request = Message.Message(.request, Server);
 
-    /// The protocol the peer wants to switch to.
-    ///
-    /// Also needs `Connection: upgrade`. An Upgrade header on its own is
-    /// hop-by-hop and might just be something a proxy left behind.
-    pub fn upgradeTo(r: Request) ?[]const u8 {
-        r.check();
-        if (!body.connectionHas(r.head, "upgrade")) return null;
-        return r.header("upgrade");
-    }
-
-    /// The peer is waiting for a 100 Continue before it sends the body.
-    /// Reading the body sends one. Answering without reading does not.
-    pub fn expectsContinue(r: Request) bool {
-        r.check();
-        return r.owner.expect_continue;
-    }
-
-    pub fn method(r: Request) []const u8 {
-        r.check();
-        return r.head.method;
-    }
-
-    /// The method as an enum, or null if it is not one we name.
-    pub fn knownMethod(r: Request) ?scan.Method {
-        r.check();
-        return scan.Method.parse(r.head.method);
-    }
-
-    pub fn target(r: Request) []const u8 {
-        r.check();
-        return r.head.target;
-    }
-
-    /// The target taken apart. Null if it is not a shape HTTP allows.
-    pub fn parsedTarget(r: Request) ?target_mod.Target {
-        r.check();
-        return target_mod.parse(r.head.target);
-    }
-
-    /// How many bytes the body has, when `Content-Length` said so.
-    ///
-    /// Null means the length is not knowable in advance: a chunked body,
-    /// or no body at all. `readBody` needs a buffer big enough for the
-    /// whole body, and this is how you size one without guessing at the
-    /// largest request you are willing to serve.
-    pub fn contentLength(r: Request) ?u64 {
-        r.check();
-        return switch (r.framing) {
-            .length => |n| n,
-            else => null,
-        };
-    }
-
-    /// Whether there is a body to read at all. A chunked body says yes
-    /// without saying how long.
-    pub fn hasBody(r: Request) bool {
-        r.check();
-        return r.framing != .none;
-    }
-
-    /// Every header with this name, not just the first.
-    pub fn headerIter(r: Request, name: []const u8) HeaderIterator {
-        r.check();
-        return .{ .rest = r.head.headers, .name = name };
-    }
-
-    pub fn headers(r: Request) []const scan.Header {
-        r.check();
-        return r.head.headers;
-    }
-
-    pub fn header(r: Request, name: []const u8) ?[]const u8 {
-        r.check();
-        for (r.head.headers) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
-        }
-        return null;
-    }
-
-    /// Still the current request?
-    pub fn live(r: Request) bool {
-        return r.generation == r.owner.window.generation;
-    }
-
-    fn check(r: Request) void {
-        if (std.debug.runtime_safety and !r.live()) {
-            @panic("request outlived the receive that produced it");
-        }
-    }
-};
+pub const HeaderIterator = Message.HeaderIterator;
 
 pub const ReceiveError = error{
     /// Not a request.
     BadRequest,
     /// A streamed response is still open. End it first.
     ResponseOpen,
+    /// The request we have hasn't been answered. Answer it first.
+    RequestUnanswered,
     /// An Expect we don't support. Answer 417.
     UnsupportedExpectation,
     /// The head didn't fit, or it had too many headers.
@@ -235,7 +145,11 @@ pub fn receive(s: *Server) ReceiveError!?Request {
     switch (s.phase) {
         .handed_over, .done => return null,
         .streaming => return error.ResponseOpen,
-        else => {},
+        // One request, one response. Reading the next one first would
+        // frame the answer from the wrong request, and the peer would
+        // read it as the answer to the one still outstanding.
+        .unanswered => return error.RequestUnanswered,
+        .ready, .answered => {},
     }
     if (!s.keep_alive) return null;
 
@@ -245,10 +159,15 @@ pub fn receive(s: *Server) ReceiveError!?Request {
     errdefer s.forgetRequest();
 
     const taken = (s.window.takeRequest() catch |err| {
+        // Listed one by one instead of `else => |e| e`, which would
+        // make the window's error set part of ours by accident.
         return switch (err) {
             error.Invalid => error.BadRequest,
             error.ReadFailed => s.readFailure(),
-            else => |e| e,
+            error.HeadTooLarge => error.HeadTooLarge,
+            error.Ambiguous => error.Ambiguous,
+            error.UnsupportedEncoding => error.UnsupportedEncoding,
+            error.Canceled => error.Canceled,
         };
     }) orelse {
         s.forgetRequest();
@@ -258,7 +177,7 @@ pub fn receive(s: *Server) ReceiveError!?Request {
 
     s.expect_continue = try expectsContinue(taken.head);
     s.head_only = scan.Method.parse(taken.head.method) == .HEAD;
-    s.keep_alive = body.keepAlive(taken.head);
+    s.keep_alive = body.keepAlive(.of(taken.head));
     s.phase = .unanswered;
 
     return .{
@@ -284,20 +203,6 @@ pub fn bodyReader(s: *Server, decode_buf: []u8) Io.Writer.Error!BodyReader {
     return s.window.bodyReader(decode_buf);
 }
 
-pub const HeaderIterator = struct {
-    rest: []const scan.Header,
-    name: []const u8,
-
-    pub fn next(it: *HeaderIterator) ?[]const u8 {
-        while (it.rest.len != 0) {
-            const h = it.rest[0];
-            it.rest = it.rest[1..];
-            if (std.ascii.eqlIgnoreCase(h.name, it.name)) return h.value;
-        }
-        return null;
-    }
-};
-
 /// Tells a waiting peer to send its body. `readBody` and `bodyReader`
 /// do this for you.
 pub fn sendContinue(s: *Server) Io.Writer.Error!void {
@@ -322,9 +227,13 @@ fn expectsContinue(head: scan.Head) error{UnsupportedExpectation}!bool {
 
 pub const BodyError = HeadWindow.BodyError;
 
+/// The body's own errors, plus the 100 Continue that reading a body owes
+/// a waiting peer.
+pub const ReadBodyError = BodyError || Io.Writer.Error;
+
 /// Reads the whole body into `buf`. If it doesn't fit you get an error,
 /// not a short read.
-pub fn readBody(s: *Server, buf: []u8) (BodyError || Io.Writer.Error || error{BodyTooLarge})![]u8 {
+pub fn readBody(s: *Server, buf: []u8) ReadBodyError![]u8 {
     try s.sendContinue();
     const got = try s.window.readBody(buf);
     return got.bytes;
@@ -493,36 +402,46 @@ pub const ResponseWriter = struct {
     /// Every error the writer reports goes through here: half a body is
     /// on the wire, no later write can make it whole, so the connection
     /// ends after it and the writer refuses anything further.
-    fn fail(rw: *ResponseWriter, err: Io.Writer.Error) Io.Writer.Error {
+    fn fail(rw: *ResponseWriter, err: anytype) @TypeOf(err) {
         rw.server.keep_alive = false;
         rw.server.phase = .done;
         return err;
     }
 
+    pub const EndError = Io.Writer.Error || error{
+        /// A trailer name or value that cannot be written, or one that
+        /// would change the framing something has already acted on.
+        InvalidTrailer,
+        /// Fewer bytes were written than `Content-Length` promised. The
+        /// peer would wait forever for the rest.
+        LengthMismatch,
+        /// The body is over: it was ended already, or a write failed and
+        /// took the framing with it.
+        Finished,
+    };
+
     /// Ends the body and flushes. You have to call this.
-    pub fn end(rw: *ResponseWriter) Io.Writer.Error!void {
+    pub fn end(rw: *ResponseWriter) EndError!void {
         return rw.endWithTrailers(&.{});
     }
 
     /// Ends the body with trailers. Chunked only, and the peer ignores
     /// them unless the head announced them.
-    pub fn endWithTrailers(rw: *ResponseWriter, fields: []const Response.Header) Io.Writer.Error!void {
-        // Already ended, or already failed. Either way there is no open
-        // body to terminate.
-        if (rw.server.phase != .streaming) return error.WriteFailed;
+    ///
+    /// A write past `Content-Length` still arrives as `WriteFailed`,
+    /// through `interface`: an `Io.Writer` has no other word for it.
+    pub fn endWithTrailers(rw: *ResponseWriter, fields: []const Response.Header) EndError!void {
+        if (rw.server.phase != .streaming) return error.Finished;
         // Decide before writing: a trailer refused halfway through would
         // leave the terminator unwritten and the body unfinished.
-        for (fields) |f| if (!validTrailer(f)) return rw.fail(error.WriteFailed);
+        for (fields) |f| if (!validTrailer(f)) return rw.fail(error.InvalidTrailer);
 
         rw.interface.flush() catch |err| return rw.fail(err);
         const out = rw.server.writer;
         switch (rw.mode) {
             .discard => {},
             .chunked => terminate(out, fields) catch |err| return rw.fail(err),
-            .length => |left| if (left != 0) {
-                // Short of Content-Length; the peer would wait forever.
-                return rw.fail(error.WriteFailed);
-            },
+            .length => |left| if (left != 0) return rw.fail(error.LengthMismatch),
         }
         out.flush() catch |err| return rw.fail(err);
         rw.server.phase = if (rw.server.keep_alive) .answered else .done;
@@ -1133,7 +1052,7 @@ test "stopping short of the promised length is refused" {
     var scratch: [64]u8 = undefined;
     var rw = try s.respondStreaming(.{}, &scratch, .{ .content_length = 100 });
     try rw.interface.writeAll("not enough");
-    try testing.expectError(error.WriteFailed, rw.end());
+    try testing.expectError(error.LengthMismatch, rw.end());
     try testing.expect(!s.alive());
 }
 
@@ -1370,6 +1289,21 @@ test "a refused Expect does not carry the last request's HEAD over" {
     try testing.expect(std.mem.endsWith(u8, h.written(), "\r\n\r\nno"));
 }
 
+test "a second request before the first is answered is refused" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+    const first = (try s.receive()).?;
+    try testing.expectEqualStrings("/a", first.target());
+
+    // Answering now would frame the response from /b, and the peer would
+    // read it as the answer to /a.
+    try testing.expectError(error.RequestUnanswered, s.receive());
+
+    try s.respond(.{});
+    const second = (try s.receive()).?;
+    try testing.expectEqualStrings("/b", second.target());
+}
+
 test "no trailers is an empty slice" {
     for (shapes) |shape| {
         var h: Harness = undefined;
@@ -1407,7 +1341,7 @@ test "a trailer that would change the framing is refused" {
         var rw = try s.respondStreaming(.{}, &scratch, .{});
         try rw.interface.writeAll("body");
         try testing.expectError(
-            error.WriteFailed,
+            error.InvalidTrailer,
             rw.endWithTrailers(&.{.{ .name = name, .value = "1" }}),
         );
 
@@ -1426,10 +1360,10 @@ test "a refused trailer leaves the writer finished" {
     var scratch: [64]u8 = undefined;
     var rw = try s.respondStreaming(.{}, &scratch, .{});
     try rw.interface.writeAll("body");
-    try testing.expectError(error.WriteFailed, rw.endWithTrailers(&.{.{ .name = "Host", .value = "1" }}));
+    try testing.expectError(error.InvalidTrailer, rw.endWithTrailers(&.{.{ .name = "Host", .value = "1" }}));
 
     const after_first = h.written().len;
-    try testing.expectError(error.WriteFailed, rw.end());
+    try testing.expectError(error.Finished, rw.end());
     try testing.expectEqual(after_first, h.written().len);
 }
 
@@ -1458,9 +1392,11 @@ test "end after an overrun is refused" {
 
     var scratch: [4]u8 = undefined;
     var rw = try s.respondStreaming(.{}, &scratch, .{ .content_length = 4 });
+    // Going past the end comes back as WriteFailed, the only error an
+    // `Io.Writer` has.
     try testing.expectError(error.WriteFailed, rw.interface.writeAll("far too much"));
     try testing.expect(!s.alive());
-    try testing.expectError(error.WriteFailed, rw.end());
+    try testing.expectError(error.Finished, rw.end());
 }
 
 test "a Date header when one is asked for" {

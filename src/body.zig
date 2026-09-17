@@ -79,17 +79,29 @@ pub fn response(head: scan.ResponseHead, method: ?scan.Method) Error!Framing {
     return try announced(head.headers) orelse .until_close;
 }
 
-/// Whether the connection can carry another request after this one.
-pub fn keepAlive(head: scan.Head) bool {
-    if (connectionHas(head, "close")) return false;
-    if (connectionHas(head, "keep-alive")) return true;
-    return head.minor_version >= 1;
+/// The part of a head that decides how long the connection lives. The
+/// rules are the same both ways: a server saying `close` ends it just
+/// like a client does.
+pub const Connection = struct {
+    headers: []const scan.Header,
+    minor_version: u8,
+
+    pub fn of(head: anytype) Connection {
+        return .{ .headers = head.headers, .minor_version = head.minor_version };
+    }
+};
+
+/// Whether the connection can carry another message after this one.
+pub fn keepAlive(c: Connection) bool {
+    if (connectionHas(c, "close")) return false;
+    if (connectionHas(c, "keep-alive")) return true;
+    return c.minor_version >= 1;
 }
 
 /// Whether Connection lists `token`. It is comma separated, so a plain
 /// substring search would find "close" inside "not-close".
-pub fn connectionHas(head: scan.Head, token: []const u8) bool {
-    for (head.headers) |h| {
+pub fn connectionHas(c: Connection, token: []const u8) bool {
+    for (c.headers) |h| {
         if (!eqlIgnoreCase(h.name, "connection")) continue;
         var it = std.mem.splitScalar(u8, h.value, ',');
         while (it.next()) |raw| {
@@ -279,14 +291,14 @@ test "a response can smuggle too" {
 
 test "keep alive defaults by version" {
     var h: [8]scan.Header = undefined;
-    try testing.expect(keepAlive(parse("GET / HTTP/1.1\r\n\r\n", &h)));
-    try testing.expect(!keepAlive(parse("GET / HTTP/1.0\r\n\r\n", &h)));
+    try testing.expect(keepAlive(.of(parse("GET / HTTP/1.1\r\n\r\n", &h))));
+    try testing.expect(!keepAlive(.of(parse("GET / HTTP/1.0\r\n\r\n", &h))));
 }
 
 test "connection close and keep-alive" {
     var h: [8]scan.Header = undefined;
-    try testing.expect(!keepAlive(parse("GET / HTTP/1.1\r\nConnection: close\r\n\r\n", &h)));
-    try testing.expect(keepAlive(parse("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", &h)));
-    try testing.expect(!keepAlive(parse("GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n", &h)));
-    try testing.expect(!keepAlive(parse("GET / HTTP/1.1\r\nconnection: CLOSE\r\n\r\n", &h)));
+    try testing.expect(!keepAlive(.of(parse("GET / HTTP/1.1\r\nConnection: close\r\n\r\n", &h))));
+    try testing.expect(keepAlive(.of(parse("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", &h))));
+    try testing.expect(!keepAlive(.of(parse("GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n", &h))));
+    try testing.expect(!keepAlive(.of(parse("GET / HTTP/1.1\r\nconnection: CLOSE\r\n\r\n", &h))));
 }

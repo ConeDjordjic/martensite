@@ -76,9 +76,17 @@ is not known until you read it, and also for a request with no body at
 all. Use `req.hasBody()` to tell those two apart. `Client.Response` has
 both methods too.
 
-One request gets one response. A second `respond` for the same request is
-`error.AlreadyAnswered`, because it would go out as the answer to a
-request the peer has not sent yet.
+One request gets one response. Calling `respond` twice for the same
+request gives you `error.AlreadyAnswered`, because the second one would
+go out as the answer to a request the peer has not sent yet. Reading
+works the same way while a streamed response is open: `receive` returns
+`error.ResponseOpen` until `end` finishes the body.
+
+Any error from a `ResponseWriter` — `LengthMismatch` for a body that
+stopped short of what it promised, `InvalidTrailer` for one that would
+change the framing, `WriteFailed` for a write that gave out — means the
+body on the wire is not a whole one. The connection closes, and every
+later call on that writer is `Finished` and writes nothing.
 
 If the handler never reads the body, the connection ends. Reading a body
 you already rejected is up to you, so you have to say how much of it you
@@ -125,6 +133,15 @@ try client.send(.{ .method = "POST", .target = "/things", .body = payload });
 const res = (try client.receive()) orelse return error.Closed;
 const body = try client.readBody(&buf);
 ```
+
+One exchange at a time. A second `send` before the response has arrived
+is `error.ExchangeOpen`, and a `receive` with nothing outstanding is
+`error.NothingSent`. An interim `1xx` does not close the exchange, so the
+next `receive` gives you the real response.
+
+`Client.Options` has `trailer_buf` and `failure` just like `Server`'s, so
+trailers from a chunked response show up in `client.trailers(&storage)`
+and a peer that goes quiet comes back as `error.Timeout`.
 
 And responses too big to buffer stream like request bodies:
 
@@ -188,6 +205,8 @@ somewhere to ask, it can tell them apart:
 ```zig
 .failure = reader.failureSource(),   // then receive() can return error.Timeout
 ```
+
+`Client.Options` has the same field.
 
 Without it a timeout stays `error.ReadFailed`. Anything that is not a
 timeout stays `error.ReadFailed` either way, because they all end up in
