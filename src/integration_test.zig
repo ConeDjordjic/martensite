@@ -38,7 +38,41 @@ fn bind(io: Io, seed: u16) !Bound {
     return error.NoFreePort;
 }
 
-/// Runs `handler` on one connection while `client` talks to it.
+/// Where the client side puts whatever went wrong.
+///
+/// `Io.Group.concurrent` wants `Io.Cancelable!void`, so a client closure
+/// can't return a normal error and every step inside one that fails has
+/// to `return`. Without somewhere to write it down, a connection that
+/// was refused or a send that failed looks exactly like a test that
+/// passed.
+const Outcome = struct {
+    err: ?anyerror = null,
+
+    /// The first failure is the interesting one.
+    fn fail(o: *Outcome, e: anyerror) void {
+        if (o.err == null) o.err = e;
+    }
+
+    /// Unwraps it, or writes it down and gives back null so the caller
+    /// can `orelse return`.
+    fn ok(o: *Outcome, result: anytype) ?@typeInfo(@TypeOf(result)).error_union.payload {
+        return result catch |e| {
+            o.fail(e);
+            return null;
+        };
+    }
+
+    fn expect(o: *Outcome, condition: bool) void {
+        if (!condition) o.fail(error.TestUnexpectedResult);
+    }
+
+    fn check(o: Outcome) !void {
+        if (o.err) |e| return e;
+    }
+};
+
+/// Runs `handler` on one connection while `client` talks to it. Both
+/// sides have to pass.
 fn exchange(
     io: Io,
     seed: u16,
@@ -48,11 +82,12 @@ fn exchange(
     var bound = try bind(io, seed);
     defer bound.server.deinit(io);
 
+    var outcome: Outcome = .{};
     var group: Io.Group = .init;
     defer group.cancel(io);
     // Not Group.async, which might wait until await, and we await after
     // the accept below.
-    try group.concurrent(io, client, .{ io, bound.address });
+    try group.concurrent(io, client, .{ io, bound.address, &outcome });
 
     const stream = try bound.server.accept(io);
     const result = handler(io, stream);
@@ -61,6 +96,7 @@ fn exchange(
     stream.close(io);
     try group.await(io);
     try result;
+    try outcome.check();
 }
 
 /// The server side of most of these.
@@ -149,19 +185,19 @@ test "a body larger than the TimedReader buffer" {
     // this.
     const io = testing.io;
     try exchange(io, 39600, timedHandler, struct {
-        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
             const size = 8000;
             var request: [size + 128]u8 = undefined;
-            const head = std.fmt.bufPrint(
+            const head = out.ok(std.fmt.bufPrint(
                 &request,
                 "POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\n\r\n",
                 .{size},
-            ) catch return;
+            )) orelse return;
             @memset(request[head.len..][0..size], 'x');
 
-            var out: [4096]u8 = undefined;
-            const reply = send(inner, address, request[0 .. head.len + size], &out) catch return;
-            std.debug.assert(std.mem.endsWith(u8, reply, "8000"));
+            var reply_buf: [4096]u8 = undefined;
+            const reply = out.ok(send(inner, address, request[0 .. head.len + size], &reply_buf)) orelse return;
+            out.expect(std.mem.endsWith(u8, reply, "8000"));
         }
     }.f);
 }
@@ -169,11 +205,11 @@ test "a body larger than the TimedReader buffer" {
 test "a real request over a real socket" {
     const io = testing.io;
     try exchange(io, 39100, plainHandler, struct {
-        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
-            var out: [4096]u8 = undefined;
-            const reply = send(inner, address, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n", &out) catch return;
-            std.debug.assert(std.mem.startsWith(u8, reply, "HTTP/1.1 200 OK\r\n"));
-            std.debug.assert(std.mem.endsWith(u8, reply, "\r\n\r\n/hello"));
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
+            var reply_buf: [4096]u8 = undefined;
+            const reply = out.ok(send(inner, address, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n", &reply_buf)) orelse return;
+            out.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 200 OK\r\n"));
+            out.expect(std.mem.endsWith(u8, reply, "\r\n\r\n/hello"));
         }
     }.f);
 }
@@ -181,16 +217,16 @@ test "a real request over a real socket" {
 test "keep-alive over a real socket" {
     const io = testing.io;
     try exchange(io, 39200, plainHandler, struct {
-        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
-            var out: [4096]u8 = undefined;
-            const reply = send(
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
+            var reply_buf: [4096]u8 = undefined;
+            const reply = out.ok(send(
                 inner,
                 address,
                 "GET /one HTTP/1.1\r\n\r\nGET /two HTTP/1.1\r\n\r\n",
-                &out,
-            ) catch return;
-            std.debug.assert(std.mem.indexOf(u8, reply, "/one") != null);
-            std.debug.assert(std.mem.indexOf(u8, reply, "/two") != null);
+                &reply_buf,
+            )) orelse return;
+            out.expect(std.mem.indexOf(u8, reply, "/one") != null);
+            out.expect(std.mem.indexOf(u8, reply, "/two") != null);
         }
     }.f);
 }
@@ -198,8 +234,8 @@ test "keep-alive over a real socket" {
 test "a chunked body over a real socket, arriving in pieces" {
     const io = testing.io;
     try exchange(io, 39300, plainHandler, struct {
-        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
-            const stream = address.connect(inner, .{ .mode = .stream }) catch return;
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
+            const stream = out.ok(address.connect(inner, .{ .mode = .stream })) orelse return;
             defer stream.close(inner);
             var wbuf: [512]u8 = undefined;
             var writer = stream.writer(inner, &wbuf);
@@ -211,18 +247,18 @@ test "a chunked body over a real socket, arriving in pieces" {
                 "\r\n0\r\n\r\n",
             };
             for (pieces) |p| {
-                writer.interface.writeAll(p) catch return;
-                writer.interface.flush() catch return;
+                _ = out.ok(writer.interface.writeAll(p)) orelse return;
+                _ = out.ok(writer.interface.flush()) orelse return;
                 millis(5).sleep(inner) catch {};
             }
             stream.shutdown(inner, .send) catch {};
 
             var rbuf: [64]u8 = undefined;
             var reader = stream.reader(inner, &rbuf);
-            var out: [4096]u8 = undefined;
-            var w: Io.Writer = .fixed(&out);
+            var reply_buf: [4096]u8 = undefined;
+            var w: Io.Writer = .fixed(&reply_buf);
             _ = reader.interface.streamRemaining(&w) catch {};
-            std.debug.assert(std.mem.endsWith(u8, w.buffered(), "\r\n\r\nhello world"));
+            out.expect(std.mem.endsWith(u8, w.buffered(), "\r\n\r\nhello world"));
         }
     }.f);
 }
@@ -230,11 +266,11 @@ test "a chunked body over a real socket, arriving in pieces" {
 test "a streamed response over a real socket" {
     const io = testing.io;
     try exchange(io, 39400, plainHandler, struct {
-        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
-            var out: [4096]u8 = undefined;
-            const reply = send(inner, address, "GET /stream HTTP/1.1\r\n\r\n", &out) catch return;
-            std.debug.assert(std.mem.indexOf(u8, reply, "Transfer-Encoding: chunked") != null);
-            std.debug.assert(std.mem.endsWith(u8, reply, "0\r\n\r\n"));
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
+            var reply_buf: [4096]u8 = undefined;
+            const reply = out.ok(send(inner, address, "GET /stream HTTP/1.1\r\n\r\n", &reply_buf)) orelse return;
+            out.expect(std.mem.indexOf(u8, reply, "Transfer-Encoding: chunked") != null);
+            out.expect(std.mem.endsWith(u8, reply, "0\r\n\r\n"));
             std.debug.assert(std.mem.indexOf(u8, reply, "0,1,2,3,4,") != null or
                 std.mem.indexOf(u8, reply, "2\r\n0,") != null);
         }
@@ -266,15 +302,15 @@ test "TimedReader reads a whole request, byte count and all" {
             try http.respond(.text(.ok, "counted"));
         }
     }.f, struct {
-        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
             var request: [2200]u8 = undefined;
             var w: Io.Writer = .fixed(&request);
-            w.writeAll("POST /upload HTTP/1.1\r\nContent-Length: 2000\r\n\r\n") catch return;
-            w.splatByteAll('z', 2000) catch return;
+            _ = out.ok(w.writeAll("POST /upload HTTP/1.1\r\nContent-Length: 2000\r\n\r\n")) orelse return;
+            _ = out.ok(w.splatByteAll('z', 2000)) orelse return;
 
-            var out: [1024]u8 = undefined;
-            const reply = send(inner, address, w.buffered(), &out) catch return;
-            std.debug.assert(std.mem.endsWith(u8, reply, "counted"));
+            var reply_buf: [1024]u8 = undefined;
+            const reply = out.ok(send(inner, address, w.buffered(), &reply_buf)) orelse return;
+            out.expect(std.mem.endsWith(u8, reply, "counted"));
         }
     }.f);
 }
@@ -306,8 +342,8 @@ test "TimedReader gives up on a peer that says nothing" {
             try testing.expect(waited < 3 * std.time.ns_per_s);
         }
     }.f, struct {
-        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
-            const stream = address.connect(inner, .{ .mode = .stream }) catch return;
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
+            const stream = out.ok(address.connect(inner, .{ .mode = .stream })) orelse return;
             defer stream.close(inner);
             // Connect, send nothing, wait to get dropped.
             millis(600).sleep(inner) catch {};
@@ -338,14 +374,16 @@ test "TimedReader bounds a whole head, not just each read of it" {
             try testing.expectEqual(TimedReader.Error.Timeout, reader.failure().?);
         }
     }.f, struct {
-        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
-            const stream = address.connect(inner, .{ .mode = .stream }) catch return;
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
+            const stream = out.ok(address.connect(inner, .{ .mode = .stream })) orelse return;
             defer stream.close(inner);
             var wbuf: [512]u8 = undefined;
             var writer = stream.writer(inner, &wbuf);
-            writer.interface.writeAll("GET / HTTP/1.1\r\n") catch return;
-            writer.interface.flush() catch return;
-            // A header every 50ms, never finishing.
+            _ = out.ok(writer.interface.writeAll("GET / HTTP/1.1\r\n")) orelse return;
+            _ = out.ok(writer.interface.flush()) orelse return;
+            // A header every 50ms and never finishing. The server hangs
+            // up at 300ms, which is the whole point, so a failed write
+            // from here is what we expect.
             for (0..20) |_| {
                 millis(50).sleep(inner) catch return;
                 writer.interface.writeAll("X-Pad: y\r\n") catch return;
@@ -390,16 +428,16 @@ test "upgrade over a real socket keeps the early bytes" {
             try writer.interface.flush();
         }
     }.f, struct {
-        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
-            var out: [1024]u8 = undefined;
-            const reply = send(
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
+            var reply_buf: [1024]u8 = undefined;
+            const reply = out.ok(send(
                 inner,
                 address,
                 "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nEARLYFRAME",
-                &out,
-            ) catch return;
-            std.debug.assert(std.mem.startsWith(u8, reply, "HTTP/1.1 101 "));
-            std.debug.assert(std.mem.endsWith(u8, reply, "PONG"));
+                &reply_buf,
+            )) orelse return;
+            out.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 101 "));
+            out.expect(std.mem.endsWith(u8, reply, "PONG"));
         }
     }.f);
 }
@@ -407,31 +445,31 @@ test "upgrade over a real socket keeps the early bytes" {
 test "100-continue over a real socket" {
     const io = testing.io;
     try exchange(io, 39900, plainHandler, struct {
-        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
-            const stream = address.connect(inner, .{ .mode = .stream }) catch return;
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
+            const stream = out.ok(address.connect(inner, .{ .mode = .stream })) orelse return;
             defer stream.close(inner);
             var wbuf: [512]u8 = undefined;
             var writer = stream.writer(inner, &wbuf);
 
-            writer.interface.writeAll(
+            _ = out.ok(writer.interface.writeAll(
                 "POST /echo HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n",
-            ) catch return;
-            writer.interface.flush() catch return;
+            )) orelse return;
+            _ = out.ok(writer.interface.flush()) orelse return;
 
             // Waits to be told, the way curl does.
             var rbuf: [256]u8 = undefined;
             var reader = stream.reader(inner, &rbuf);
-            const line = reader.interface.takeDelimiterInclusive('\n') catch return;
-            std.debug.assert(std.mem.startsWith(u8, line, "HTTP/1.1 100 Continue"));
+            const line = out.ok(reader.interface.takeDelimiterInclusive('\n')) orelse return;
+            out.expect(std.mem.startsWith(u8, line, "HTTP/1.1 100 Continue"));
 
-            writer.interface.writeAll("body") catch return;
-            writer.interface.flush() catch return;
+            _ = out.ok(writer.interface.writeAll("body")) orelse return;
+            _ = out.ok(writer.interface.flush()) orelse return;
             stream.shutdown(inner, .send) catch {};
 
-            var out: [1024]u8 = undefined;
-            var w: Io.Writer = .fixed(&out);
+            var reply_buf: [1024]u8 = undefined;
+            var w: Io.Writer = .fixed(&reply_buf);
             _ = reader.interface.streamRemaining(&w) catch {};
-            std.debug.assert(std.mem.endsWith(u8, w.buffered(), "body"));
+            out.expect(std.mem.endsWith(u8, w.buffered(), "body"));
         }
     }.f);
 }
@@ -439,8 +477,8 @@ test "100-continue over a real socket" {
 test "the client talks to the server over a real socket" {
     const io = testing.io;
     try exchange(io, 40100, plainHandler, struct {
-        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
-            const stream = address.connect(inner, .{ .mode = .stream }) catch return;
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
+            const stream = out.ok(address.connect(inner, .{ .mode = .stream })) orelse return;
             defer stream.close(inner);
 
             var rbuf: [4096]u8 = undefined;
@@ -456,25 +494,25 @@ test "the client talks to the server over a real socket" {
             }) catch unreachable;
 
             // Two requests on one connection.
-            client.send(.{ .target = "/first", .headers = &.{
+            out.ok(client.send(.{ .target = "/first", .headers = &.{
                 .{ .name = "Host", .value = "x" },
-            } }) catch return;
-            const first = (client.receive() catch return) orelse return;
-            std.debug.assert(first.status() == 200);
+            } })) orelse return;
+            const first = (out.ok(client.receive()) orelse return) orelse return;
+            out.expect(first.status() == 200);
             var buf: [256]u8 = undefined;
-            const b1 = client.readBody(&buf) catch return;
-            std.debug.assert(std.mem.eql(u8, b1, "/first"));
+            const b1 = out.ok(client.readBody(&buf)) orelse return;
+            out.expect(std.mem.eql(u8, b1, "/first"));
 
-            client.send(.{
+            out.ok(client.send(.{
                 .method = "POST",
                 .target = "/echo",
                 .headers = &.{.{ .name = "Host", .value = "x" }},
                 .body = "round trip",
-            }) catch return;
-            const second = (client.receive() catch return) orelse return;
-            std.debug.assert(second.status() == 200);
-            const b2 = client.readBody(&buf) catch return;
-            std.debug.assert(std.mem.eql(u8, b2, "round trip"));
+            })) orelse return;
+            const second = (out.ok(client.receive()) orelse return) orelse return;
+            out.expect(second.status() == 200);
+            const b2 = out.ok(client.readBody(&buf)) orelse return;
+            out.expect(std.mem.eql(u8, b2, "round trip"));
         }
     }.f);
 }
@@ -482,8 +520,8 @@ test "the client talks to the server over a real socket" {
 test "the client reads a chunked response from the server" {
     const io = testing.io;
     try exchange(io, 40200, plainHandler, struct {
-        fn f(inner: Io, address: net.IpAddress) Io.Cancelable!void {
-            const stream = address.connect(inner, .{ .mode = .stream }) catch return;
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
+            const stream = out.ok(address.connect(inner, .{ .mode = .stream })) orelse return;
             defer stream.close(inner);
 
             var rbuf: [4096]u8 = undefined;
@@ -498,12 +536,12 @@ test "the client reads a chunked response from the server" {
                 .head_buf = &head_buf,
             }) catch unreachable;
 
-            client.send(.{ .target = "/stream" }) catch return;
+            _ = out.ok(client.send(.{ .target = "/stream" })) orelse return;
             const res = (client.receive() catch return) orelse return;
-            std.debug.assert(std.mem.eql(u8, res.header("transfer-encoding").?, "chunked"));
+            out.expect(std.mem.eql(u8, res.header("transfer-encoding").?, "chunked"));
             var buf: [256]u8 = undefined;
-            const b = client.readBody(&buf) catch return;
-            std.debug.assert(std.mem.eql(u8, b, "0,1,2,3,4,"));
+            const b = out.ok(client.readBody(&buf)) orelse return;
+            out.expect(std.mem.eql(u8, b, "0,1,2,3,4,"));
         }
     }.f);
 }

@@ -15,3 +15,13 @@ cause: *const fn (*anyopaque) ?anyerror,
 pub fn last(f: FailureSource) ?anyerror {
     return f.cause(f.ctx);
 }
+
+/// What to report a `ReadFailed` as. Only `Timeout` gets its own error.
+/// Reset, no route and out of resources all end the connection the same
+/// way, so there would be nothing for the caller to decide.
+/// Takes an optional so callers without a source can still call it.
+pub fn readError(f: ?FailureSource) error{ Timeout, ReadFailed } {
+    const src = f orelse return error.ReadFailed;
+    const cause = src.last() orelse return error.ReadFailed;
+    return if (cause == error.Timeout) error.Timeout else error.ReadFailed;
+}

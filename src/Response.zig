@@ -5,6 +5,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const scan = @import("scan.zig");
+const field = @import("field.zig");
 
 const Response = @This();
 
@@ -16,10 +17,8 @@ keep_alive: bool = true,
 /// Drop the body but keep its Content-Length. For HEAD.
 head_only: bool = false,
 
-pub const Header = struct {
-    name: []const u8,
-    value: []const u8,
-};
+/// The Scanner's one. The same `Header` for both directions.
+pub const Header = field.Header;
 
 pub const WriteOptions = struct {
     /// Decided by the caller from the request.
@@ -55,9 +54,7 @@ pub fn write(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void 
 /// refused leaves the writer untouched, because a partial head becomes the
 /// prefix of whatever the caller sends next, and that is a response split.
 pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void {
-    for (r.headers) |h| {
-        if (!scan.validFieldName(h.name) or !scan.validFieldValue(h.value)) return error.InvalidHeader;
-    }
+    field.check(r.headers, .header) catch return error.InvalidHeader;
     if (options.date) |d| {
         if (!scan.validFieldValue(d)) return error.InvalidHeader;
     }
@@ -69,12 +66,7 @@ pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!v
     try w.writeAll(r.status.phrase());
     try w.writeAll("\r\n");
 
-    for (r.headers) |h| {
-        try w.writeAll(h.name);
-        try w.writeAll(": ");
-        try w.writeAll(h.value);
-        try w.writeAll("\r\n");
-    }
+    try field.write(w, r.headers);
 
     // 1xx, 204 and 304 have no body. A Content-Length on one makes the
     // peer read the next response as this one's.
@@ -99,8 +91,6 @@ pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!v
 
     try w.writeAll("\r\n");
 }
-
-
 
 fn hasHeader(r: Response, name: []const u8) bool {
     for (r.headers) |h| {
@@ -176,6 +166,27 @@ pub const Status = enum(u16) {
     http_version_not_supported = 505,
 
     _,
+
+    /// What to answer when we reject a request.
+    ///
+    /// The errors are ours, so the mapping is ours too. Only the ones
+    /// the peer caused get a 4xx. Everything else, including a mistake
+    /// by the caller, is a 500.
+    ///
+    /// This says nothing about keeping the connection. None of these
+    /// leave the reader on a message boundary, so whatever response
+    /// carries one is the last.
+    pub fn forError(err: anyerror) Status {
+        return switch (err) {
+            error.Timeout => .request_timeout,
+            error.HeadTooLarge => .request_header_fields_too_large,
+            error.UnsupportedExpectation => .expectation_failed,
+            error.BodyTooLarge => .payload_too_large,
+            error.UnsupportedEncoding => .not_implemented,
+            error.Ambiguous, error.BadRequest, error.Incomplete, error.BadChunk => .bad_request,
+            else => .bad_request,
+        };
+    }
 
     /// Whether this status is allowed to have a body.
     pub fn mayHaveBody(s: Status) bool {
@@ -301,6 +312,20 @@ test "a header name has to be a token" {
     }
 }
 
+test "every refusal this library can return has a status" {
+    // Server.ReceiveError plus whatever reading a body can return.
+    // Anything new that nobody named yet gets a 500 instead of blaming
+    // the peer.
+    try testing.expectEqual(Status.request_timeout, Status.forError(error.Timeout));
+    try testing.expectEqual(Status.request_header_fields_too_large, Status.forError(error.HeadTooLarge));
+    try testing.expectEqual(Status.expectation_failed, Status.forError(error.UnsupportedExpectation));
+    try testing.expectEqual(Status.payload_too_large, Status.forError(error.BodyTooLarge));
+    try testing.expectEqual(Status.not_implemented, Status.forError(error.UnsupportedEncoding));
+    try testing.expectEqual(Status.bad_request, Status.forError(error.Ambiguous));
+    try testing.expectEqual(Status.bad_request, Status.forError(error.BadRequest));
+    try testing.expectEqual(Status.bad_request, Status.forError(error.ReadFailed));
+}
+
 test "statuses that cannot have a body do not get a length" {
     var buf: [256]u8 = undefined;
     for ([_]Status{ .@"continue", .switching_protocols, .no_content, .not_modified }) |st| {
@@ -310,8 +335,6 @@ test "statuses that cannot have a body do not get a length" {
         try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n"));
     }
 }
-
-
 
 test "an unnamed status still writes" {
     var buf: [256]u8 = undefined;

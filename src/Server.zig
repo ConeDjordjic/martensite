@@ -16,6 +16,7 @@ const HeadWindow = @import("HeadWindow.zig");
 const FailureSource = @import("FailureSource.zig");
 const Response = @import("Response.zig");
 const Message = @import("Message.zig");
+const field = @import("field.zig");
 
 const Server = @This();
 
@@ -34,7 +35,8 @@ phase: Phase = .ready,
 /// A HEAD: describe the body, do not send it. Only meaningful while a
 /// request is in hand.
 head_only: bool = false,
-/// The peer is waiting on a 100 Continue.
+/// We owe the peer a 100 Continue. `expectsContinue` says what the
+/// request asked for, and this says what is still left to do about it.
 expect_continue: bool = false,
 
 /// Where the connection is in the request/response cycle.
@@ -115,7 +117,7 @@ pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) In
 
 /// Points into the connection's buffers and is valid until the next
 /// `receive`. Using it after that panics in Debug and ReleaseSafe.
-pub const Request = Message.Message(.request, Server);
+pub const Request = Message.Message(.request);
 
 pub const HeaderIterator = Message.HeaderIterator;
 
@@ -163,7 +165,7 @@ pub fn receive(s: *Server) ReceiveError!?Request {
         // make the window's error set part of ours by accident.
         return switch (err) {
             error.Invalid => error.BadRequest,
-            error.ReadFailed => s.readFailure(),
+            error.ReadFailed => FailureSource.readError(s.failure),
             error.HeadTooLarge => error.HeadTooLarge,
             error.Ambiguous => error.Ambiguous,
             error.UnsupportedEncoding => error.UnsupportedEncoding,
@@ -183,7 +185,7 @@ pub fn receive(s: *Server) ReceiveError!?Request {
     return .{
         .head = taken.head,
         .framing = taken.framing,
-        .owner = s,
+        .window = &s.window,
         .generation = s.window.generation,
     };
 }
@@ -245,20 +247,6 @@ pub const SendError = Response.WriteError || error{
     AlreadyAnswered,
 };
 
-/// `error.ReadFailed` says nothing about why. Ask the reader, if it was
-/// the kind that keeps an answer.
-fn readFailure(s: *Server) ReceiveError {
-    const f = s.failure orelse return error.ReadFailed;
-    const cause = f.last() orelse return error.ReadFailed;
-    return switch (cause) {
-        error.Timeout => error.Timeout,
-        // Everything else ends the same way: stop serving this
-        // connection. Naming them would grow every caller's switch for
-        // no decision they could make differently.
-        else => error.ReadFailed,
-    };
-}
-
 /// Forgets the last request, so nothing about it leaks into a response
 /// written with no request in hand.
 fn forgetRequest(s: *Server) void {
@@ -293,6 +281,9 @@ pub fn respond(s: *Server, r: Response) SendError!void {
     try out.write(s.writer, .{ .keep_alive = s.keep_alive, .date = s.dateValue() });
     try s.writer.flush();
     if (!r.keep_alive) s.keep_alive = false;
+    // Nothing comes after this, so the connection is done, not just
+    // answered.
+    if (!s.keep_alive) s.phase = .done;
 }
 
 pub const StreamOptions = struct {
@@ -434,7 +425,7 @@ pub const ResponseWriter = struct {
         if (rw.server.phase != .streaming) return error.Finished;
         // Decide before writing: a trailer refused halfway through would
         // leave the terminator unwritten and the body unfinished.
-        for (fields) |f| if (!validTrailer(f)) return rw.fail(error.InvalidTrailer);
+        field.check(fields, .trailer) catch return rw.fail(error.InvalidTrailer);
 
         rw.interface.flush() catch |err| return rw.fail(err);
         const out = rw.server.writer;
@@ -449,28 +440,10 @@ pub const ResponseWriter = struct {
 
     fn terminate(out: *Io.Writer, fields: []const Response.Header) Io.Writer.Error!void {
         try out.writeAll("0\r\n");
-        for (fields) |f| {
-            try out.writeAll(f.name);
-            try out.writeAll(": ");
-            try out.writeAll(f.value);
-            try out.writeAll("\r\n");
-        }
+        try field.write(out, fields);
         try out.writeAll("\r\n");
     }
 };
-
-/// Same rules as a header, minus the fields something already acted on.
-fn validTrailer(f: Response.Header) bool {
-    if (!scan.validFieldName(f.name) or !scan.validFieldValue(f.value)) return false;
-    const forbidden = [_][]const u8{
-        "transfer-encoding", "content-length", "host",  "trailer",
-        "connection",        "te",             "range", "expect",
-    };
-    for (forbidden) |name| {
-        if (std.ascii.eqlIgnoreCase(f.name, name)) return false;
-    }
-    return true;
-}
 
 /// Today's date, if the caller asked for one. `writeHead` drops it if
 /// the response already has a Date.
@@ -1302,6 +1275,21 @@ test "a second request before the first is answered is refused" {
     try s.respond(.{});
     const second = (try s.receive()).?;
     try testing.expectEqualStrings("/b", second.target());
+}
+
+test "what the request asked for outlives the 100 we sent" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
+        const req = (try s.receive()).?;
+        try testing.expect(req.expectsContinue());
+
+        var buf: [8]u8 = undefined;
+        _ = try s.readBody(&buf);
+        try testing.expect(std.mem.indexOf(u8, h.written(), "100 Continue") != null);
+
+        try testing.expect(req.expectsContinue());
+    }
 }
 
 test "no trailers is an empty slice" {

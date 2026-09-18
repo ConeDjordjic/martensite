@@ -6,6 +6,7 @@
 pub const scan = @import("scan.zig");
 pub const chunked = @import("chunked.zig");
 pub const body = @import("body.zig");
+pub const field = @import("field.zig");
 pub const target = @import("target.zig");
 
 pub const Response = @import("Response.zig");
@@ -24,6 +25,7 @@ test {
     _ = scan;
     _ = chunked;
     _ = body;
+    _ = field;
     _ = target;
     _ = Response;
     _ = Date;

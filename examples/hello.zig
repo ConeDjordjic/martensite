@@ -100,13 +100,7 @@ fn seconds(n: i64) Io.Clock.Duration {
 }
 
 fn errorResponse(err: anyerror) martensite.Response {
-    return switch (err) {
-        // The reader was given as a failure source, so a peer that went
-        // quiet arrives as a timeout rather than an unexplained read.
-        error.Timeout => .{ .status = .request_timeout, .keep_alive = false },
-        error.HeadTooLarge => .{ .status = .request_header_fields_too_large, .keep_alive = false },
-        error.UnsupportedExpectation => .{ .status = .expectation_failed, .keep_alive = false },
-        error.BodyTooLarge => .{ .status = .payload_too_large, .keep_alive = false },
-        else => .{ .status = .bad_request, .keep_alive = false },
-    };
+    // The library already knows which rejection is which. All we add
+    // here is the decision to close, which all of them imply anyway.
+    return .{ .status = .forError(err), .keep_alive = false };
 }

@@ -10,19 +10,21 @@ const std = @import("std");
 const scan = @import("scan.zig");
 const body = @import("body.zig");
 const target_mod = @import("target.zig");
+const HeadWindow = @import("HeadWindow.zig");
 
 pub const Kind = enum { request, response };
 
-/// `Owner` is the Server or Client that produced it, and has to have a
-/// `window`: that is where the generation this checks against lives.
-pub fn Message(comptime kind: Kind, comptime Owner: type) type {
+/// A message gets everything it needs passed in, so it can't reach back
+/// into the Server or Client that made it.
+pub fn Message(comptime kind: Kind) type {
     return struct {
         head: switch (kind) {
             .request => scan.Head,
             .response => scan.ResponseHead,
         },
         framing: body.Framing,
-        owner: *const Owner,
+        /// Checked against `window.generation` to catch stale reads.
+        window: *const HeadWindow,
         generation: u32,
 
         const M = @This();
@@ -73,7 +75,7 @@ pub fn Message(comptime kind: Kind, comptime Owner: type) type {
 
         /// Still the current message?
         pub fn live(m: M) bool {
-            return m.generation == m.owner.window.generation;
+            return m.generation == m.window.generation;
         }
 
         fn check(m: M) void {
@@ -127,7 +129,8 @@ pub fn Message(comptime kind: Kind, comptime Owner: type) type {
         pub fn expectsContinue(m: M) bool {
             comptime only(.request, "expectsContinue");
             m.check();
-            return m.owner.expect_continue;
+            const value = m.header("expect") orelse return false;
+            return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "100-continue");
         }
 
         // Responses only.
