@@ -128,6 +128,7 @@ pub const SendError = Io.Writer.Error || error{
 /// one request into two.
 pub fn send(c: *Client, r: Request) SendError!void {
     try c.writeHead(r, .from_body);
+    errdefer c.writeFailed();
     try c.writer.writeAll(r.body);
     try c.writer.flush();
     c.phase = .sent;
@@ -152,6 +153,7 @@ pub fn sendStreaming(
     options: StreamOptions,
 ) SendError!RequestWriter {
     try c.writeHead(r, if (options.content_length) |n| .{ .length = n } else .chunked);
+    errdefer c.writeFailed();
     // The head goes out now. A server we asked for 100-continue can't
     // answer a request it hasn't seen yet.
     try c.writer.flush();
@@ -172,13 +174,17 @@ pub const RequestWriter = BodyWriter;
 fn settled(ctx: *anyopaque, state: BodyWriter.State) void {
     const c: *Client = @ptrCast(@alignCast(ctx));
     switch (state) {
-        .broken => {
-            c.keep_alive = false;
-            c.phase = .done;
-        },
+        .broken => c.writeFailed(),
         .finished => c.phase = .sent,
         .open => unreachable,
     }
+}
+
+/// A write failed. Part of a request is on the wire and the next one
+/// would just carry on from there, so nothing more happens here.
+fn writeFailed(c: *Client) void {
+    c.keep_alive = false;
+    c.phase = .done;
 }
 
 /// How the body coming after this is framed.
@@ -210,13 +216,9 @@ fn writeHead(c: *Client, r: Request, framing: Framing) SendError!void {
             std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) framed = true;
     }
 
-    // Everything that can be refused has been. A write that gives out
-    // from here leaves part of a request on the wire, and the next one
-    // would continue it, so the connection ends with it.
-    errdefer {
-        c.keep_alive = false;
-        c.phase = .done;
-    }
+    // Past every check now. A write that fails from here on leaves part
+    // of a request on the wire.
+    errdefer c.writeFailed();
 
     const w = c.writer;
     try w.writeAll(r.method);
@@ -328,7 +330,7 @@ pub const BodyReader = HeadWindow.BodyReader;
 /// `decode_buf` is the reader's own memory. It is what the reader
 /// buffers into, and where a chunked body decodes on the way out. A few
 /// hundred bytes is plenty, and two is the minimum.
-pub fn bodyReader(c: *Client, decode_buf: []u8) error{BodyTaken}!BodyReader {
+pub fn bodyReader(c: *Client, decode_buf: []u8) HeadWindow.BodyReaderError!BodyReader {
     return c.window.bodyReader(decode_buf);
 }
 
@@ -607,6 +609,17 @@ test "a streamed request whose head cannot be written ends the connection" {
         c.sendStreaming(.{ .method = "POST", .target = "/a-long-target" }, &scratch, .{}),
     );
     try testing.expect(!c.alive());
+}
+
+test "a body the writer cannot hold ends the connection" {
+    var h: Harness = undefined;
+    var c = h.initWith(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", .{ .tight_writer = true });
+
+    // The head fits in 16 bytes and the body doesn't, so the failure
+    // happens after `writeHead`.
+    try testing.expectError(error.WriteFailed, c.send(.{ .method = "PUT", .target = "/", .body = "hello" }));
+    try testing.expect(!c.alive());
+    try testing.expectError(error.Closed, c.send(.{}));
 }
 
 test "one exchange at a time" {

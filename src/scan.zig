@@ -359,13 +359,41 @@ fn findTerminator(bytes: []const u8, last_len: usize) ?usize {
     var i = start;
     while (i < bytes.len) : (i += 1) {
         if (bytes[i] != '\n') continue;
+        // A blank line, written either way. `crlf` takes a bare LF as
+        // well as CRLF, so all four combinations end a head. When only
+        // two of them worked, the same bytes would scan or not depending
+        // on how they arrived.
         if (i >= 1 and bytes[i - 1] == '\n') return i + 1;
-        if (i >= 3 and bytes[i - 1] == '\r' and bytes[i - 2] == '\n' and bytes[i - 3] == '\r') return i + 1;
+        if (i >= 2 and bytes[i - 1] == '\r' and bytes[i - 2] == '\n') return i + 1;
     }
     return null;
 }
 
 const testing = std.testing;
+
+test "a head ends the same way however its line endings are mixed" {
+    const heads = [_][]const u8{
+        "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+        "GET / HTTP/1.1\nHost: a\n\n",
+        "GET / HTTP/1.1\r\nHost: a\r\n\n",
+        "GET / HTTP/1.1\r\nHost: a\n\r\n",
+    };
+    for (heads) |head| {
+        var h: [8]Header = undefined;
+        const whole = (try request(head, &h, 0)).?;
+        try testing.expectEqual(head.len, whole.len);
+
+        // The same bytes a piece at a time, carrying `last_len` forward
+        // the way a reader filling its buffer does.
+        var last: usize = 0;
+        var i: usize = 1;
+        const incremental = while (i <= head.len) : (i += 1) {
+            if (try request(head[0..i], &h, last)) |got| break got;
+            last = i;
+        } else unreachable;
+        try testing.expectEqual(whole.len, incremental.len);
+    }
+}
 
 test "methods" {
     try testing.expectEqual(Method.GET, Method.parse("GET").?);

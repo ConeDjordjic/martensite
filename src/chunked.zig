@@ -27,6 +27,8 @@ pub const Decoder = struct {
     /// rest instead of failing, and set `trailers_truncated` so nobody
     /// mistakes a short set for a complete one.
     trailer_len: usize = 0,
+    /// A trailer line didn't fit. What we kept is valid but partial.
+    trailers_truncated: bool = false,
 
     const State = enum {
         size,
@@ -167,8 +169,12 @@ pub const Decoder = struct {
     }
 
     fn keep(d: *Decoder, bytes: []const u8) void {
+        // No buffer means "drop them", which is not the same thing as
+        // a buffer that ran out halfway through.
+        if (d.trailer_buf.len == 0) return;
         const room = d.trailer_buf.len - d.trailer_len;
         const n = @min(room, bytes.len);
+        if (n != bytes.len) d.trailers_truncated = true;
         @memcpy(d.trailer_buf[d.trailer_len..][0..n], bytes[0..n]);
         d.trailer_len += n;
     }

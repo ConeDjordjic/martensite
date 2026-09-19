@@ -201,7 +201,7 @@ pub const BodyReader = HeadWindow.BodyReader;
 /// buffers into, and where a chunked body gets decoded on the way out.
 /// It is not the size of the body and not the connection's buffer. A few
 /// hundred bytes is plenty, and two is the minimum.
-pub fn bodyReader(s: *Server, decode_buf: []u8) (Io.Writer.Error || error{BodyTaken})!BodyReader {
+pub fn bodyReader(s: *Server, decode_buf: []u8) (Io.Writer.Error || HeadWindow.BodyReaderError)!BodyReader {
     try s.sendContinue();
     return s.window.bodyReader(decode_buf);
 }
@@ -211,6 +211,7 @@ pub fn bodyReader(s: *Server, decode_buf: []u8) (Io.Writer.Error || error{BodyTa
 pub fn sendContinue(s: *Server) Io.Writer.Error!void {
     if (!s.expect_continue) return;
     s.expect_continue = false;
+    errdefer s.writeFailed();
     try s.writer.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
     try s.writer.flush();
 }
@@ -247,6 +248,14 @@ pub const SendError = Response.WriteError || error{
     AlreadyAnswered,
 };
 
+/// A write failed. Part of a message is on the wire and the next one
+/// would just carry on from there, so nothing more happens on this
+/// connection. Every path that writes bytes ends up here when it fails.
+fn writeFailed(s: *Server) void {
+    s.keep_alive = false;
+    s.phase = .done;
+}
+
 /// Forgets the last request, so nothing about it leaks into a response
 /// written with no request in hand.
 fn forgetRequest(s: *Server) void {
@@ -270,11 +279,15 @@ fn startResponse(s: *Server) error{AlreadyAnswered}!void {
         },
         .streaming, .answered, .handed_over, .done => return error.AlreadyAnswered,
     }
+    // A rejected response leaves it alone. A 100 after an answer would
+    // be a second response.
+    s.expect_continue = false;
 }
 
 /// Writes a response and flushes it.
 pub fn respond(s: *Server, r: Response) SendError!void {
     try s.startResponse();
+    errdefer s.writeFailed();
     var out = r;
     // A HEAD gets the headers and none of the body.
     if (s.head_only) out.head_only = true;
@@ -303,6 +316,9 @@ pub fn respondStreaming(
     options: StreamOptions,
 ) SendError!ResponseWriter {
     try s.startResponse();
+    // There is no `ResponseWriter` yet, so nothing else would settle the
+    // connection if the head doesn't go out.
+    errdefer s.writeFailed();
 
     var head = r;
     head.body = "";
@@ -336,10 +352,7 @@ pub const ResponseWriter = BodyWriter;
 fn settled(ctx: *anyopaque, state: BodyWriter.State) void {
     const s: *Server = @ptrCast(@alignCast(ctx));
     switch (state) {
-        .broken => {
-            s.keep_alive = false;
-            s.phase = .done;
-        },
+        .broken => s.writeFailed(),
         .finished => s.phase = if (s.keep_alive) .answered else .done,
         .open => unreachable,
     }
@@ -377,6 +390,7 @@ pub fn alive(s: *const Server) bool {
 /// 101.
 pub fn upgrade(s: *Server, response: Response) SendError!void {
     try s.startResponse();
+    errdefer s.writeFailed();
     s.window.handOver();
 
     var r = response;
@@ -414,6 +428,8 @@ const Harness = struct {
         max_drain: u64 = 0,
         /// Somewhere to keep a head while its body is read.
         keep_head: bool = true,
+        /// Somewhere to keep the peer's trailers. Off by default.
+        keep_trailers: bool = true,
         /// Almost nowhere for the response to go. A `fixed` writer with
         /// plenty of room never fails partway through a head, so nothing
         /// built on one ever hits a write failure mid-response.
@@ -438,7 +454,7 @@ const Harness = struct {
         return Server.init(testing.io, reader, &h.writer, .{
             .headers = &h.headers,
             .head_buf = if (setup.keep_head) &h.head_buf else &.{},
-            .trailer_buf = &h.trailer_buf,
+            .trailer_buf = if (setup.keep_trailers) &h.trailer_buf else &.{},
             .max_drain = setup.max_drain,
         }) catch unreachable;
     }
@@ -1254,6 +1270,215 @@ test "what a connection costs, apart from its buffers" {
     try testing.expectEqual(@as(usize, 88), @sizeOf(Request));
 }
 
+test "a splat through a streamed body" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var scratch: [64]u8 = undefined;
+    var rw = try s.respondStreaming(.{}, &scratch, .{});
+    // Buffer something, then splat. `drain` reports what it took from
+    // `data`, not what it flushed out of the buffer.
+    try rw.interface.writeAll("hi");
+    try rw.interface.splatByteAll('x', 100);
+    try rw.end();
+
+    const out = h.written();
+    try testing.expect(std.mem.indexOf(u8, out, "2\r\nhi\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, out, "0\r\n\r\n"));
+    var xs: usize = 0;
+    for (out) |c| {
+        if (c == 'x') xs += 1;
+    }
+    try testing.expectEqual(@as(usize, 100), xs);
+}
+
+test "a chunked body that does not fit ends the connection" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        // 16 bytes of body with a valid request behind it. Does
+        // anything get read from a position nobody can account for?
+        var s = h.initDraining(
+            shape,
+            "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+                "10\r\nAAAAAAAAAAAAAAAA\r\n0\r\n\r\nGET /evil HTTP/1.1\r\n\r\n",
+        );
+        _ = (try s.receive()).?;
+
+        var small: [4]u8 = undefined;
+        try testing.expectError(error.BodyTooLarge, s.readBody(&small));
+
+        // Nobody can say where that body ended, so we don't read any
+        // further. A drain here could be talked into finding /evil.
+        try testing.expect(!s.alive());
+        try s.respond(.{ .status = .forError(error.BodyTooLarge), .keep_alive = false });
+        try testing.expectEqual(@as(?Request, null), try s.receive());
+    }
+}
+
+test "a HEAD drops trailers with the body it describes" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "HEAD / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var scratch: [64]u8 = undefined;
+    var rw = try s.respondStreaming(.{
+        .headers = &.{.{ .name = "Trailer", .value = "X-Sum" }},
+    }, &scratch, .{});
+    try rw.interface.writeAll("not sent");
+    try rw.endWithTrailers(&.{.{ .name = "X-Sum", .value = "42" }});
+    try testing.expect(s.alive());
+
+    const out = h.written();
+    try testing.expect(std.mem.indexOf(u8, out, "not sent") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "X-Sum: 42") == null);
+}
+
+test "trailers on a counted body have nowhere to go" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var scratch: [64]u8 = undefined;
+    var rw = try s.respondStreaming(.{}, &scratch, .{ .content_length = 4 });
+    try rw.interface.writeAll("body");
+    try testing.expectError(error.InvalidTrailer, rw.endWithTrailers(&.{.{ .name = "X-Sum", .value = "42" }}));
+}
+
+test "a chunked body that exactly fits is not too large" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+        _ = (try s.receive()).?;
+
+        // 5 bytes of body, 5 bytes of buffer. The terminator is still
+        // in the reader and is not body.
+        var buf: [5]u8 = undefined;
+        try testing.expectEqualStrings("hello", try s.readBody(&buf));
+        try testing.expect(s.alive());
+    }
+}
+
+test "a sink that fills mid-body ends the connection" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.initDraining(
+            shape,
+            "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+                "10\r\nAAAAAAAAAAAAAAAA\r\n0\r\n\r\nGET /evil HTTP/1.1\r\n\r\n",
+        );
+        _ = (try s.receive()).?;
+
+        var small: [4]u8 = undefined;
+        var sink: Io.Writer = .fixed(&small);
+        var scratch: [8]u8 = undefined;
+        var b = try s.bodyReader(&scratch);
+
+        try testing.expectError(error.WriteFailed, b.interface.streamRemaining(&sink));
+        try testing.expect(!s.alive());
+
+        try s.respond(.{ .status = .forError(error.BodyTooLarge), .keep_alive = false });
+        try testing.expectEqual(@as(?Request, null), try s.receive());
+    }
+}
+
+test "a chunked body needs somewhere to be decoded" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    // No room to decode into is not "unbuffered", it is no progress
+    // ever. A counted body is fine with none.
+    try testing.expectError(error.NoDecodeBuffer, s.bodyReader(&.{}));
+}
+
+test "a counted body needs no decode buffer" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+    _ = (try s.receive()).?;
+
+    var b = try s.bodyReader(&.{});
+    var out: [8]u8 = undefined;
+    var sink: Io.Writer = .fixed(&out);
+    _ = try b.interface.streamRemaining(&sink);
+    try testing.expectEqualStrings("hello", sink.buffered());
+}
+
+test "an upgrade the writer cannot hold ends the connection" {
+    var h: Harness = undefined;
+    var s = h.initTight(
+        .whole,
+        "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nEARLYFRAME",
+    );
+    const req = (try s.receive()).?;
+    try testing.expectEqualStrings("websocket", req.upgradeTo().?);
+
+    // Half a 101 on the wire with the peer's first frame behind it.
+    // Those bytes are not a request.
+    try testing.expectError(error.WriteFailed, s.upgrade(.{ .status = .switching_protocols }));
+    try testing.expect(!s.alive());
+    try testing.expectEqual(@as(?Request, null), try s.receive());
+}
+
+test "answering settles the continue we owed" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
+    _ = (try s.receive()).?;
+
+    try s.respond(.{ .status = .payload_too_large, .keep_alive = false });
+    const after_answer = h.written().len;
+
+    // A 100 now would be a second response after the first one.
+    var buf: [8]u8 = undefined;
+    _ = s.readBody(&buf) catch {};
+    try testing.expectEqual(after_answer, h.written().len);
+    try testing.expect(std.mem.indexOf(u8, h.written(), "100 Continue") == null);
+}
+
+test "no trailer_buf drops trailers rather than failing" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        // Nobody asked for room, so the trailers get dropped.
+        var s = h.initWith(
+            shape,
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\nX: y\r\n\r\n",
+            .{ .keep_trailers = false },
+        );
+        _ = (try s.receive()).?;
+
+        var buf: [8]u8 = undefined;
+        try testing.expectEqualStrings("a", try s.readBody(&buf));
+
+        var storage: [4]scan.Header = undefined;
+        try testing.expectEqual(@as(usize, 0), (try s.trailers(&storage)).len);
+        try testing.expect(s.alive());
+    }
+}
+
+test "a body too large for the buffer may be asked for again" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+    _ = (try s.receive()).?;
+
+    var small: [2]u8 = undefined;
+    try testing.expectError(error.BodyTooLarge, s.readBody(&small));
+    var big: [8]u8 = undefined;
+    try testing.expectEqualStrings("hello", try s.readBody(&big));
+}
+
+test "a sink that gave out is not blamed on the peer" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nAAAAAAAA\r\n0\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var small: [2]u8 = undefined;
+    var sink: Io.Writer = .fixed(&small);
+    var scratch: [8]u8 = undefined;
+    var b = try s.bodyReader(&scratch);
+    try testing.expectError(error.WriteFailed, b.interface.streamRemaining(&sink));
+    try testing.expectEqual(BodyError.SinkFailed, b.failure().?);
+}
+
 test "no trailers is an empty slice" {
     for (shapes) |shape| {
         var h: Harness = undefined;
@@ -1457,21 +1682,17 @@ test "an unread body is never scanned as the next request" {
 
         try s.respond(.{ .status = .unauthorized });
 
-        // The body's bytes must never reach the scanner. Either the drain
-        // consumed all of them and /b is a real request, or the
-        // connection is finished. Never a request line made of body.
-        if (try s.receive()) |second| {
-            try testing.expectEqualStrings("GET", second.method());
-            try testing.expectEqualStrings("/b", second.target());
-        } else {
-            try testing.expect(!s.alive());
-        }
+        // Draining is off by default, so there is a body here nobody
+        // will read, and the window says so before anyone asks it to
+        // scan.
+        try testing.expect(!s.alive());
+        try testing.expectEqual(@as(?Request, null), try s.receive());
     }
 }
 
-test "a response the writer cannot hold fails instead of half-arriving" {
+test "a response the writer cannot hold ends the connection" {
     var h: Harness = undefined;
-    var s = h.initTight(.whole, "GET /hi HTTP/1.1\r\nHost: x\r\n\r\n");
+    var s = h.initTight(.whole, "GET /hi HTTP/1.1\r\nHost: x\r\n\r\nGET /next HTTP/1.1\r\n\r\n");
 
     const req = (try s.receive()).?;
     try testing.expectEqualStrings("/hi", req.target());
@@ -1480,6 +1701,32 @@ test "a response the writer cannot hold fails instead of half-arriving" {
     // the wire and can't be taken back, so the question is what happens
     // next.
     try testing.expectError(error.WriteFailed, s.respond(Response.text(.ok, "yes")));
+    try testing.expect(!s.alive());
+    try testing.expectError(error.AlreadyAnswered, s.respond(.{}));
+    try testing.expectEqual(@as(?Request, null), try s.receive());
+}
+
+test "a streamed head the writer cannot hold ends the connection" {
+    var h: Harness = undefined;
+    var s = h.initTight(.whole, "GET /hi HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var scratch: [32]u8 = undefined;
+    try testing.expectError(error.WriteFailed, s.respondStreaming(.{}, &scratch, .{}));
+    try testing.expect(!s.alive());
+}
+
+test "a 100 Continue that cannot be written ends the connection" {
+    var h: Harness = undefined;
+    var s = h.initTight(
+        .whole,
+        "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi",
+    );
+    _ = (try s.receive()).?;
+
+    var buf: [8]u8 = undefined;
+    try testing.expectError(error.WriteFailed, s.readBody(&buf));
+    try testing.expect(!s.alive());
 }
 
 test "a response with more headers than the old splice buffer held" {

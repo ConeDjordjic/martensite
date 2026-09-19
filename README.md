@@ -82,11 +82,13 @@ go out as the answer to a request the peer has not sent yet. Reading
 works the same way while a streamed response is open: `receive` returns
 `error.ResponseOpen` until `end` finishes the body.
 
-Any error from a `ResponseWriter` — `LengthMismatch` for a body that
-stopped short of what it promised, `InvalidTrailer` for one that would
-change the framing, `WriteFailed` for a write that gave out — means the
-body on the wire is not a whole one. The connection closes, and every
-later call on that writer is `Finished` and writes nothing.
+Any error out of a `ResponseWriter` means the body on the wire is
+incomplete. `LengthMismatch` means the body was shorter than promised,
+`InvalidTrailer` means a trailer would have changed the framing, and
+`WriteFailed` means the write itself failed. After any of them the
+connection closes and the writer is done. `end` and `endWithTrailers`
+also return `Finished`, and `flush` returns `WriteFailed`, which is the
+only error `Io.Writer` has.
 
 If the handler never reads the body, the connection ends. Reading a body
 you already rejected is up to you, so you have to say how much of it you
@@ -155,7 +157,7 @@ try rw.end();
 And responses too big to buffer stream like request bodies:
 
 ```zig
-var b = client.bodyReader(&decode_buf);
+var b = try client.bodyReader(&decode_buf);
 _ = try b.interface.streamRemaining(&file_writer.interface);
 ```
 

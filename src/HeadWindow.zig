@@ -39,6 +39,9 @@ finished: bool = false,
 /// readers that both think they own it, and the second one reads the
 /// next head as body.
 claimed: bool = false,
+/// The last body's trailers didn't fit in `trailer_buf`, so what we
+/// kept is only the start of them.
+trailers_truncated: bool = false,
 /// Raw trailer lines from the last chunked body. Cleared on every take.
 trailers_raw: []const u8 = "",
 
@@ -82,6 +85,7 @@ pub fn init(reader: *Io.Reader, options: Options) InitError!HeadWindow {
 /// are just data. They arrive after the body, so nothing in them can
 /// change framing or routing, which are both decided by that point.
 pub fn trailers(w: *const HeadWindow, storage: []scan.Header) scan.Error![]const scan.Header {
+    if (w.trailers_truncated) return error.TooManyHeaders;
     if (w.trailers_raw.len == 0) return &.{};
     return scan.trailers(w.trailers_raw, storage);
 }
@@ -92,7 +96,8 @@ pub fn trailers(w: *const HeadWindow, storage: []scan.Header) scan.Error![]const
 /// while there is a pending body nobody is going to read. Reading the
 /// body changes the answer.
 pub fn usable(w: *const HeadWindow) bool {
-    return !w.finished;
+    if (w.finished) return false;
+    return w.pending == .none or w.max_drain != 0;
 }
 
 pub const TakeError = error{
@@ -138,6 +143,7 @@ fn take(w: *HeadWindow, comptime kind: Kind, sent_method: ?scan.Method) TakeErro
 
     w.releaseHead();
     w.trailers_raw = "";
+    w.trailers_truncated = false;
     w.claimed = false;
 
     var last_len: usize = 0;
@@ -229,6 +235,7 @@ fn decodeStep(w: *HeadWindow, d: *chunked.Decoder, dest: []u8) Step {
     w.reader.toss(used);
     if (r.done) {
         w.trailers_raw = r.trailers;
+        w.trailers_truncated = d.trailers_truncated;
         return .{ .looked = want, .decoded = r.decoded, .outcome = .done };
     }
     return .{
@@ -249,7 +256,7 @@ fn decodeStep(w: *HeadWindow, d: *chunked.Decoder, dest: []u8) Step {
 fn drainPending(w: *HeadWindow) void {
     if (w.pending == .none) return;
     if (w.max_drain == 0) {
-        w.finished = true;
+        w.stop();
         return;
     }
 
@@ -257,14 +264,14 @@ fn drainPending(w: *HeadWindow) void {
 
     switch (w.pending) {
         .none => unreachable,
-        .until_close => w.finished = true,
+        .until_close => w.stop(),
         .length => |n| {
             if (n > w.max_drain) {
-                w.finished = true;
+                w.stop();
                 return;
             }
             w.reader.discardAll64(n) catch {
-                w.finished = true;
+                w.stop();
                 return;
             };
             w.pending = .none;
@@ -279,7 +286,7 @@ fn drainPending(w: *HeadWindow) void {
                 const st = w.decodeStep(&d, &stage);
                 read += st.looked;
                 if (st.outcome == .bad or read > w.max_drain) {
-                    w.finished = true;
+                    w.stop();
                     return;
                 }
                 switch (st.outcome) {
@@ -289,7 +296,7 @@ fn drainPending(w: *HeadWindow) void {
                     },
                     .more => continue,
                     .need_fill => w.reader.fillMore() catch {
-                        w.finished = true;
+                        w.stop();
                         return;
                     },
                     .bad => unreachable,
@@ -304,6 +311,10 @@ pub const BodyError = error{
     Incomplete,
     /// The chunked encoding is malformed.
     BadChunk,
+    /// The destination failed partway through and there is no way to
+    /// find out how much it kept. Reading again wouldn't help, since we
+    /// can't hand it the same bytes twice.
+    SinkFailed,
     /// The body doesn't fit in the buffer it was given. Only `readBody`
     /// returns this.
     BodyTooLarge,
@@ -318,19 +329,21 @@ pub const BodyError = error{
 /// Reads the whole body into `buf`. If it doesn't fit you get an error,
 /// not a short read.
 pub fn readBody(w: *HeadWindow, buf: []u8) BodyError![]u8 {
-    // Before the `pending` check: once a body has been read, `pending`
-    // is `.none` and answering with an empty slice would be a lie about
-    // the message rather than an answer about the body.
-    if (w.claimed) return error.BodyTaken;
+    // This goes before the `pending` check. Once a body has been read,
+    // or the window has given up, `pending` is `.none`, and an empty
+    // slice would be a lie about the message.
+    if (w.claimed or w.finished) return error.BodyTaken;
     if (w.pending == .none) return buf[0..0];
-    w.claimed = true;
-
-    w.releaseHead();
 
     switch (w.pending) {
         .none => unreachable,
         .length => |n| {
+            // Before we claim it. Nothing has moved yet, so a caller
+            // who guessed too small can try again with a bigger
+            // buffer.
             if (n > buf.len) return error.BodyTooLarge;
+            w.claimed = true;
+            w.releaseHead();
             const want: usize = @intCast(n);
             w.reader.readSliceAll(buf[0..want]) catch |err| switch (err) {
                 error.EndOfStream => return w.giveUp(error.Incomplete),
@@ -340,29 +353,45 @@ pub fn readBody(w: *HeadWindow, buf: []u8) BodyError![]u8 {
             return buf[0..want];
         },
         .until_close => {
+            w.claimed = true;
+            w.releaseHead();
             var out: Io.Writer = .fixed(buf);
             _ = w.reader.streamRemaining(&out) catch |err| switch (err) {
-                error.WriteFailed => return error.BodyTooLarge,
+                // Through `giveUp`, because the bytes are already read
+                // and a close-delimited body has no boundary after it
+                // anyway.
+                error.WriteFailed => return w.giveUp(error.BodyTooLarge),
                 error.ReadFailed => return w.giveUp(error.ReadFailed),
             };
-            w.pending = .none;
             // The body ended because the connection did. There is no
             // next message on a socket that is going away.
-            w.finished = true;
+            w.stop();
             return out.buffered();
         },
         .chunked => {
+            w.claimed = true;
+            w.releaseHead();
             var d: chunked.Decoder = .{
                 .consume_trailer = true,
                 .trailer_buf = w.trailer_buf,
             };
             var out: usize = 0;
+            // What is left once `buf` is full is usually the
+            // terminator, which is framing and not body. It still has to
+            // be decoded somewhere, so we decode it here. If any of it
+            // turns out to be body, the body didn't fit.
+            var tail: [64]u8 = undefined;
             while (true) {
-                // Bytes waiting with nowhere to put them: the body does
-                // not fit, which is an error and not a short read.
-                if (out == buf.len and w.reader.buffered().len != 0) return error.BodyTooLarge;
-
-                const st = w.decodeStep(&d, buf[out..]);
+                const full = out == buf.len;
+                const st = w.decodeStep(&d, if (full) &tail else buf[out..]);
+                if (full and st.decoded != 0) {
+                    // Doesn't fit, and this is not a short read. This
+                    // goes through `giveUp`, unlike the counted case
+                    // below, because the decoder has already eaten part
+                    // of a chunk and is about to be thrown away, so
+                    // nobody can say where the body ends any more.
+                    return w.giveUp(error.BodyTooLarge);
+                }
                 out += st.decoded;
                 switch (st.outcome) {
                     .bad => return w.giveUp(error.BadChunk),
@@ -384,9 +413,16 @@ pub fn readBody(w: *HeadWindow, buf: []u8) BodyError![]u8 {
 /// A body that failed partway through leaves the reader somewhere nobody
 /// can account for. Say so instead of scanning from there.
 fn giveUp(w: *HeadWindow, err: anytype) @TypeOf(err) {
+    w.stop();
+    return err;
+}
+
+/// We no longer know where the reader is. Both halves get set here so
+/// that no path can set one and forget the other: nothing more gets
+/// scanned, and no body is pending because nobody can find its end.
+fn stop(w: *HeadWindow) void {
     w.finished = true;
     w.pending = .none;
-    return err;
 }
 
 /// A reader over the body. Valid until the next take.
@@ -418,6 +454,9 @@ pub const BodyReader = struct {
                         b.left;
                     const want = @min(@as(u64, limit.minInt(buffered.len)), room);
                     const n: usize = @intCast(want);
+                    // Tossed only once the destination has them, so a
+                    // write that gives out here leaves the reader where
+                    // it was and the count still true.
                     try out.writeAll(buffered[0..n]);
                     w.reader.toss(n);
                     if (w.pending != .until_close) {
@@ -435,7 +474,15 @@ pub const BodyReader = struct {
                     }
                     if (st.outcome == .done) b.complete();
                     if (st.decoded != 0) {
-                        try out.writeAll(b.scratch[0..st.decoded]);
+                        // The source bytes are already tossed and the
+                        // decoder's state is mid-body, so a destination
+                        // that gives out here takes the only account of
+                        // where the body ends with it. Nobody may read
+                        // from this connection again.
+                        out.writeAll(b.scratch[0..st.decoded]) catch |err| {
+                            b.fail(error.SinkFailed);
+                            return err;
+                        };
                         return st.decoded;
                     }
                     if (b.finished) return error.EndOfStream;
@@ -449,8 +496,8 @@ pub const BodyReader = struct {
         w.reader.fillMore() catch |err| switch (err) {
             error.EndOfStream => {
                 if (w.pending == .until_close) {
-                    b.complete();
-                    w.finished = true;
+                    b.finished = true;
+                    w.stop();
                     return error.EndOfStream;
                 }
                 b.fail(error.Incomplete);
@@ -472,8 +519,7 @@ pub const BodyReader = struct {
     fn fail(b: *BodyReader, e: BodyError) void {
         b.err = e;
         b.finished = true;
-        b.window.finished = true;
-        b.window.pending = .none;
+        b.window.stop();
     }
 
     /// What actually went wrong, once the interface says ReadFailed.
@@ -482,14 +528,26 @@ pub const BodyReader = struct {
     }
 };
 
+pub const BodyReaderError = error{
+    BodyTaken,
+    /// `decode_buf` is smaller than two bytes. The reader buffers into
+    /// it whatever the framing is, and chunked decodes into it too. An
+    /// `Io.Reader` with nowhere to buffer panics inside std the first
+    /// time something takes instead of streams.
+    NoDecodeBuffer,
+};
+
 /// A reader over the body.
 ///
 /// `decode_buf` is the reader's own memory. It buffers there for the
 /// `Io.Reader` calls that take instead of stream, and a chunked body
 /// decodes in the other half of it. A few hundred bytes is plenty, and
 /// two is the minimum.
-pub fn bodyReader(w: *HeadWindow, decode_buf: []u8) error{BodyTaken}!BodyReader {
-    if (w.claimed) return error.BodyTaken;
+pub fn bodyReader(w: *HeadWindow, decode_buf: []u8) BodyReaderError!BodyReader {
+    if (w.claimed or w.finished) return error.BodyTaken;
+    // Chunked bytes are decoded in it, so there is no making progress
+    // without one. A counted body never touches it.
+    if (w.pending == .chunked and decode_buf.len == 0) return error.NoDecodeBuffer;
     if (w.pending != .none) {
         w.claimed = true;
         w.releaseHead();
@@ -607,6 +665,24 @@ test "a head_buf smaller than the reader is refused here, not by the caller" {
     }));
 
     _ = try HeadWindow.init(&src.interface, .{ .headers = &headers });
+}
+
+test "trailers that did not fit are an error, not a short list" {
+    var f: Fixture = undefined;
+    var w = f.init(
+        .whole,
+        "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "1\r\na\r\n0\r\nX-Sum: 42\r\nX-Other: yes\r\n\r\n",
+        0,
+    );
+    w.trailer_buf = f.trailer_buf[0..12];
+
+    _ = (try w.takeRequest()).?;
+    var buf: [16]u8 = undefined;
+    _ = try w.readBody(&buf);
+
+    var storage: [8]scan.Header = undefined;
+    try testing.expectError(error.TooManyHeaders, w.trailers(&storage));
 }
 
 test "a head and its body" {

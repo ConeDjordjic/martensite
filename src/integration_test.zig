@@ -151,6 +151,87 @@ fn send(io: Io, address: net.IpAddress, request: []const u8, out: []u8) ![]u8 {
     return w.buffered();
 }
 
+/// Answers whatever the library rejects and then stops. Used by the
+/// adversarial test below.
+fn refusingHandler(io: Io, stream: net.Stream) !void {
+    var read_buf: [4096]u8 = undefined;
+    var write_buf: [4096]u8 = undefined;
+    var headers: [32]martensite.Header = undefined;
+    var head_buf: [4096]u8 = undefined;
+
+    var reader = stream.reader(io, &read_buf);
+    var writer = stream.writer(io, &write_buf);
+    var http: Server = try .init(io, &reader.interface, &writer.interface, .{
+        .headers = &headers,
+        .head_buf = &head_buf,
+    });
+
+    while (true) {
+        const req = http.receive() catch |err| {
+            _ = http.respond(.{ .status = .forError(err), .keep_alive = false }) catch {};
+            return;
+        } orelse return;
+        _ = req;
+
+        var body_buf: [8192]u8 = undefined;
+        const body = http.readBody(&body_buf) catch |err| {
+            _ = http.respond(.{ .status = .forError(err), .keep_alive = false }) catch {};
+            return;
+        };
+        try http.respond(.text(.ok, body));
+        if (!http.alive()) return;
+    }
+}
+
+/// One connection, one hostile payload, and nothing else running.
+fn probeExchange(io: Io, seed: u16, payload: []const u8) !void {
+    var bound = try bind(io, seed);
+    defer bound.server.deinit(io);
+
+    var outcome: Outcome = .{};
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, probe, .{ io, bound.address, payload, &outcome });
+
+    const stream = try bound.server.accept(io);
+    const result = refusingHandler(io, stream);
+    stream.close(io);
+    try group.await(io);
+    try result;
+    try outcome.check();
+}
+
+fn probe(io: Io, address: net.IpAddress, payload: []const u8, out: *Outcome) Io.Cancelable!void {
+    var reply_buf: [4096]u8 = undefined;
+    const reply = out.ok(send(io, address, payload, &reply_buf)) orelse return;
+    // Rejected once. A second response would mean the smuggled request
+    // got answered as well.
+    out.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 4"));
+    out.expect(std.mem.count(u8, reply, "HTTP/1.1 ") == 1);
+}
+
+test "an adversarial peer gets one refusal and smuggles nothing" {
+    const io = testing.io;
+    const payloads = [_][]const u8{
+        // Content-Length and Transfer-Encoding together.
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "0\r\n\r\nGET /evil HTTP/1.1\r\n\r\n",
+        // Two lengths that disagree.
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\nContent-Length: 5\r\n\r\nhelloX",
+        // A folded header hides a second one from the first reader.
+        "GET /hello HTTP/1.1\r\nHost: x\r\nX-A: 1\r\n  2\r\n\r\n",
+        // A bare LF where a chunk size line needs CRLF.
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\n\r\n",
+        // A space inside the method.
+        "GE T /hello HTTP/1.1\r\nHost: x\r\n\r\n",
+        // A length that doesn't fit in a u64.
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999999999999\r\n\r\n",
+    };
+    for (payloads, 0..) |payload, i| {
+        try probeExchange(io, @intCast(40100 + i * 10), payload);
+    }
+}
+
 /// Like plainHandler, but through TimedReader and with a buffer smaller
 /// than the bodies it reads.
 fn timedHandler(io: Io, stream: net.Stream) !void {
@@ -184,7 +265,7 @@ test "a body larger than the TimedReader buffer" {
     // array and panicked. Anything posting more than the read buffer hit
     // this.
     const io = testing.io;
-    try exchange(io, 39600, timedHandler, struct {
+    try exchange(io, 39610, timedHandler, struct {
         fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
             const size = 8000;
             var request: [size + 128]u8 = undefined;

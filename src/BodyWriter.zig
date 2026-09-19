@@ -94,9 +94,11 @@ pub fn end(b: *BodyWriter) EndError!void {
 /// that is the only error an `Io.Writer` has.
 pub fn endWithTrailers(b: *BodyWriter, fields: []const field.Header) EndError!void {
     if (b.state != .open) return error.Finished;
-    // Only a chunked body has anywhere to put them. Accepting them and
-    // dropping them would be a checksum the peer never sees.
-    if (fields.len != 0 and b.mode != .chunked) return b.fail(error.InvalidTrailer);
+    // A counted body has nowhere to put them, and dropping them quietly
+    // could lose a checksum the peer never sees. `discard` is different:
+    // the head promised chunked and this is a HEAD, so the trailers go
+    // the same way the body went.
+    if (fields.len != 0 and b.mode == .length) return b.fail(error.InvalidTrailer);
     // Check first. Rejecting a trailer halfway through leaves the
     // terminator unwritten and the body unfinished.
     field.check(fields, .trailer) catch return b.fail(error.InvalidTrailer);
@@ -119,9 +121,10 @@ fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Err
     // Buffered bytes first, then the vectors. Bytes out of the buffer
     // don't count here: `drain` reports what it took from `data`.
     const buffered = io_w.buffered();
-    var total: usize = buffered.len;
     try b.emit(buffered);
     io_w.end = 0;
+
+    var total: usize = 0;
 
     for (data[0 .. data.len - 1]) |slice| {
         try b.emit(slice);
