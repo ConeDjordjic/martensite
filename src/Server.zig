@@ -17,6 +17,7 @@ const FailureSource = @import("FailureSource.zig");
 const Response = @import("Response.zig");
 const Message = @import("Message.zig");
 const field = @import("field.zig");
+const BodyWriter = @import("BodyWriter.zig");
 
 const Server = @This();
 
@@ -200,7 +201,7 @@ pub const BodyReader = HeadWindow.BodyReader;
 /// buffers into, and where a chunked body gets decoded on the way out.
 /// It is not the size of the body and not the connection's buffer. A few
 /// hundred bytes is plenty, and two is the minimum.
-pub fn bodyReader(s: *Server, decode_buf: []u8) Io.Writer.Error!BodyReader {
+pub fn bodyReader(s: *Server, decode_buf: []u8) (Io.Writer.Error || error{BodyTaken})!BodyReader {
     try s.sendContinue();
     return s.window.bodyReader(decode_buf);
 }
@@ -237,8 +238,7 @@ pub const ReadBodyError = BodyError || Io.Writer.Error;
 /// not a short read.
 pub fn readBody(s: *Server, buf: []u8) ReadBodyError![]u8 {
     try s.sendContinue();
-    const got = try s.window.readBody(buf);
-    return got.bytes;
+    return s.window.readBody(buf);
 }
 
 pub const SendError = Response.WriteError || error{
@@ -313,137 +313,37 @@ pub fn respondStreaming(
         .framing = if (options.content_length) |n| .{ .length = n } else .chunked,
     });
     if (!r.keep_alive) s.keep_alive = false;
+    // The head goes out now, not when the body ends. Otherwise a peer
+    // waiting on the status line waits for a body that is waiting on
+    // it.
+    try s.writer.flush();
     s.phase = .streaming;
 
-    return .{
-        .server = s,
-        .scratch = out_buf,
-        .mode = if (!head.status.mayHaveBody() or s.head_only)
+    return .init(
+        s.writer,
+        out_buf,
+        if (!head.status.mayHaveBody() or s.head_only)
             .discard
         else if (options.content_length) |n| .{ .length = n } else .chunked,
-        .interface = .{
-            .vtable = &.{ .drain = ResponseWriter.drain },
-            .buffer = out_buf,
-        },
-    };
+        .{ .ctx = s, .settled = settled },
+    );
 }
 
-/// Writes a body a piece at a time. Uses chunked encoding unless you pass
-/// a length, which then gets checked against what you actually write.
-///
-/// One error state: any error from a write, from `end` or from
-/// `endWithTrailers` means the body on the wire is not a complete one, so
-/// the connection is closed (`alive()` goes false) and every later call
-/// on the writer returns `WriteFailed` without writing. There is nothing
-/// to retry and nothing to clean up.
-pub const ResponseWriter = struct {
-    server: *Server,
-    interface: Io.Writer,
-    scratch: []u8,
-    mode: union(enum) {
-        chunked,
-        length: u64,
-        /// No body allowed. Writes are dropped.
-        discard,
-    },
+/// Writes the response body a piece at a time. See `BodyWriter`.
+pub const ResponseWriter = BodyWriter;
 
-    fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
-        const rw: *ResponseWriter = @alignCast(@fieldParentPtr("interface", io_w));
-        const out = rw.server.writer;
-
-        // Buffered bytes first, then the vectors. Bytes out of the buffer
-    // don't count here: `drain` reports what it took from `data`.
-        const buffered = io_w.buffered();
-        var total: usize = buffered.len;
-        try rw.emit(out, buffered);
-        io_w.end = 0;
-
-        for (data[0 .. data.len - 1]) |slice| {
-            try rw.emit(out, slice);
-            total += slice.len;
-        }
-        const last = data[data.len - 1];
-        for (0..splat) |_| {
-            try rw.emit(out, last);
-            total += last.len;
-        }
-        return total;
+/// An unfinished body ends the connection. A finished one ends the turn.
+fn settled(ctx: *anyopaque, state: BodyWriter.State) void {
+    const s: *Server = @ptrCast(@alignCast(ctx));
+    switch (state) {
+        .broken => {
+            s.keep_alive = false;
+            s.phase = .done;
+        },
+        .finished => s.phase = if (s.keep_alive) .answered else .done,
+        .open => unreachable,
     }
-
-    fn emit(rw: *ResponseWriter, out: *Io.Writer, bytes: []const u8) Io.Writer.Error!void {
-        if (bytes.len == 0) return;
-        switch (rw.mode) {
-            .discard => {},
-            .length => |*left| {
-                // Overrunning would be read as the next response.
-                if (bytes.len > left.*) return rw.fail(error.WriteFailed);
-                left.* -= bytes.len;
-                out.writeAll(bytes) catch |err| return rw.fail(err);
-            },
-            .chunked => chunk(out, bytes) catch |err| return rw.fail(err),
-        }
-    }
-
-    fn chunk(out: *Io.Writer, bytes: []const u8) Io.Writer.Error!void {
-        try out.print("{x}\r\n", .{bytes.len});
-        try out.writeAll(bytes);
-        try out.writeAll("\r\n");
-    }
-
-    /// Every error the writer reports goes through here: half a body is
-    /// on the wire, no later write can make it whole, so the connection
-    /// ends after it and the writer refuses anything further.
-    fn fail(rw: *ResponseWriter, err: anytype) @TypeOf(err) {
-        rw.server.keep_alive = false;
-        rw.server.phase = .done;
-        return err;
-    }
-
-    pub const EndError = Io.Writer.Error || error{
-        /// A trailer name or value that cannot be written, or one that
-        /// would change the framing something has already acted on.
-        InvalidTrailer,
-        /// Fewer bytes were written than `Content-Length` promised. The
-        /// peer would wait forever for the rest.
-        LengthMismatch,
-        /// The body is over: it was ended already, or a write failed and
-        /// took the framing with it.
-        Finished,
-    };
-
-    /// Ends the body and flushes. You have to call this.
-    pub fn end(rw: *ResponseWriter) EndError!void {
-        return rw.endWithTrailers(&.{});
-    }
-
-    /// Ends the body with trailers. Chunked only, and the peer ignores
-    /// them unless the head announced them.
-    ///
-    /// A write past `Content-Length` still arrives as `WriteFailed`,
-    /// through `interface`: an `Io.Writer` has no other word for it.
-    pub fn endWithTrailers(rw: *ResponseWriter, fields: []const Response.Header) EndError!void {
-        if (rw.server.phase != .streaming) return error.Finished;
-        // Decide before writing: a trailer refused halfway through would
-        // leave the terminator unwritten and the body unfinished.
-        field.check(fields, .trailer) catch return rw.fail(error.InvalidTrailer);
-
-        rw.interface.flush() catch |err| return rw.fail(err);
-        const out = rw.server.writer;
-        switch (rw.mode) {
-            .discard => {},
-            .chunked => terminate(out, fields) catch |err| return rw.fail(err),
-            .length => |left| if (left != 0) return rw.fail(error.LengthMismatch),
-        }
-        out.flush() catch |err| return rw.fail(err);
-        rw.server.phase = if (rw.server.keep_alive) .answered else .done;
-    }
-
-    fn terminate(out: *Io.Writer, fields: []const Response.Header) Io.Writer.Error!void {
-        try out.writeAll("0\r\n");
-        try field.write(out, fields);
-        try out.writeAll("\r\n");
-    }
-};
+}
 
 /// Today's date, if the caller asked for one. `writeHead` drops it if
 /// the response already has a Date.
@@ -1290,6 +1190,68 @@ test "what the request asked for outlives the 100 we sent" {
 
         try testing.expect(req.expectsContinue());
     }
+}
+
+test "a body is handed out once, one way" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\n\r\n");
+        _ = (try s.receive()).?;
+
+        var scratch: [16]u8 = undefined;
+        var b = try s.bodyReader(&scratch);
+
+        // The stream owns the body. A second way in would pick up where
+        // the first one left off and read the next head as body.
+        var buf: [64]u8 = undefined;
+        try testing.expectError(error.BodyTaken, s.readBody(&buf));
+        try testing.expectError(error.BodyTaken, s.bodyReader(&scratch));
+
+        var sink: Io.Writer = .fixed(&buf);
+        _ = try b.interface.streamRemaining(&sink);
+        try testing.expectEqualStrings("hello", sink.buffered());
+
+        try s.respond(.{});
+        const next = (try s.receive()).?;
+        try testing.expectEqualStrings("/next", next.target());
+    }
+}
+
+test "reading the body twice is refused" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+    _ = (try s.receive()).?;
+
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("hello", try s.readBody(&buf));
+    try testing.expectError(error.BodyTaken, s.readBody(&buf));
+}
+
+test "a streamed body reaches the peer before it ends" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var scratch: [64]u8 = undefined;
+    var rw = try s.respondStreaming(.{}, &scratch, .{});
+
+    try testing.expect(std.mem.endsWith(u8, h.written(), "\r\n\r\n"));
+
+    try rw.interface.writeAll("event one");
+    try rw.flush();
+    try testing.expect(std.mem.endsWith(u8, h.written(), "9\r\nevent one\r\n"));
+
+    try rw.interface.writeAll("event two");
+    try rw.end();
+    try testing.expect(std.mem.endsWith(u8, h.written(), "9\r\nevent two\r\n0\r\n\r\n"));
+}
+
+test "what a connection costs, apart from its buffers" {
+    // Pinned, so if it grows you see it in a diff. Everything else a
+    // connection uses is a buffer the caller sized.
+    try testing.expectEqual(@as(usize, 184), @sizeOf(Server));
+    try testing.expectEqual(@as(usize, 112), @sizeOf(HeadWindow));
+    try testing.expectEqual(@as(usize, 88), @sizeOf(Request));
 }
 
 test "no trailers is an empty slice" {

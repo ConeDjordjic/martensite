@@ -183,8 +183,17 @@ pub const Status = enum(u16) {
             error.UnsupportedExpectation => .expectation_failed,
             error.BodyTooLarge => .payload_too_large,
             error.UnsupportedEncoding => .not_implemented,
-            error.Ambiguous, error.BadRequest, error.Incomplete, error.BadChunk => .bad_request,
-            else => .bad_request,
+            // The rest all mean "not a request we are going to serve".
+            error.BadRequest,
+            error.Ambiguous,
+            error.Incomplete,
+            error.BadChunk,
+            error.ReadFailed,
+            => .bad_request,
+            // Not the peer's fault: answered twice, read a body twice,
+            // or a write that failed. Don't blame the request in the
+            // log.
+            else => .internal_server_error,
         };
     }
 
@@ -324,6 +333,12 @@ test "every refusal this library can return has a status" {
     try testing.expectEqual(Status.bad_request, Status.forError(error.Ambiguous));
     try testing.expectEqual(Status.bad_request, Status.forError(error.BadRequest));
     try testing.expectEqual(Status.bad_request, Status.forError(error.ReadFailed));
+
+    // Not the peer's fault, so don't report it like it was.
+    try testing.expectEqual(Status.internal_server_error, Status.forError(error.AlreadyAnswered));
+    try testing.expectEqual(Status.internal_server_error, Status.forError(error.ResponseOpen));
+    try testing.expectEqual(Status.internal_server_error, Status.forError(error.BodyTaken));
+    try testing.expectEqual(Status.internal_server_error, Status.forError(error.WriteFailed));
 }
 
 test "statuses that cannot have a body do not get a length" {

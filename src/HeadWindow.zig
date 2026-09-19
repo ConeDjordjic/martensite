@@ -35,6 +35,10 @@ generation: u32 = 0,
 /// Set once we no longer know the reader is sitting on a message
 /// boundary. We don't scan anything after that.
 finished: bool = false,
+/// The body has been handed out. Handing it out twice gives you two
+/// readers that both think they own it, and the second one reads the
+/// next head as body.
+claimed: bool = false,
 /// Raw trailer lines from the last chunked body. Cleared on every take.
 trailers_raw: []const u8 = "",
 
@@ -73,6 +77,10 @@ pub fn init(reader: *Io.Reader, options: Options) InitError!HeadWindow {
 /// `TooManyHeaders` means one of the buffers was too small: `storage`
 /// for the scanned headers, or `trailer_buf` for the lines. We never
 /// hand back a truncated set as if it were complete.
+///
+/// These are not filtered, unlike the ones we write. A peer's trailers
+/// are just data. They arrive after the body, so nothing in them can
+/// change framing or routing, which are both decided by that point.
 pub fn trailers(w: *const HeadWindow, storage: []scan.Header) scan.Error![]const scan.Header {
     if (w.trailers_raw.len == 0) return &.{};
     return scan.trailers(w.trailers_raw, storage);
@@ -130,6 +138,7 @@ fn take(w: *HeadWindow, comptime kind: Kind, sent_method: ?scan.Method) TakeErro
 
     w.releaseHead();
     w.trailers_raw = "";
+    w.claimed = false;
 
     var last_len: usize = 0;
     var filled = false;
@@ -298,20 +307,23 @@ pub const BodyError = error{
     /// The body doesn't fit in the buffer it was given. Only `readBody`
     /// returns this.
     BodyTooLarge,
+    /// There is no body to hand out. Either this call or the other one
+    /// already took it, or the window gave up first. A body is read once
+    /// and one way, because a second reader would mistake the next head
+    /// for body.
+    BodyTaken,
     ReadFailed,
 } || Io.Cancelable;
 
-pub const Body = struct {
-    bytes: []u8,
-    /// Raw trailer lines, if the body was chunked and `trailer_buf` had
-    /// room. Valid until the next take.
-    trailers: []const u8 = "",
-};
-
 /// Reads the whole body into `buf`. If it doesn't fit you get an error,
 /// not a short read.
-pub fn readBody(w: *HeadWindow, buf: []u8) BodyError!Body {
-    if (w.pending == .none) return .{ .bytes = buf[0..0] };
+pub fn readBody(w: *HeadWindow, buf: []u8) BodyError![]u8 {
+    // Before the `pending` check: once a body has been read, `pending`
+    // is `.none` and answering with an empty slice would be a lie about
+    // the message rather than an answer about the body.
+    if (w.claimed) return error.BodyTaken;
+    if (w.pending == .none) return buf[0..0];
+    w.claimed = true;
 
     w.releaseHead();
 
@@ -325,7 +337,7 @@ pub fn readBody(w: *HeadWindow, buf: []u8) BodyError!Body {
                 error.ReadFailed => return w.giveUp(error.ReadFailed),
             };
             w.pending = .none;
-            return .{ .bytes = buf[0..want] };
+            return buf[0..want];
         },
         .until_close => {
             var out: Io.Writer = .fixed(buf);
@@ -337,7 +349,7 @@ pub fn readBody(w: *HeadWindow, buf: []u8) BodyError!Body {
             // The body ended because the connection did. There is no
             // next message on a socket that is going away.
             w.finished = true;
-            return .{ .bytes = out.buffered() };
+            return out.buffered();
         },
         .chunked => {
             var d: chunked.Decoder = .{
@@ -356,7 +368,7 @@ pub fn readBody(w: *HeadWindow, buf: []u8) BodyError!Body {
                     .bad => return w.giveUp(error.BadChunk),
                     .done => {
                         w.pending = .none;
-                        return .{ .bytes = buf[0..out], .trailers = w.trailers_raw };
+                        return buf[0..out];
                     },
                     .more => continue,
                     .need_fill => w.reader.fillMore() catch |err| switch (err) {
@@ -476,8 +488,12 @@ pub const BodyReader = struct {
 /// `Io.Reader` calls that take instead of stream, and a chunked body
 /// decodes in the other half of it. A few hundred bytes is plenty, and
 /// two is the minimum.
-pub fn bodyReader(w: *HeadWindow, decode_buf: []u8) BodyReader {
-    if (w.pending != .none) w.releaseHead();
+pub fn bodyReader(w: *HeadWindow, decode_buf: []u8) error{BodyTaken}!BodyReader {
+    if (w.claimed) return error.BodyTaken;
+    if (w.pending != .none) {
+        w.claimed = true;
+        w.releaseHead();
+    }
     return .{
         .window = w,
         .interface = .{
@@ -603,8 +619,7 @@ test "a head and its body" {
         try testing.expectEqualStrings("/a", taken.head.target);
 
         var buf: [32]u8 = undefined;
-        const got = try w.readBody(&buf);
-        try testing.expectEqualStrings("hello", got.bytes);
+        try testing.expectEqualStrings("hello", try w.readBody(&buf));
     }
 }
 
@@ -670,9 +685,11 @@ test "trailers do not outlive the take that produced them" {
 
         _ = (try w.takeRequest()).?;
         var buf: [64]u8 = undefined;
-        const got = try w.readBody(&buf);
-        try testing.expectEqualStrings("hello", got.bytes);
-        try testing.expect(std.mem.indexOf(u8, got.trailers, "X-Note") != null);
+        try testing.expectEqualStrings("hello", try w.readBody(&buf));
+
+        var storage: [4]scan.Header = undefined;
+        const t = try w.trailers(&storage);
+        try testing.expectEqualStrings("X-Note", t[0].name);
 
         _ = (try w.takeRequest()).?;
         try testing.expectEqualStrings("", w.trailers_raw);
@@ -701,7 +718,7 @@ test "the body reader streams what readBody would have returned" {
         var out: [64]u8 = undefined;
         var sink: Io.Writer = .fixed(&out);
         var scratch: [16]u8 = undefined;
-        var b = w.bodyReader(&scratch);
+        var b = try w.bodyReader(&scratch);
         _ = try b.interface.streamRemaining(&sink);
         try testing.expectEqualStrings("hello world", sink.buffered());
     }

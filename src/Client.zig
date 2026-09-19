@@ -11,6 +11,7 @@ const body = @import("body.zig");
 const chunked = @import("chunked.zig");
 const HeadWindow = @import("HeadWindow.zig");
 const field = @import("field.zig");
+const BodyWriter = @import("BodyWriter.zig");
 const FailureSource = @import("FailureSource.zig");
 const Message = @import("Message.zig");
 
@@ -46,6 +47,9 @@ pub const Phase = enum {
     /// Nothing outstanding, either before the first request or after
     /// the last response.
     ready,
+    /// The head is out and the body is still being written. Nothing
+    /// moves until `RequestWriter.end`.
+    sending,
     /// A request is on the wire and there is no response yet. Sending
     /// another one is pipelining, which we don't allow. We only keep one
     /// request's framing rules at a time, so a second send would frame
@@ -123,9 +127,75 @@ pub const SendError = Io.Writer.Error || error{
 /// becomes the start of whatever gets sent next, and then you have split
 /// one request into two.
 pub fn send(c: *Client, r: Request) SendError!void {
+    try c.writeHead(r, .from_body);
+    try c.writer.writeAll(r.body);
+    try c.writer.flush();
+    c.phase = .sent;
+}
+
+pub const StreamOptions = struct {
+    /// Null means chunked.
+    content_length: ?u64 = null,
+};
+
+/// Starts a request whose body gets written afterwards. Finish it with
+/// `end`.
+///
+/// `out_buf` becomes the body writer's buffer, so its size is the
+/// biggest piece that goes out in one write. With chunked encoding that
+/// is the chunk size on the wire. `Request.body` is ignored here, since
+/// the body is whatever you write to the returned writer.
+pub fn sendStreaming(
+    c: *Client,
+    r: Request,
+    out_buf: []u8,
+    options: StreamOptions,
+) SendError!RequestWriter {
+    try c.writeHead(r, if (options.content_length) |n| .{ .length = n } else .chunked);
+    // The head goes out now. A server we asked for 100-continue can't
+    // answer a request it hasn't seen yet.
+    try c.writer.flush();
+    c.phase = .sending;
+    return .init(
+        c.writer,
+        out_buf,
+        if (options.content_length) |n| .{ .length = n } else .chunked,
+        .{ .ctx = c, .settled = settled },
+    );
+}
+
+/// Writes the request body a piece at a time. See `BodyWriter`.
+pub const RequestWriter = BodyWriter;
+
+/// An unfinished body ends the connection. A finished one leaves the
+/// request outstanding, waiting to be answered.
+fn settled(ctx: *anyopaque, state: BodyWriter.State) void {
+    const c: *Client = @ptrCast(@alignCast(ctx));
+    switch (state) {
+        .broken => {
+            c.keep_alive = false;
+            c.phase = .done;
+        },
+        .finished => c.phase = .sent,
+        .open => unreachable,
+    }
+}
+
+/// How the body coming after this is framed.
+const Framing = union(enum) {
+    /// Whatever `Request.body` holds.
+    from_body,
+    length: u64,
+    chunked,
+};
+
+/// The request line and headers, up to the blank line. Everything gets
+/// checked before a byte goes out, because half a request line becomes
+/// the start of whatever is sent next.
+fn writeHead(c: *Client, r: Request, framing: Framing) SendError!void {
     switch (c.phase) {
         .ready, .received => {},
-        .sent => return error.ExchangeOpen,
+        .sent, .sending => return error.ExchangeOpen,
         .done => return error.Closed,
     }
     if (!c.keep_alive or !c.window.usable()) return error.Closed;
@@ -140,6 +210,14 @@ pub fn send(c: *Client, r: Request) SendError!void {
             std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) framed = true;
     }
 
+    // Everything that can be refused has been. A write that gives out
+    // from here leaves part of a request on the wire, and the next one
+    // would continue it, so the connection ends with it.
+    errdefer {
+        c.keep_alive = false;
+        c.phase = .done;
+    }
+
     const w = c.writer;
     try w.writeAll(r.method);
     try w.writeByte(' ');
@@ -147,15 +225,16 @@ pub fn send(c: *Client, r: Request) SendError!void {
     try w.writeAll(" HTTP/1.1\r\n");
 
     try field.write(w, r.headers);
-    if (!framed and r.send_length and r.body.len != 0) {
-        try w.print("Content-Length: {d}\r\n", .{r.body.len});
-    }
+    if (!framed) switch (framing) {
+        .from_body => if (r.send_length and r.body.len != 0) {
+            try w.print("Content-Length: {d}\r\n", .{r.body.len});
+        },
+        .length => |n| try w.print("Content-Length: {d}\r\n", .{n}),
+        .chunked => try w.writeAll("Transfer-Encoding: chunked\r\n"),
+    };
     try w.writeAll("\r\n");
-    try w.writeAll(r.body);
-    try w.flush();
 
     c.sent_method = scan.Method.parse(r.method);
-    c.phase = .sent;
 }
 
 pub const ReceiveError = error{
@@ -165,6 +244,8 @@ pub const ReceiveError = error{
     HeadTooLarge,
     /// Nothing outstanding to read. Send a request first.
     NothingSent,
+    /// A streamed request body is still open. End it first.
+    RequestOpen,
     Ambiguous,
     UnsupportedEncoding,
     ReadFailed,
@@ -192,6 +273,7 @@ pub fn receive(c: *Client) ReceiveError!?Response {
     switch (c.phase) {
         .sent => {},
         .ready, .received => return error.NothingSent,
+        .sending => return error.RequestOpen,
         .done => return null,
     }
 
@@ -234,8 +316,7 @@ pub const BodyError = HeadWindow.BodyError;
 /// Reads the whole body into `buf`. If it doesn't fit you get an error,
 /// not a short read.
 pub fn readBody(c: *Client, buf: []u8) BodyError![]u8 {
-    const got = try c.window.readBody(buf);
-    return got.bytes;
+    return c.window.readBody(buf);
 }
 
 /// The response body as an `Io.Reader`, for bodies too big to hold in
@@ -247,7 +328,7 @@ pub const BodyReader = HeadWindow.BodyReader;
 /// `decode_buf` is the reader's own memory. It is what the reader
 /// buffers into, and where a chunked body decodes on the way out. A few
 /// hundred bytes is plenty, and two is the minimum.
-pub fn bodyReader(c: *Client, decode_buf: []u8) BodyReader {
+pub fn bodyReader(c: *Client, decode_buf: []u8) error{BodyTaken}!BodyReader {
     return c.window.bodyReader(decode_buf);
 }
 
@@ -255,7 +336,7 @@ pub fn bodyReader(c: *Client, decode_buf: []u8) BodyReader {
 /// outstanding.
 pub fn alive(c: *const Client) bool {
     switch (c.phase) {
-        .sent, .done => return false,
+        .sent, .sending, .done => return false,
         .ready, .received => {},
     }
     return c.keep_alive and c.window.usable();
@@ -281,11 +362,15 @@ const Harness = struct {
     head_buf: [16 * 1024]u8,
     trailer_buf: [512]u8,
     out: [4096]u8,
+    tight: [16]u8,
 
     /// Test knobs. All of them go through `Options`.
     const Setup = struct {
         /// Read a body the caller ignored. Off by default.
         max_drain: u64 = 0,
+        /// Almost nowhere for the request to go. A `fixed` writer with
+        /// plenty of room never fails partway through a head.
+        tight_writer: bool = false,
     };
 
     fn init(h: *Harness, shape: Shape, input: []const u8) Client {
@@ -294,7 +379,7 @@ const Harness = struct {
 
     fn initWith(h: *Harness, shape: Shape, input: []const u8, setup: Setup) Client {
         const reader = h.source.reader(shape, input);
-        h.writer = .fixed(&h.out);
+        h.writer = if (setup.tight_writer) .fixed(&h.tight) else .fixed(&h.out);
         return Client.init(testing.io, reader, &h.writer, .{
             .headers = &h.headers,
             .head_buf = &h.head_buf,
@@ -423,6 +508,105 @@ test "an interim response does not decide the connection" {
         _ = (try c.receive()).?;
         try testing.expect(c.alive());
     }
+}
+
+test "a streamed request body is chunked when the length is unknown" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var c = h.init(shape, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+
+        var scratch: [64]u8 = undefined;
+        var rw = try c.sendStreaming(.{ .method = "POST", .target = "/up" }, &scratch, .{});
+        try rw.interface.writeAll("hello ");
+        try rw.interface.writeAll("world");
+        try rw.end();
+
+        const out = h.sent();
+        try testing.expect(std.mem.indexOf(u8, out, "Transfer-Encoding: chunked") != null);
+        try testing.expect(std.mem.endsWith(u8, out, "b\r\nhello world\r\n0\r\n\r\n"));
+
+        const res = (try c.receive()).?;
+        try testing.expectEqual(@as(u16, 200), res.status());
+    }
+}
+
+test "a streamed request with a known length is not chunked" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+
+    var scratch: [64]u8 = undefined;
+    var rw = try c.sendStreaming(.{ .method = "PUT", .target = "/f" }, &scratch, .{ .content_length = 5 });
+    try rw.interface.writeAll("hello");
+    try rw.end();
+
+    const out = h.sent();
+    try testing.expect(std.mem.indexOf(u8, out, "Content-Length: 5") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "chunked") == null);
+    try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\nhello"));
+}
+
+test "a streamed request body that stops short is refused" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+
+    var scratch: [64]u8 = undefined;
+    var rw = try c.sendStreaming(.{ .method = "PUT", .target = "/f" }, &scratch, .{ .content_length = 100 });
+    try rw.interface.writeAll("not enough");
+    try testing.expectError(error.LengthMismatch, rw.end());
+    try testing.expect(!c.alive());
+    try testing.expectError(error.Finished, rw.end());
+}
+
+test "nothing else happens while a request body is open" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+
+    var scratch: [64]u8 = undefined;
+    var rw = try c.sendStreaming(.{ .method = "POST", .target = "/a" }, &scratch, .{});
+    try rw.interface.writeAll("part");
+
+    try testing.expectError(error.RequestOpen, c.receive());
+    try testing.expectError(error.ExchangeOpen, c.send(.{}));
+    try testing.expect(!c.alive());
+
+    try rw.end();
+    _ = (try c.receive()).?;
+}
+
+test "a HEAD sent as a streamed request still frames its answer" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n");
+
+    var scratch: [64]u8 = undefined;
+    var rw = try c.sendStreaming(.{ .method = "HEAD", .target = "/x" }, &scratch, .{ .content_length = 0 });
+    try rw.end();
+
+    const res = (try c.receive()).?;
+    try testing.expectEqual(body.Framing.none, res.framing);
+}
+
+test "a request the writer cannot hold ends the connection" {
+    var h: Harness = undefined;
+    var c = h.initWith(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", .{ .tight_writer = true });
+
+    // 16 bytes of room, and the request line alone doesn't fit.
+    try testing.expectError(error.WriteFailed, c.send(.{ .target = "/a-long-target" }));
+
+    try testing.expect(!c.alive());
+    try testing.expectError(error.Closed, c.send(.{ .target = "/b" }));
+    try testing.expectEqual(@as(?Response, null), try c.receive());
+}
+
+test "a streamed request whose head cannot be written ends the connection" {
+    var h: Harness = undefined;
+    var c = h.initWith(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", .{ .tight_writer = true });
+
+    var scratch: [32]u8 = undefined;
+    try testing.expectError(
+        error.WriteFailed,
+        c.sendStreaming(.{ .method = "POST", .target = "/a-long-target" }, &scratch, .{}),
+    );
+    try testing.expect(!c.alive());
 }
 
 test "one exchange at a time" {

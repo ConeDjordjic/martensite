@@ -29,7 +29,7 @@ next `receive`. If something has to outlive the request, copy it out.
 If you use a `Request` after that, it panics in Debug and ReleaseSafe:
 
 ```
-thread 547234 panic: request outlived the receive that produced it
+thread 547234 panic: message outlived the receive that produced it
 ```
 
 In ReleaseFast there is no check, so you just read a stale pointer. Use
@@ -142,6 +142,15 @@ next `receive` gives you the real response.
 `Client.Options` has `trailer_buf` and `failure` just like `Server`'s, so
 trailers from a chunked response show up in `client.trailers(&storage)`
 and a peer that goes quiet comes back as `error.Timeout`.
+
+A request body too big to hold in memory goes out the same way a response
+does:
+
+```zig
+var rw = try client.sendStreaming(.{ .method = "POST", .target = "/upload" }, &out_buf, .{});
+_ = try file_reader.interface.streamRemaining(&rw.interface);
+try rw.end();
+```
 
 And responses too big to buffer stream like request bodies:
 

@@ -10,6 +10,7 @@ pub const field = @import("field.zig");
 pub const target = @import("target.zig");
 
 pub const Response = @import("Response.zig");
+pub const BodyWriter = @import("BodyWriter.zig");
 pub const Date = @import("Date.zig");
 pub const Server = @import("Server.zig");
 pub const Client = @import("Client.zig");
@@ -28,6 +29,7 @@ test {
     _ = field;
     _ = target;
     _ = Response;
+    _ = BodyWriter;
     _ = Date;
     _ = Server;
     _ = Client;
