@@ -111,8 +111,9 @@ pub fn connectionHas(c: Connection, token: []const u8) bool {
     return false;
 }
 
-/// chunked must be last, and may appear only once.
-fn endsWithChunked(value: []const u8) bool {
+/// chunked has to be last and can only appear once. This is public
+/// because the write side checks the caller's own header the same way.
+pub fn endsWithChunked(value: []const u8) bool {
     var last: []const u8 = "";
     var count: usize = 0;
     var it = std.mem.splitScalar(u8, value, ',');

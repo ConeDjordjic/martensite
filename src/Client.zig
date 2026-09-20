@@ -104,13 +104,15 @@ pub const Request = struct {
     target: []const u8 = "/",
     headers: []const Header = &.{},
     body: []const u8 = "",
-    /// Send a Content-Length, unless `headers` already has framing in it.
-    send_length: bool = true,
 };
 
 pub const SendError = Io.Writer.Error || error{
     /// A bad header name, or CR, LF or NUL in a value.
     InvalidHeader,
+    /// The caller's framing headers say something we would refuse to
+    /// read: both `Content-Length` and `Transfer-Encoding`, two lengths
+    /// that disagree, or a length that isn't the body's.
+    AmbiguousFraming,
     /// The method or target doesn't fit in a request line.
     InvalidRequest,
     /// The last request hasn't been answered yet. Receive first.
@@ -210,10 +212,35 @@ fn writeHead(c: *Client, r: Request, framing: Framing) SendError!void {
         std.mem.indexOfScalar(u8, r.target, ' ') != null) return error.InvalidRequest;
 
     field.check(r.headers, .header) catch return error.InvalidHeader;
-    var framed = false;
-    for (r.headers) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "content-length") or
-            std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) framed = true;
+
+    // The caller's own framing has to agree with the body coming after
+    // it, otherwise we send a request our own Scanner would reject.
+    const announced = field.announced(r.headers) catch return error.AmbiguousFraming;
+    const framed = announced.framed();
+    switch (framing) {
+        .from_body => {
+            if (announced.length) |n| {
+                if (n != r.body.len) return error.AmbiguousFraming;
+            }
+            if (announced.encoding) |te| {
+                if (!body.endsWithChunked(te)) return error.AmbiguousFraming;
+                // A body with no terminator never ends. Trailers go
+                // through `sendStreaming` and `endWithTrailers`.
+                if (!std.mem.endsWith(u8, r.body, "0\r\n\r\n")) return error.AmbiguousFraming;
+            }
+        },
+        .length => |n| {
+            if (announced.encoding != null) return error.AmbiguousFraming;
+            if (announced.length) |mine| {
+                if (mine != n) return error.AmbiguousFraming;
+            }
+        },
+        .chunked => {
+            if (announced.length != null) return error.AmbiguousFraming;
+            if (announced.encoding) |te| {
+                if (!body.endsWithChunked(te)) return error.AmbiguousFraming;
+            }
+        },
     }
 
     // Past every check now. A write that fails from here on leaves part
@@ -228,7 +255,9 @@ fn writeHead(c: *Client, r: Request, framing: Framing) SendError!void {
 
     try field.write(w, r.headers);
     if (!framed) switch (framing) {
-        .from_body => if (r.send_length and r.body.len != 0) {
+        // An unframed body reads as the start of the next request, so
+        // this is not optional.
+        .from_body => if (r.body.len != 0) {
             try w.print("Content-Length: {d}\r\n", .{r.body.len});
         },
         .length => |n| try w.print("Content-Length: {d}\r\n", .{n}),
@@ -620,6 +649,71 @@ test "a body the writer cannot hold ends the connection" {
     try testing.expectError(error.WriteFailed, c.send(.{ .method = "PUT", .target = "/", .body = "hello" }));
     try testing.expect(!c.alive());
     try testing.expectError(error.Closed, c.send(.{}));
+}
+
+test "a request cannot be framed two ways at once" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "");
+
+    try testing.expectError(error.AmbiguousFraming, c.send(.{
+        .method = "POST",
+        .headers = &.{
+            .{ .name = "Content-Length", .value = "5" },
+            .{ .name = "Transfer-Encoding", .value = "chunked" },
+        },
+        .body = "hello",
+    }));
+    try testing.expectEqualStrings("", h.sent());
+    // Rejected before any byte went out, so the exchange is still open
+    // for a sensible request.
+    try testing.expect(c.alive());
+}
+
+test "a request length that is not the body's is refused" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "");
+
+    try testing.expectError(error.AmbiguousFraming, c.send(.{
+        .method = "POST",
+        .headers = &.{.{ .name = "Content-Length", .value = "0" }},
+        .body = "GET /admin HTTP/1.1\r\n\r\n",
+    }));
+    try testing.expectEqualStrings("", h.sent());
+}
+
+test "a body always gets a length" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "");
+    try c.send(.{ .method = "POST", .body = "hello" });
+    try testing.expect(std.mem.indexOf(u8, h.sent(), "Content-Length: 5") != null);
+}
+
+test "a streamed request cannot contradict its own head" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "");
+
+    var scratch: [64]u8 = undefined;
+    try testing.expectError(error.AmbiguousFraming, c.sendStreaming(.{
+        .method = "POST",
+        .headers = &.{.{ .name = "Content-Length", .value = "5" }},
+    }, &scratch, .{}));
+}
+
+test "an encoding the Scanner would refuse is not sent" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "");
+
+    try testing.expectError(error.AmbiguousFraming, c.send(.{
+        .method = "POST",
+        .headers = &.{.{ .name = "Transfer-Encoding", .value = "gzip" }},
+        .body = "hello",
+    }));
+    try testing.expectError(error.AmbiguousFraming, c.send(.{
+        .method = "POST",
+        .headers = &.{.{ .name = "Transfer-Encoding", .value = "chunked" }},
+        .body = "hello",
+    }));
+    try testing.expectEqualStrings("", h.sent());
 }
 
 test "one exchange at a time" {

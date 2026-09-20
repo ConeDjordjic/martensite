@@ -37,6 +37,45 @@ pub fn check(fields: []const Header, policy: Policy) Error!void {
     }
 }
 
+/// What the caller's own headers say about the body coming after them.
+pub const Announced = struct {
+    /// A `Content-Length` the caller wrote themselves.
+    length: ?u64 = null,
+    /// A `Transfer-Encoding` the caller wrote, as written. Any value at
+    /// all means they are framing the body themselves.
+    encoding: ?[]const u8 = null,
+
+    /// Whether the caller framed the body at all.
+    pub fn framed(a: Announced) bool {
+        return a.length != null or a.encoding != null;
+    }
+};
+
+/// Reads the framing out of the caller's headers and rejects whatever
+/// the read side rejects. Writing a message we wouldn't parse ourselves
+/// is how a body gets past the less careful end of a connection.
+pub fn announced(fields: []const Header) Error!Announced {
+    var out: Announced = .{};
+    for (fields) |f| {
+        if (std.ascii.eqlIgnoreCase(f.name, "content-length")) {
+            const n = std.fmt.parseInt(u64, std.mem.trim(u8, f.value, " \t"), 10) catch
+                return error.Invalid;
+            // Repeating it is fine as long as it agrees.
+            if (out.length) |prev| {
+                if (prev != n) return error.Invalid;
+            }
+            out.length = n;
+        } else if (std.ascii.eqlIgnoreCase(f.name, "transfer-encoding")) {
+            // The read side calls a repeat of this Ambiguous too.
+            if (out.encoding != null) return error.Invalid;
+            out.encoding = f.value;
+        }
+    }
+    // Both at once is the classic smuggling setup.
+    if (out.encoding != null and out.length != null) return error.Invalid;
+    return out;
+}
+
 /// Writes one line each. Call `check` first, because this can't reject.
 pub fn write(w: *Io.Writer, fields: []const Header) Io.Writer.Error!void {
     for (fields) |f| {
@@ -59,6 +98,34 @@ fn forbiddenInTrailer(name: []const u8) bool {
 }
 
 const testing = std.testing;
+
+test "framing a caller announced for themselves" {
+    try testing.expectEqual(@as(?u64, 5), (try announced(&.{.{ .name = "Content-Length", .value = "5" }})).length);
+    try testing.expectEqualStrings("chunked", (try announced(&.{.{ .name = "Transfer-Encoding", .value = "chunked" }})).encoding.?);
+    try testing.expectEqual(@as(?u64, null), (try announced(&.{.{ .name = "X", .value = "1" }})).length);
+
+    // This is what the read side calls Ambiguous.
+    try testing.expectError(error.Invalid, announced(&.{
+        .{ .name = "Content-Length", .value = "5" },
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+    }));
+    try testing.expectError(error.Invalid, announced(&.{
+        .{ .name = "Content-Length", .value = "5" },
+        .{ .name = "Content-Length", .value = "6" },
+    }));
+    try testing.expectError(error.Invalid, announced(&.{.{ .name = "Content-Length", .value = "5x" }}));
+
+    try testing.expectError(error.Invalid, announced(&.{
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+        .{ .name = "Transfer-Encoding", .value = "gzip" },
+    }));
+
+    // Repeating the same length is not a disagreement.
+    try testing.expectEqual(@as(?u64, 5), (try announced(&.{
+        .{ .name = "Content-Length", .value = "5" },
+        .{ .name = "Content-Length", .value = "5" },
+    })).length);
+}
 
 test "a field the Scanner would refuse is refused here" {
     for ([_]Header{

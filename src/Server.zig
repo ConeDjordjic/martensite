@@ -286,12 +286,19 @@ fn startResponse(s: *Server) error{AlreadyAnswered}!void {
 
 /// Writes a response and flushes it.
 pub fn respond(s: *Server, r: Response) SendError!void {
-    try s.startResponse();
-    errdefer s.writeFailed();
     var out = r;
     // A HEAD gets the headers and none of the body.
     if (s.head_only) out.head_only = true;
-    try out.write(s.writer, .{ .keep_alive = s.keep_alive, .date = s.dateValue() });
+    const options: Response.WriteOptions = .{ .date = s.dateValue() };
+    // Reject it before we mark the request answered, so the caller can
+    // still send something else.
+    try out.check(options);
+
+    try s.startResponse();
+    errdefer s.writeFailed();
+    // Read after `startResponse`, which is where a standalone response
+    // decides the connection is over.
+    try out.write(s.writer, s.keep_alive, options);
     try s.writer.flush();
     if (!r.keep_alive) s.keep_alive = false;
     // Nothing comes after this, so the connection is done, not just
@@ -315,19 +322,22 @@ pub fn respondStreaming(
     out_buf: []u8,
     options: StreamOptions,
 ) SendError!ResponseWriter {
+    var head = r;
+    head.body = "";
+    const head_options: Response.WriteOptions = .{
+        .date = s.dateValue(),
+        .framing = if (options.content_length) |n| .{ .length = n } else .chunked,
+    };
+    // Same as `respond`: reject it before the request counts as
+    // answered.
+    try head.check(head_options);
+
     try s.startResponse();
     // There is no `ResponseWriter` yet, so nothing else would settle the
     // connection if the head doesn't go out.
     errdefer s.writeFailed();
 
-    var head = r;
-    head.body = "";
-
-    try head.writeHead(s.writer, .{
-        .keep_alive = s.keep_alive,
-        .date = s.dateValue(),
-        .framing = if (options.content_length) |n| .{ .length = n } else .chunked,
-    });
+    try head.writeHead(s.writer, s.keep_alive, head_options);
     if (!r.keep_alive) s.keep_alive = false;
     // The head goes out now, not when the body ends. Otherwise a peer
     // waiting on the status line waits for a body that is waiting on
@@ -389,13 +399,19 @@ pub fn alive(s: *const Server) bool {
 /// since clients often send their first frame without waiting for the
 /// 101.
 pub fn upgrade(s: *Server, response: Response) SendError!void {
+    var r = response;
+    r.keep_alive = true;
+    const options: Response.WriteOptions = .{};
+    // Before the handover and before the request counts as answered, so
+    // a rejected 101 still lets the caller answer some other way.
+    try r.check(options);
+
     try s.startResponse();
     errdefer s.writeFailed();
     s.window.handOver();
 
-    var r = response;
-    r.keep_alive = true;
-    try r.write(s.writer, .{ .keep_alive = true });
+    // The connection carries on under another protocol.
+    try r.write(s.writer, true, options);
     try s.writer.flush();
 
     s.phase = .handed_over;
@@ -1721,6 +1737,189 @@ test "a chunked body streamed in small bites" {
             _ = n;
         }
         try testing.expectEqualStrings("hello world", sink.buffered());
+    }
+}
+
+test "a response cannot be framed two ways at once" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    try testing.expectError(error.AmbiguousFraming, s.respond(.{
+        .headers = &.{
+            .{ .name = "Content-Length", .value = "5" },
+            .{ .name = "Transfer-Encoding", .value = "chunked" },
+        },
+        .body = "hello",
+    }));
+    try testing.expectEqualStrings("", h.written());
+}
+
+test "a response length that is not the body's is refused" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    // `Content-Length: 0` with a body puts the body exactly where the
+    // peer looks for the next response.
+    try testing.expectError(error.AmbiguousFraming, s.respond(.{
+        .headers = &.{.{ .name = "Content-Length", .value = "0" }},
+        .body = "hello",
+    }));
+    try testing.expectEqualStrings("", h.written());
+}
+
+test "a caller's own length may agree with the body" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    try s.respond(.{
+        .headers = &.{.{ .name = "Content-Length", .value = "5" }},
+        .body = "hello",
+    });
+    try testing.expect(std.mem.endsWith(u8, h.written(), "\r\n\r\nhello"));
+}
+
+test "a streamed response cannot contradict its own head" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    // A caller-supplied length with a chunked writer. The peer would
+    // read 5 bytes of chunk header as the whole body.
+    var scratch: [64]u8 = undefined;
+    try testing.expectError(error.AmbiguousFraming, s.respondStreaming(.{
+        .headers = &.{.{ .name = "Content-Length", .value = "5" }},
+    }, &scratch, .{}));
+
+    // Rejected before any byte went out and before the request counts as
+    // answered, so the handler can still answer properly.
+    try testing.expectEqualStrings("", h.written());
+    try s.respond(.text(.internal_server_error, "sorry"));
+    try testing.expect(std.mem.endsWith(u8, h.written(), "sorry"));
+}
+
+test "a HEAD may describe a body it does not write" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "HEAD / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    // The length describes the body a GET would have got, and no body
+    // comes after it, so there is nothing to disagree with.
+    try s.respond(.{
+        .headers = &.{.{ .name = "Content-Length", .value = "12" }},
+        .body = "",
+    });
+    try testing.expect(std.mem.indexOf(u8, h.written(), "Content-Length: 12") != null);
+}
+
+test "an encoding this library cannot read is not written either" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    // The read side calls this head UnsupportedEncoding, and dropping
+    // the Content-Length would leave the body unframed.
+    try testing.expectError(error.AmbiguousFraming, s.respond(.{
+        .headers = &.{.{ .name = "Transfer-Encoding", .value = "gzip" }},
+        .body = "hello",
+    }));
+    try testing.expectEqualStrings("", h.written());
+}
+
+test "chunked framing the caller wrote has to be chunked" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    try testing.expectError(error.AmbiguousFraming, s.respond(.{
+        .headers = &.{.{ .name = "Transfer-Encoding", .value = "chunked" }},
+        .body = "hello",
+    }));
+
+    try s.respond(.{
+        .headers = &.{.{ .name = "Transfer-Encoding", .value = "chunked" }},
+        .body = "5\r\nhello\r\n0\r\n\r\n",
+    });
+    try testing.expect(std.mem.endsWith(u8, h.written(), "5\r\nhello\r\n0\r\n\r\n"));
+    try testing.expect(std.mem.indexOf(u8, h.written(), "Content-Length") == null);
+}
+
+test "a response refused before it is written leaves the request answerable" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    try testing.expectError(error.InvalidHeader, s.respond(.{
+        .headers = &.{.{ .name = "X", .value = "a\r\nY: 2" }},
+    }));
+    try testing.expectEqualStrings("", h.written());
+    try testing.expect(s.alive());
+
+    try s.respond(.text(.ok, "second thoughts"));
+    try testing.expect(std.mem.endsWith(u8, h.written(), "second thoughts"));
+}
+
+test "a streamed body cannot go out under an encoding that is not chunked" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    // The writer chunks the body whatever the head says, so the head has
+    // to say chunked.
+    var scratch: [64]u8 = undefined;
+    try testing.expectError(error.AmbiguousFraming, s.respondStreaming(.{
+        .headers = &.{.{ .name = "Transfer-Encoding", .value = "gzip" }},
+    }, &scratch, .{}));
+    try testing.expectEqualStrings("", h.written());
+
+    // Saying it twice is agreement, and it goes out once because
+    // `writeHead` leaves the caller's header alone.
+    var rw = try s.respondStreaming(.{
+        .headers = &.{.{ .name = "Transfer-Encoding", .value = "chunked" }},
+    }, &scratch, .{});
+    try rw.interface.writeAll("hi");
+    try rw.end();
+    try testing.expect(std.mem.endsWith(u8, h.written(), "2\r\nhi\r\n0\r\n\r\n"));
+}
+
+test "a 101 refused before the handover leaves the request answerable" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    try testing.expectError(error.InvalidHeader, s.upgrade(.{
+        .status = .switching_protocols,
+        .headers = &.{.{ .name = "X", .value = "a\r\nY: 2" }},
+    }));
+    try testing.expectEqualStrings("", h.written());
+    try testing.expect(!s.handedOver());
+
+    try s.respond(.text(.bad_request, "no"));
+    try testing.expect(std.mem.endsWith(u8, h.written(), "no"));
+}
+
+test "a response with no request in hand says the connection is over" {
+    for ([_]bool{ false, true }) |streamed| {
+        var h: Harness = undefined;
+        // Nothing received. This is the accept loop answering 503 before
+        // it reads anything.
+        var s = h.init(.whole, "");
+
+        if (streamed) {
+            var scratch: [64]u8 = undefined;
+            var rw = try s.respondStreaming(.{ .status = .service_unavailable }, &scratch, .{});
+            try rw.interface.writeAll("busy");
+            try rw.end();
+        } else {
+            try s.respond(.text(.service_unavailable, "busy"));
+        }
+
+        // Nothing left to keep the connection for, and the head has to
+        // say so instead of leaving the peer waiting.
+        try testing.expect(!s.alive());
+        try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") != null);
     }
 }
 

@@ -6,6 +6,7 @@ const Io = std.Io;
 
 const scan = @import("scan.zig");
 const field = @import("field.zig");
+const body_mod = @import("body.zig");
 
 const Response = @This();
 
@@ -20,9 +21,11 @@ head_only: bool = false,
 /// The Scanner's one. The same `Header` for both directions.
 pub const Header = field.Header;
 
+/// Everything we can decide about a response before writing starts.
+/// Whether the connection survives is not in here, because that gets
+/// decided while the response goes out. It is an argument instead of
+/// something we capture early.
 pub const WriteOptions = struct {
-    /// Decided by the caller from the request.
-    keep_alive: bool,
     /// Written as a Date header unless the caller already gave us one.
     date: ?[]const u8 = null,
     /// How the body is framed. `from_body` describes the `body` field,
@@ -41,25 +44,75 @@ pub const WriteError = Io.Writer.Error || error{
     /// A bad header name, or CR, LF or NUL in a value. Writing one lets
     /// the caller tack on extra headers, or a whole second response.
     InvalidHeader,
+    /// The caller's framing headers say something we would refuse to
+    /// read: both `Content-Length` and `Transfer-Encoding`, two lengths
+    /// that disagree, or a length that isn't the body's.
+    AmbiguousFraming,
 };
 
-pub fn write(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void {
-    try r.writeHead(w, options);
+pub fn write(r: Response, w: *Io.Writer, keep_alive: bool, options: WriteOptions) WriteError!void {
+    try r.writeHead(w, keep_alive, options);
     if (!r.head_only and r.status.mayHaveBody()) try w.writeAll(r.body);
 }
 
-/// Status line and headers, up to the blank line.
-///
-/// Every header is checked before any byte is written. A head that is
-/// refused leaves the writer untouched, because a partial head becomes the
-/// prefix of whatever the caller sends next, and that is a response split.
-pub fn writeHead(r: Response, w: *Io.Writer, options: WriteOptions) WriteError!void {
+/// Everything that can be rejected about a response, decided without
+/// writing a byte. `writeHead` calls this first, and `Server` calls it
+/// itself before it marks a request answered.
+pub fn check(r: Response, options: WriteOptions) WriteError!void {
     field.check(r.headers, .header) catch return error.InvalidHeader;
     if (options.date) |d| {
         if (!scan.validFieldValue(d)) return error.InvalidHeader;
     }
 
-    const alive = options.keep_alive and r.keep_alive;
+    // The caller's own framing has to agree with the body coming after
+    // it, otherwise we write a message our own Scanner would reject.
+    const announced = field.announced(r.headers) catch return error.AmbiguousFraming;
+    const writes_body = !r.head_only and r.status.mayHaveBody();
+    switch (options.framing) {
+        .from_body => {
+            if (announced.length) |n| {
+                if (writes_body and n != r.body.len) return error.AmbiguousFraming;
+            }
+            if (announced.encoding) |te| {
+                // Either an encoding the read side calls
+                // UnsupportedEncoding, or a `chunked` whose body isn't.
+                // Either way the peer can't find the end.
+                if (!body_mod.endsWithChunked(te)) return error.AmbiguousFraming;
+                // The caller chunked this themselves, so the framing is
+                // theirs, but a body with no terminator never ends and
+                // the peer waits forever. Trailers go through
+                // `respondStreaming` and `endWithTrailers` instead.
+                if (writes_body and !std.mem.endsWith(u8, r.body, "0\r\n\r\n"))
+                    return error.AmbiguousFraming;
+            }
+        },
+        .length => |n| {
+            if (announced.encoding != null) return error.AmbiguousFraming;
+            if (announced.length) |mine| {
+                if (mine != n) return error.AmbiguousFraming;
+            }
+        },
+        .chunked => {
+            if (announced.length != null) return error.AmbiguousFraming;
+            // We chunk the body whatever the header says, so the header
+            // has to say chunked.
+            if (announced.encoding) |te| {
+                if (!body_mod.endsWithChunked(te)) return error.AmbiguousFraming;
+            }
+        },
+    }
+}
+
+/// Status line and headers, up to the blank line.
+///
+/// Everything that can be rejected is decided before a byte is written.
+/// A rejected head leaves the writer untouched, because half a head on
+/// the wire becomes the start of whatever goes out next, and then you
+/// have split one response into two.
+pub fn writeHead(r: Response, w: *Io.Writer, keep_alive: bool, options: WriteOptions) WriteError!void {
+    try r.check(options);
+
+    const alive = keep_alive and r.keep_alive;
 
     try w.writeAll("HTTP/1.1 ");
     try w.print("{d} ", .{@intFromEnum(r.status)});
@@ -254,7 +307,7 @@ const testing = std.testing;
 
 fn render(r: Response, keep_alive: bool, buf: []u8) ![]u8 {
     var w: Io.Writer = .fixed(buf);
-    try r.write(&w, .{ .keep_alive = keep_alive });
+    try r.write(&w, keep_alive, .{});
     return w.buffered();
 }
 
@@ -365,7 +418,7 @@ test "a refused header leaves the writer untouched" {
         .{ .name = "X-Bad", .value = "a\r\nInjected: yes" },
     }, .body = "hi" };
 
-    try testing.expectError(error.InvalidHeader, r.write(&w, .{ .keep_alive = true }));
+    try testing.expectError(error.InvalidHeader, r.write(&w, true, .{}));
     // Half a head left in the writer becomes the start of whatever goes
     // out next.
     try testing.expectEqual(@as(usize, 0), w.buffered().len);

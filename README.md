@@ -252,6 +252,20 @@ Framing is where request smuggling lives, so:
 
 Repeated spaces in a request line and folded headers are rejected too.
 
+The same list applies to what this library *writes*. A response or
+request that carries both framing headers, or two lengths that disagree,
+or a `Content-Length` that is not the length of the body being written,
+is `error.AmbiguousFraming` and never reaches the wire. Writing a message
+that martensite itself would refuse to read is how a body gets smuggled
+past whichever end is less careful. The check costs nothing: it happens
+before the first byte goes out and before the request counts as answered,
+so the handler can still send something else.
+
+Writing `Transfer-Encoding: chunked` yourself and passing already chunked
+bytes as the body still works. They have to end with `0\r\n\r\n`, and
+trailers after the last chunk go through `respondStreaming` and
+`endWithTrailers` rather than in the body.
+
 ## Not here
 
 TLS, HTTP/2, a router, connection pooling.
