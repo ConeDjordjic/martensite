@@ -1359,7 +1359,7 @@ test "a chunked body that exactly fits is not too large" {
     }
 }
 
-test "a sink that fills mid-body ends the connection" {
+test "a body left unfinished ends the connection, whatever stopped it" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var s = h.initDraining(
@@ -1375,6 +1375,13 @@ test "a sink that fills mid-body ends the connection" {
         var b = try s.bodyReader(&scratch);
 
         try testing.expectError(error.WriteFailed, b.interface.streamRemaining(&sink));
+
+        // Not because the sink failing broke anything — it did not,
+        // and `b.failure()` is null — but because the body was handed
+        // out and never read to its end, so nothing here can say where
+        // it stopped. The bytes after it are shaped like a request and
+        // must never be read as one.
+        try testing.expectEqual(@as(?BodyError, null), b.failure());
         try testing.expect(!s.alive());
 
         try s.respond(.{ .status = .forError(error.BodyTooLarge), .keep_alive = false });
@@ -1382,26 +1389,37 @@ test "a sink that fills mid-body ends the connection" {
     }
 }
 
-test "a chunked body needs somewhere to be decoded" {
-    var h: Harness = undefined;
-    var s = h.init(.whole, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n");
-    _ = (try s.receive()).?;
+test "every body reader needs somewhere to buffer" {
+    // This is not only about chunked. The reader buffers into it
+    // whatever the framing is, and an unbuffered `Io.Reader` panics
+    // inside std on the first take.
+    for ([_][]const u8{
+        "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello",
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\n\r\n",
+    }) |input| {
+        var h: Harness = undefined;
+        var s = h.init(.whole, input);
+        _ = (try s.receive()).?;
 
-    // No room to decode into is not "unbuffered", it is no progress
-    // ever. A counted body is fine with none.
-    try testing.expectError(error.NoDecodeBuffer, s.bodyReader(&.{}));
+        var one: [1]u8 = undefined;
+        try testing.expectError(error.NoDecodeBuffer, s.bodyReader(&.{}));
+        try testing.expectError(error.NoDecodeBuffer, s.bodyReader(&one));
+    }
 }
 
-test "a counted body needs no decode buffer" {
+test "a counted body takes what it is given as buffer" {
     var h: Harness = undefined;
     var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
     _ = (try s.receive()).?;
 
-    var b = try s.bodyReader(&.{});
+    var tiny: [2]u8 = undefined;
+    var b = try s.bodyReader(&tiny);
+    try testing.expectEqual(@as(u8, 'h'), try b.interface.takeByte());
     var out: [8]u8 = undefined;
     var sink: Io.Writer = .fixed(&out);
     _ = try b.interface.streamRemaining(&sink);
-    try testing.expectEqualStrings("hello", sink.buffered());
+    try testing.expectEqualStrings("ello", sink.buffered());
 }
 
 test "an upgrade the writer cannot hold ends the connection" {
@@ -1466,9 +1484,9 @@ test "a body too large for the buffer may be asked for again" {
     try testing.expectEqualStrings("hello", try s.readBody(&big));
 }
 
-test "a sink that gave out is not blamed on the peer" {
+test "a sink too small does not break the reader" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nAAAAAAAA\r\n0\r\n\r\n");
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcdefgh\r\n0\r\n\r\n");
     _ = (try s.receive()).?;
 
     var small: [2]u8 = undefined;
@@ -1476,7 +1494,139 @@ test "a sink that gave out is not blamed on the peer" {
     var scratch: [8]u8 = undefined;
     var b = try s.bodyReader(&scratch);
     try testing.expectError(error.WriteFailed, b.interface.streamRemaining(&sink));
-    try testing.expectEqual(BodyError.SinkFailed, b.failure().?);
+
+    // The destination refused, so the reader is not broken: it stops
+    // where the destination stopped taking, and what it has already
+    // delivered is in the destination's own buffer.
+    try testing.expectEqual(@as(?BodyError, null), b.failure());
+    try testing.expectEqualStrings("ab", sink.buffered());
+
+    var out: [16]u8 = undefined;
+    var big: Io.Writer = .fixed(&out);
+    _ = try b.interface.streamRemaining(&big);
+    try testing.expectEqualStrings("bcdefgh", big.buffered());
+    try testing.expect(s.alive());
+}
+
+test "a sink that takes nothing leaves the body where it was" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nAAAAAAAA\r\n0\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var scratch: [16]u8 = undefined;
+    var b = try s.bodyReader(&scratch);
+
+    // A writer that rejects everything, which is how std probes for a
+    // delimiter. That call is supposed to leave no trace.
+    var refuses: Io.Writer = .fixed(&.{});
+    try testing.expectError(error.WriteFailed, b.interface.stream(&refuses, .unlimited));
+    try testing.expectEqual(@as(?BodyError, null), b.failure());
+
+    var out: [16]u8 = undefined;
+    var sink: Io.Writer = .fixed(&out);
+    _ = try b.interface.streamRemaining(&sink);
+    try testing.expectEqualStrings("AAAAAAAA", sink.buffered());
+    try testing.expect(s.alive());
+}
+
+test "looking for a delimiter that is not there leaves the body readable" {
+    var h: Harness = undefined;
+    var s = h.init(
+        .whole,
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nc\r\nline one two\r\n0\r\n\r\n",
+    );
+    _ = (try s.receive()).?;
+
+    var scratch: [16]u8 = undefined;
+    var b = try s.bodyReader(&scratch);
+    // No newline and no room to keep looking. std says StreamTooLong and
+    // promises nothing was consumed.
+    try testing.expectError(error.StreamTooLong, b.interface.takeDelimiterInclusive('\n'));
+
+    var out: [16]u8 = undefined;
+    var sink: Io.Writer = .fixed(&out);
+    _ = try b.interface.streamRemaining(&sink);
+    try testing.expectEqualStrings("line one two", sink.buffered());
+}
+
+test "a body read partway cannot be drained past" {
+    var h: Harness = undefined;
+    // A 0x20-byte chunk whose contents look like the end of a body
+    // followed by another request.
+    var s = h.initDraining(.whole, "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "20\r\nAAAA0\r\n\r\nGET /evil HTTP/1.1\r\n\r\nA\r\n0\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var out: [64]u8 = undefined;
+    var sink: Io.Writer = .fixed(&out);
+    var scratch: [4]u8 = undefined;
+    var b = try s.bodyReader(&scratch);
+    // The caller reads a few bytes and stops, the way a handler deciding
+    // whether to carry on would.
+    _ = try b.interface.stream(&sink, .unlimited);
+
+    try s.respond(.{});
+    // Nobody can say where that body ends. The reader is in the middle
+    // of a chunk and the decoder belongs to `b`.
+    try testing.expect(!s.alive());
+    try testing.expectEqual(@as(?Request, null), try s.receive());
+}
+
+test "a counted body read partway is not discarded by its old length" {
+    var h: Harness = undefined;
+    var s = h.initDraining(
+        .whole,
+        "POST /a HTTP/1.1\r\nContent-Length: 10\r\n\r\n0123456789GET /b HTTP/1.1\r\n\r\n",
+    );
+    _ = (try s.receive()).?;
+
+    var out: [4]u8 = undefined;
+    var sink: Io.Writer = .fixed(&out);
+    var decode: [16]u8 = undefined;
+    var b = try s.bodyReader(&decode);
+    _ = try b.interface.stream(&sink, .limited(4));
+
+    try s.respond(.{});
+    // Discarding all ten would eat 6 bytes of body and 4 bytes of the
+    // next request.
+    try testing.expect(!s.alive());
+    try testing.expectEqual(@as(?Request, null), try s.receive());
+}
+
+test "a body read to its end still leaves the connection usable" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var out: [8]u8 = undefined;
+    var sink: Io.Writer = .fixed(&out);
+    var decode: [16]u8 = undefined;
+    var b = try s.bodyReader(&decode);
+    _ = try b.interface.streamRemaining(&sink);
+    try testing.expectEqualStrings("hello", sink.buffered());
+
+    try s.respond(.{});
+    try testing.expect(s.alive());
+    const second = (try s.receive()).?;
+    try testing.expectEqualStrings("/b", second.target());
+}
+
+test "the body reader is a reader, buffered calls and all" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nc\r\nline\none\ntwo\r\n0\r\n\r\n");
+        _ = (try s.receive()).?;
+
+        var scratch: [64]u8 = undefined;
+        var b = try s.bodyReader(&scratch);
+        try testing.expectEqual(@as(u8, 'l'), try b.interface.takeByte());
+        try testing.expectEqualStrings("ine\n", try b.interface.takeDelimiterInclusive('\n'));
+
+        var rest: [16]u8 = undefined;
+        var sink: Io.Writer = .fixed(&rest);
+        _ = try b.interface.streamRemaining(&sink);
+        try testing.expectEqualStrings("one\ntwo", sink.buffered());
+    }
 }
 
 test "no trailers is an empty slice" {

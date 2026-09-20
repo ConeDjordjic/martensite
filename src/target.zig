@@ -47,14 +47,18 @@ pub fn parse(raw: []const u8) ?Target {
         const scheme = raw[0..sep];
         if (scheme.len == 0) return null;
         const rest = raw[sep + 3 ..];
-        const slash = std.mem.indexOfScalar(u8, rest, '/');
-        const authority = if (slash) |i| rest[0..i] else rest;
+        // The authority ends at the path or the query, whichever comes
+        // first. `http://host?q=1` is a normal thing to send to a proxy,
+        // and stopping only at `/` put the query into the host.
+        const end = std.mem.indexOfAny(u8, rest, "/?");
+        const authority = if (end) |i| rest[0..i] else rest;
         if (authority.len == 0) return null;
-        const after = if (slash) |i| rest[i..] else "/";
+        const after = if (end) |i| rest[i..] else "/";
         const cut = std.mem.indexOfScalar(u8, after, '?');
         return .{
             .form = .absolute,
-            .path = if (cut) |i| after[0..i] else after,
+            // If only a query is left, the path is `/`.
+            .path = if (cut) |i| (if (i == 0) "/" else after[0..i]) else after,
             .query = if (cut) |i| after[i + 1 ..] else "",
             .authority = authority,
             .scheme = scheme,
@@ -169,6 +173,15 @@ test "absolute form" {
     try testing.expectEqualStrings("example.com", t.authority);
     try testing.expectEqualStrings("/where", t.path);
     try testing.expectEqualStrings("q=now", t.query);
+}
+
+test "absolute form with a query and no path" {
+    // What a proxy gets. The authority ends before the query.
+    const t = parse("http://example.com?q=1").?;
+    try testing.expectEqual(Form.absolute, t.form);
+    try testing.expectEqualStrings("example.com", t.authority);
+    try testing.expectEqualStrings("/", t.path);
+    try testing.expectEqualStrings("q=1", t.query);
 }
 
 test "absolute form with no path" {

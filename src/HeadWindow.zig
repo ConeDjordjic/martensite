@@ -97,6 +97,10 @@ pub fn trailers(w: *const HeadWindow, storage: []scan.Header) scan.Error![]const
 /// body changes the answer.
 pub fn usable(w: *const HeadWindow) bool {
     if (w.finished) return false;
+    // Handed out and not finished. The caller has the count and the
+    // decoder, so we can't find the end any more. A finished body clears
+    // `pending`.
+    if (w.claimed and w.pending != .none) return false;
     return w.pending == .none or w.max_drain != 0;
 }
 
@@ -207,6 +211,11 @@ fn take(w: *HeadWindow, comptime kind: Kind, sent_method: ?scan.Method) TakeErro
 const Step = struct {
     /// Source bytes looked at, consumed or not.
     looked: usize,
+    /// Source bytes consumed. The caller tosses them, because when to
+    /// do that is the one thing the three paths disagree about. A
+    /// destination that can reject the bytes has to be able to leave the
+    /// body where it was.
+    used: usize,
     /// The decoded bytes, at the front of `dest`.
     decoded: usize,
     outcome: enum {
@@ -225,21 +234,21 @@ const Step = struct {
 fn decodeStep(w: *HeadWindow, d: *chunked.Decoder, dest: []u8) Step {
     const buffered = w.reader.buffered();
     const want = @min(buffered.len, dest.len);
-    if (want == 0) return .{ .looked = 0, .decoded = 0, .outcome = .need_fill };
+    if (want == 0) return .{ .looked = 0, .used = 0, .decoded = 0, .outcome = .need_fill };
 
     @memcpy(dest[0..want], buffered[0..want]);
     const r = d.decode(dest[0..want]) catch
-        return .{ .looked = want, .decoded = 0, .outcome = .bad };
+        return .{ .looked = want, .used = 0, .decoded = 0, .outcome = .bad };
 
     const used = want - r.leftover;
-    w.reader.toss(used);
     if (r.done) {
         w.trailers_raw = r.trailers;
         w.trailers_truncated = d.trailers_truncated;
-        return .{ .looked = want, .decoded = r.decoded, .outcome = .done };
+        return .{ .looked = want, .used = used, .decoded = r.decoded, .outcome = .done };
     }
     return .{
         .looked = want,
+        .used = used,
         .decoded = r.decoded,
         .outcome = if (used == 0) .need_fill else .more,
     };
@@ -255,6 +264,15 @@ fn decodeStep(w: *HeadWindow, d: *chunked.Decoder, dest: []u8) Step {
 /// ended is not.
 fn drainPending(w: *HeadWindow) void {
     if (w.pending == .none) return;
+    // Handed out and not finished. `pending` still describes the whole
+    // body but the reader has moved on, so draining it would eat the
+    // peer's next message. With chunked it would start a fresh decoder
+    // in the middle of a chunk, where an attacker gets to pick the next
+    // "request line".
+    if (w.claimed) {
+        w.stop();
+        return;
+    }
     if (w.max_drain == 0) {
         w.stop();
         return;
@@ -284,6 +302,7 @@ fn drainPending(w: *HeadWindow) void {
             var read: u64 = 0;
             while (true) {
                 const st = w.decodeStep(&d, &stage);
+                w.reader.toss(st.used);
                 read += st.looked;
                 if (st.outcome == .bad or read > w.max_drain) {
                     w.stop();
@@ -311,10 +330,6 @@ pub const BodyError = error{
     Incomplete,
     /// The chunked encoding is malformed.
     BadChunk,
-    /// The destination failed partway through and there is no way to
-    /// find out how much it kept. Reading again wouldn't help, since we
-    /// can't hand it the same bytes twice.
-    SinkFailed,
     /// The body doesn't fit in the buffer it was given. Only `readBody`
     /// returns this.
     BodyTooLarge,
@@ -384,6 +399,7 @@ pub fn readBody(w: *HeadWindow, buf: []u8) BodyError![]u8 {
             while (true) {
                 const full = out == buf.len;
                 const st = w.decodeStep(&d, if (full) &tail else buf[out..]);
+                w.reader.toss(st.used);
                 if (full and st.decoded != 0) {
                     // Doesn't fit, and this is not a short read. This
                     // goes through `giveUp`, unlike the counted case
@@ -441,6 +457,10 @@ pub const BodyReader = struct {
     fn stream(io_r: *Io.Reader, out: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
         const b: *BodyReader = @alignCast(@fieldParentPtr("interface", io_r));
         const w = b.window;
+        // A reader that failed is not a reader that finished.
+        // `EndOfStream` here would let a truncated body read like a
+        // complete one.
+        if (b.err != null) return error.ReadFailed;
         if (b.finished) return error.EndOfStream;
 
         while (true) {
@@ -467,24 +487,40 @@ pub const BodyReader = struct {
                 },
                 .chunked => {
                     const room = @min(limit.minInt(buffered.len), b.scratch.len);
+                    // Everything a step touches, saved so that a
+                    // destination which rejects the bytes gets back
+                    // exactly what it started with. std probes for a
+                    // delimiter with a writer that always rejects, and
+                    // expects that call to leave no trace.
+                    const undo: struct {
+                        decoder: chunked.Decoder,
+                        trailers_raw: []const u8,
+                        trailers_truncated: bool,
+                    } = .{
+                        .decoder = b.decoder,
+                        .trailers_raw = w.trailers_raw,
+                        .trailers_truncated = w.trailers_truncated,
+                    };
+
                     const st = w.decodeStep(&b.decoder, b.scratch[0..room]);
                     if (st.outcome == .bad) {
                         b.fail(error.BadChunk);
                         return error.ReadFailed;
                     }
+                    if (st.decoded != 0) out.writeAll(b.scratch[0..st.decoded]) catch |err| {
+                        // Nothing is consumed when the destination will
+                        // not take the bytes, the way every `Io.Reader`
+                        // behaves: whatever the destination buffered
+                        // before it failed is its own to report, and
+                        // the body is still here to be read again.
+                        b.decoder = undo.decoder;
+                        w.trailers_raw = undo.trailers_raw;
+                        w.trailers_truncated = undo.trailers_truncated;
+                        return err;
+                    };
+                    w.reader.toss(st.used);
                     if (st.outcome == .done) b.complete();
-                    if (st.decoded != 0) {
-                        // The source bytes are already tossed and the
-                        // decoder's state is mid-body, so a destination
-                        // that gives out here takes the only account of
-                        // where the body ends with it. Nobody may read
-                        // from this connection again.
-                        out.writeAll(b.scratch[0..st.decoded]) catch |err| {
-                            b.fail(error.SinkFailed);
-                            return err;
-                        };
-                        return st.decoded;
-                    }
+                    if (st.decoded != 0) return st.decoded;
                     if (b.finished) return error.EndOfStream;
                     if (st.outcome == .need_fill) break;
                     continue;
@@ -545,22 +581,25 @@ pub const BodyReaderError = error{
 /// two is the minimum.
 pub fn bodyReader(w: *HeadWindow, decode_buf: []u8) BodyReaderError!BodyReader {
     if (w.claimed or w.finished) return error.BodyTaken;
-    // Chunked bytes are decoded in it, so there is no making progress
-    // without one. A counted body never touches it.
-    if (w.pending == .chunked and decode_buf.len == 0) return error.NoDecodeBuffer;
+    // Same rule whatever the framing. The reader buffers into it, so it
+    // can't be empty, and chunked needs a second half to decode into.
+    if (decode_buf.len < 2) return error.NoDecodeBuffer;
     if (w.pending != .none) {
         w.claimed = true;
         w.releaseHead();
     }
+    // Split, so this is a whole `Io.Reader` and not just the streaming
+    // half. `takeByte` and the rest fill through the buffer.
+    const split = if (w.pending == .chunked) decode_buf.len / 2 else decode_buf.len;
     return .{
         .window = w,
         .interface = .{
             .vtable = &.{ .stream = BodyReader.stream },
-            .buffer = &.{},
+            .buffer = decode_buf[0..split],
             .seek = 0,
             .end = 0,
         },
-        .scratch = decode_buf,
+        .scratch = decode_buf[split..],
         .left = switch (w.pending) {
             .length => |n| n,
             else => 0,

@@ -105,8 +105,16 @@ var b = try http.bodyReader(&decode_buf);
 _ = try b.interface.streamRemaining(&file_writer.interface);
 ```
 
-`decode_buf` is where chunked bytes are decoded on their way out; a few
-hundred bytes is plenty, and a counted body never touches it.
+`decode_buf` is the reader's own scratch space. It buffers into it, and a
+chunked body is decoded there on the way out. A few hundred bytes is
+enough no matter what the framing is. Less than two bytes gives you
+`error.NoDecodeBuffer`, since a reader with no room to buffer can't
+implement `takeByte`.
+
+A body is read once and one way. A second `readBody` or `bodyReader` for
+the same message is `error.BodyTaken`. If you hand a body to a
+`bodyReader` and don't read it to the end, the connection ends, because
+after that there is no way to know where the next message starts.
 
 Responses work the same way. You get chunked encoding when you don't give
 a length:
