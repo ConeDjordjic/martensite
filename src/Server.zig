@@ -1376,12 +1376,10 @@ test "a body left unfinished ends the connection, whatever stopped it" {
 
         try testing.expectError(error.WriteFailed, b.interface.streamRemaining(&sink));
 
-        // Not because the sink failing broke anything — it did not,
-        // and `b.failure()` is null — but because the body was handed
-        // out and never read to its end, so nothing here can say where
-        // it stopped. The bytes after it are shaped like a request and
-        // must never be read as one.
-        try testing.expectEqual(@as(?BodyError, null), b.failure());
+        // The sink kept part of it and then failed, so the body is
+        // broken and the request-shaped bytes behind it must not be
+        // read.
+        try testing.expectEqual(BodyError.SinkFailed, b.failure().?);
         try testing.expect(!s.alive());
 
         try s.respond(.{ .status = .forError(error.BodyTooLarge), .keep_alive = false });
@@ -1484,7 +1482,7 @@ test "a body too large for the buffer may be asked for again" {
     try testing.expectEqualStrings("hello", try s.readBody(&big));
 }
 
-test "a sink too small does not break the reader" {
+test "a sink that kept some of it and then gave out breaks the body" {
     var h: Harness = undefined;
     var s = h.init(.whole, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcdefgh\r\n0\r\n\r\n");
     _ = (try s.receive()).?;
@@ -1495,17 +1493,88 @@ test "a sink too small does not break the reader" {
     var b = try s.bodyReader(&scratch);
     try testing.expectError(error.WriteFailed, b.interface.streamRemaining(&sink));
 
-    // The destination refused, so the reader is not broken: it stops
-    // where the destination stopped taking, and what it has already
-    // delivered is in the destination's own buffer.
-    try testing.expectEqual(@as(?BodyError, null), b.failure());
+    // It kept "ab" and won't tell us, so the rest can't go anywhere
+    // without sending those bytes twice.
     try testing.expectEqualStrings("ab", sink.buffered());
+    try testing.expectEqual(BodyError.SinkFailed, b.failure().?);
+    try testing.expect(!s.alive());
+}
+
+test "a counted body into a sink that gave out partway" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 8\r\n\r\nabcdefgh");
+    _ = (try s.receive()).?;
+
+    var small: [2]u8 = undefined;
+    var sink: Io.Writer = .fixed(&small);
+    var scratch: [8]u8 = undefined;
+    var b = try s.bodyReader(&scratch);
+    try testing.expectError(error.WriteFailed, b.interface.streamRemaining(&sink));
+
+    try testing.expectEqual(BodyError.SinkFailed, b.failure().?);
+    try testing.expect(!s.alive());
+}
+
+/// An unbuffered destination that takes half of what it is offered and
+/// then fails, like a socket that short-writes and then resets.
+const HalfThenBroken = struct {
+    interface: Io.Writer,
+    kept: usize = 0,
+    calls: usize = 0,
+
+    fn init(p: *HalfThenBroken) void {
+        p.* = .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} } };
+    }
+
+    fn drain(io_w: *Io.Writer, data: []const []const u8, _: usize) Io.Writer.Error!usize {
+        const p: *HalfThenBroken = @alignCast(@fieldParentPtr("interface", io_w));
+        p.calls += 1;
+        if (p.calls > 1) return error.WriteFailed;
+        p.kept = data[0].len / 2;
+        return p.kept;
+    }
+};
+
+test "a sink with no buffer can still have kept a prefix" {
+    for ([_][]const u8{
+        "POST / HTTP/1.1\r\nContent-Length: 8\r\n\r\nabcdefgh",
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcdefgh\r\n0\r\n\r\n",
+    }) |input| {
+        var h: Harness = undefined;
+        var s = h.init(.whole, input);
+        _ = (try s.receive()).?;
+
+        var p: HalfThenBroken = undefined;
+        p.init();
+        var scratch: [16]u8 = undefined;
+        var b = try s.bodyReader(&scratch);
+
+        try testing.expectError(error.WriteFailed, b.interface.streamRemaining(&p.interface));
+
+        // No buffer, but it took bytes on the write before the one that
+        // failed. Those can't be sent twice.
+        try testing.expect(p.kept != 0);
+        try testing.expectEqual(BodyError.SinkFailed, b.failure().?);
+        try testing.expect(!s.alive());
+    }
+}
+
+test "a counted body into a sink that takes nothing" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 8\r\n\r\nabcdefgh");
+    _ = (try s.receive()).?;
+
+    var scratch: [8]u8 = undefined;
+    var b = try s.bodyReader(&scratch);
+
+    var refuses: Io.Writer = .fixed(&.{});
+    try testing.expectError(error.WriteFailed, b.interface.stream(&refuses, .unlimited));
+    try testing.expectEqual(@as(?BodyError, null), b.failure());
 
     var out: [16]u8 = undefined;
-    var big: Io.Writer = .fixed(&out);
-    _ = try b.interface.streamRemaining(&big);
-    try testing.expectEqualStrings("bcdefgh", big.buffered());
-    try testing.expect(s.alive());
+    var sink: Io.Writer = .fixed(&out);
+    _ = try b.interface.streamRemaining(&sink);
+    try testing.expectEqualStrings("abcdefgh", sink.buffered());
 }
 
 test "a sink that takes nothing leaves the body where it was" {
@@ -1626,6 +1695,32 @@ test "the body reader is a reader, buffered calls and all" {
         var sink: Io.Writer = .fixed(&rest);
         _ = try b.interface.streamRemaining(&sink);
         try testing.expectEqualStrings("one\ntwo", sink.buffered());
+    }
+}
+
+test "a chunked body streamed in small bites" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+        _ = (try s.receive()).?;
+
+        var scratch: [8]u8 = undefined;
+        var b = try s.bodyReader(&scratch);
+
+        // One byte per call still gets somewhere, because the decoder
+        // consumes source even when the destination takes almost
+        // nothing.
+        var out: [32]u8 = undefined;
+        var sink: Io.Writer = .fixed(&out);
+        while (true) {
+            const n = b.interface.stream(&sink, .limited(1)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            _ = n;
+        }
+        try testing.expectEqualStrings("hello world", sink.buffered());
     }
 }
 

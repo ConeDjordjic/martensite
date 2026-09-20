@@ -101,7 +101,15 @@ pub fn usable(w: *const HeadWindow) bool {
     // decoder, so we can't find the end any more. A finished body clears
     // `pending`.
     if (w.claimed and w.pending != .none) return false;
-    return w.pending == .none or w.max_drain != 0;
+    return switch (w.pending) {
+        .none => true,
+        // We know the length up front, and the Drain will reject one
+        // that is over budget, so don't promise something the next take
+        // can't deliver.
+        .length => |n| n <= w.max_drain,
+        // With chunked we don't know the length until we read it.
+        .chunked, .until_close => w.max_drain != 0,
+    };
 }
 
 pub const TakeError = error{
@@ -209,8 +217,6 @@ fn take(w: *HeadWindow, comptime kind: Kind, sent_method: ?scan.Method) TakeErro
 /// All three body paths go through here. The only difference between
 /// them is where the decoded bytes end up.
 const Step = struct {
-    /// Source bytes looked at, consumed or not.
-    looked: usize,
     /// Source bytes consumed. The caller tosses them, because when to
     /// do that is the one thing the three paths disagree about. A
     /// destination that can reject the bytes has to be able to leave the
@@ -234,20 +240,19 @@ const Step = struct {
 fn decodeStep(w: *HeadWindow, d: *chunked.Decoder, dest: []u8) Step {
     const buffered = w.reader.buffered();
     const want = @min(buffered.len, dest.len);
-    if (want == 0) return .{ .looked = 0, .used = 0, .decoded = 0, .outcome = .need_fill };
+    if (want == 0) return .{ .used = 0, .decoded = 0, .outcome = .need_fill };
 
     @memcpy(dest[0..want], buffered[0..want]);
     const r = d.decode(dest[0..want]) catch
-        return .{ .looked = want, .used = 0, .decoded = 0, .outcome = .bad };
+        return .{ .used = 0, .decoded = 0, .outcome = .bad };
 
     const used = want - r.leftover;
     if (r.done) {
         w.trailers_raw = r.trailers;
         w.trailers_truncated = d.trailers_truncated;
-        return .{ .looked = want, .used = used, .decoded = r.decoded, .outcome = .done };
+        return .{ .used = used, .decoded = r.decoded, .outcome = .done };
     }
     return .{
-        .looked = want,
         .used = used,
         .decoded = r.decoded,
         .outcome = if (used == 0) .need_fill else .more,
@@ -303,7 +308,9 @@ fn drainPending(w: *HeadWindow) void {
             while (true) {
                 const st = w.decodeStep(&d, &stage);
                 w.reader.toss(st.used);
-                read += st.looked;
+                // What the decoder took, not what it was shown. The
+                // last pass sees the next message as well.
+                read += st.used;
                 if (st.outcome == .bad or read > w.max_drain) {
                     w.stop();
                     return;
@@ -330,6 +337,10 @@ pub const BodyError = error{
     Incomplete,
     /// The chunked encoding is malformed.
     BadChunk,
+    /// The destination failed partway through and there is no way to
+    /// find out how much it kept. Reading again wouldn't help, since we
+    /// can't hand it the same bytes twice.
+    SinkFailed,
     /// The body doesn't fit in the buffer it was given. Only `readBody`
     /// returns this.
     BodyTooLarge,
@@ -474,10 +485,17 @@ pub const BodyReader = struct {
                         b.left;
                     const want = @min(@as(u64, limit.minInt(buffered.len)), room);
                     const n: usize = @intCast(want);
-                    // Tossed only once the destination has them, so a
-                    // write that gives out here leaves the reader where
-                    // it was and the count still true.
-                    try out.writeAll(buffered[0..n]);
+                    // Only tossed once the destination actually has
+                    // them, so a failed write leaves the reader where it
+                    // was.
+                    var sent: usize = 0;
+                    while (sent < n) sent += out.write(buffered[sent..n]) catch |err| {
+                        // `sent` is what it took across the writes
+                        // that worked. Anything above zero and the body
+                        // can't go anywhere else.
+                        if (sent != 0 or !refusedEverything(out)) b.fail(error.SinkFailed);
+                        return err;
+                    };
                     w.reader.toss(n);
                     if (w.pending != .until_close) {
                         b.left -= want;
@@ -507,12 +525,14 @@ pub const BodyReader = struct {
                         b.fail(error.BadChunk);
                         return error.ReadFailed;
                     }
-                    if (st.decoded != 0) out.writeAll(b.scratch[0..st.decoded]) catch |err| {
-                        // Nothing is consumed when the destination will
-                        // not take the bytes, the way every `Io.Reader`
-                        // behaves: whatever the destination buffered
-                        // before it failed is its own to report, and
-                        // the body is still here to be read again.
+                    var sent: usize = 0;
+                    while (sent < st.decoded) sent += out.write(b.scratch[sent..st.decoded]) catch |err| {
+                        if (sent != 0 or !refusedEverything(out)) {
+                            // It kept part of them, so carrying on
+                            // would hand it those bytes twice.
+                            b.fail(error.SinkFailed);
+                            return err;
+                        }
                         b.decoder = undo.decoder;
                         w.trailers_raw = undo.trailers_raw;
                         w.trailers_truncated = undo.trailers_truncated;
@@ -545,6 +565,23 @@ pub const BodyReader = struct {
             },
         };
         return 0;
+    }
+
+    /// Whether a destination that failed on its first write definitely
+    /// kept nothing. One with no buffer has nowhere to keep part of them:
+    /// it was handed the bytes and rejected them, which is what std's
+    /// delimiter probe does. One with a buffer might have copied some of
+    /// them in first.
+    ///
+    /// This is only true of the first write, which is why callers count
+    /// what they sent. A later failure tells you nothing about the writes
+    /// before it.
+    ///
+    /// After that it becomes an `Io.Writer` problem: a `drain` that keeps
+    /// bytes and reports `WriteFailed` can't say how many, and there is
+    /// no way for us to ask.
+    fn refusedEverything(out: *Io.Writer) bool {
+        return out.buffer.len == 0;
     }
 
     fn complete(b: *BodyReader) void {
@@ -722,6 +759,48 @@ test "trailers that did not fit are an error, not a short list" {
 
     var storage: [8]scan.Header = undefined;
     try testing.expectError(error.TooManyHeaders, w.trailers(&storage));
+}
+
+test "the drain's budget counts the body, not what follows it" {
+    for (shapes) |shape| {
+        // 15 bytes of chunked body, budget of 20. Whatever the reader
+        // happens to hold of the next request is not this body's to pay
+        // for.
+        var f: Fixture = undefined;
+        var w = f.init(shape, "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "5\r\nhello\r\n0\r\n\r\n" ++ "GET /b HTTP/1.1\r\nHost: x\r\n\r\n", 20);
+
+        _ = (try w.takeRequest()).?;
+        const second = (try w.takeRequest()).?;
+        try testing.expectEqualStrings("/b", second.head.target);
+    }
+}
+
+test "a counted body over the budget is refused before it is promised" {
+    for (shapes) |shape| {
+        var f: Fixture = undefined;
+        var w = f.init(shape, "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 600\r\n\r\n" ++
+            ("x" ** 600) ++ "GET /b HTTP/1.1\r\n\r\n", 100);
+        _ = (try w.takeRequest()).?;
+
+        // The Drain is going to reject this, and we say so before the
+        // caller acts on a yes.
+        try testing.expect(!w.usable());
+        try testing.expectEqual(@as(?Taken(.request), null), try w.takeRequest());
+    }
+}
+
+test "a counted body inside the budget is still promised" {
+    for (shapes) |shape| {
+        var f: Fixture = undefined;
+        var w = f.init(shape, "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n" ++
+            "helloGET /b HTTP/1.1\r\n\r\n", 100);
+        _ = (try w.takeRequest()).?;
+
+        try testing.expect(w.usable());
+        const second = (try w.takeRequest()).?;
+        try testing.expectEqualStrings("/b", second.head.target);
+    }
 }
 
 test "a head and its body" {
