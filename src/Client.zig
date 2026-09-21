@@ -50,6 +50,9 @@ pub const Phase = enum {
     /// The head is out and the body is still being written. Nothing
     /// moves until `RequestWriter.end`.
     sending,
+    /// The peer agreed to another protocol and we have the head that
+    /// says so. `handOver` finishes the job.
+    switching,
     /// A request is on the wire and there is no response yet. Sending
     /// another one is pipelining, which we don't allow. We only keep one
     /// request's framing rules at a time, so a second send would frame
@@ -58,6 +61,8 @@ pub const Phase = enum {
     /// We have the response head. Its body might still be unread, and
     /// the window drains whatever is left on the next take.
     received,
+    /// Another protocol owns the connection.
+    handed_over,
     /// Nothing more will be read or written here.
     done,
 };
@@ -204,7 +209,7 @@ fn writeHead(c: *Client, r: Request, framing: Framing) SendError!void {
     switch (c.phase) {
         .ready, .received => {},
         .sent, .sending => return error.ExchangeOpen,
-        .done => return error.Closed,
+        .switching, .handed_over, .done => return error.Closed,
     }
     if (!c.keep_alive or !c.window.usable()) return error.Closed;
     if (!scan.validFieldName(r.method)) return error.InvalidRequest;
@@ -305,7 +310,7 @@ pub fn receive(c: *Client) ReceiveError!?Response {
         .sent => {},
         .ready, .received => return error.NothingSent,
         .sending => return error.RequestOpen,
-        .done => return null,
+        .switching, .handed_over, .done => return null,
     }
 
     errdefer c.phase = .done;
@@ -322,10 +327,16 @@ pub fn receive(c: *Client) ReceiveError!?Response {
         return null;
     };
 
-    const interim = taken.head.status >= 100 and taken.head.status < 200;
+    const code = taken.head.status;
+    // The peer stopped speaking HTTP. Another head here would scan the
+    // next protocol's first bytes.
+    const switching = code == 101 or
+        (c.sent_method == .CONNECT and code >= 200 and code < 300);
     // An interim response frames nothing. The real one is still coming.
+    const interim = !switching and code >= 100 and code < 200;
+
     if (!interim) c.keep_alive = body.keepAlive(.of(taken.head));
-    c.phase = if (interim) .sent else .received;
+    c.phase = if (switching) .switching else if (interim) .sent else .received;
 
     return .{
         .head = taken.head,
@@ -363,11 +374,32 @@ pub fn bodyReader(c: *Client, decode_buf: []u8) HeadWindow.BodyReaderError!BodyR
     return c.window.bodyReader(decode_buf);
 }
 
+/// Stops speaking HTTP after a 101 or a 2xx answer to a CONNECT. We are
+/// done with the head by then, so its bytes go and the reader ends up at
+/// whatever the other protocol sent first.
+///
+/// This is only valid after `receive` returned one of those two, and
+/// anything else asserts in Debug and ReleaseSafe. The reader and writer
+/// are yours after this.
+pub fn handOver(c: *Client) void {
+    // This returns nothing, so it has no way to say no. Handing over a
+    // connection nobody switched would give the caller the rest of a
+    // response as another protocol's first bytes.
+    std.debug.assert(c.phase == .switching);
+    c.window.handOver();
+    c.phase = .handed_over;
+}
+
+/// Has it been handed to another protocol?
+pub fn handedOver(c: *const Client) bool {
+    return c.phase == .handed_over;
+}
+
 /// Can the connection carry another exchange? False while one is still
 /// outstanding.
 pub fn alive(c: *const Client) bool {
     switch (c.phase) {
-        .sent, .sending, .done => return false,
+        .sent, .sending, .switching, .handed_over, .done => return false,
         .ready, .received => {},
     }
     return c.keep_alive and c.window.usable();
@@ -727,6 +759,66 @@ test "a request length is read the way a response's is" {
         }));
     }
     try testing.expectEqualStrings("", h.sent());
+}
+
+test "a 101 is the peer agreeing to stop speaking HTTP" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var c = h.init(
+            shape,
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\nEARLYFRAME",
+        );
+        try c.send(.{ .target = "/ws", .headers = &.{
+            .{ .name = "Connection", .value = "Upgrade" },
+            .{ .name = "Upgrade", .value = "websocket" },
+        } });
+
+        const res = (try c.receive()).?;
+        try testing.expectEqual(@as(u16, 101), res.status());
+        try testing.expectEqualStrings("websocket", res.header("upgrade").?);
+
+        // Not an interim response. Another receive would scan the
+        // peer's first frame as a head.
+        try testing.expect(!c.alive());
+        try testing.expectEqual(@as(?Response, null), try c.receive());
+        try testing.expectError(error.Closed, c.send(.{}));
+
+        c.handOver();
+        try testing.expect(c.handedOver());
+    }
+}
+
+test "a 2xx answer to a CONNECT is a tunnel here too" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "HTTP/1.1 200 Connection Established\r\n\r\nTUNNELBYTES");
+    try c.send(.{ .method = "CONNECT", .target = "example.com:443" });
+
+    const res = (try c.receive()).?;
+    try testing.expectEqual(@as(u16, 200), res.status());
+    try testing.expectEqual(body.Framing.none, res.framing);
+
+    try testing.expect(!c.alive());
+    try testing.expectError(error.Closed, c.send(.{}));
+
+    c.handOver();
+    try testing.expect(c.handedOver());
+
+    // The head is out of the way, so the reader holds tunnel bytes.
+    var rest: [16]u8 = undefined;
+    var sink: Io.Writer = .fixed(&rest);
+    _ = try h.source.fixed.streamRemaining(&sink);
+    try testing.expectEqualStrings("TUNNELBYTES", sink.buffered());
+}
+
+test "a 1xx that is not a 101 is still interim" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    try c.send(.{ .method = "POST" });
+
+    _ = (try c.receive()).?;
+    const final = (try c.receive()).?;
+    try testing.expectEqual(@as(u16, 200), final.status());
+    try testing.expect(c.alive());
 }
 
 test "one exchange at a time" {

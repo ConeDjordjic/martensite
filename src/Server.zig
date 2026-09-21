@@ -250,6 +250,13 @@ pub const SendError = Response.WriteError || error{
     AlreadyAnswered,
 };
 
+pub const StreamError = SendError || error{
+    /// This answer is a tunnel, so there is no body to stream. Use
+    /// `respond`, which hands the connection over once the head is
+    /// out.
+    NoBodyToStream,
+};
+
 /// A write failed. Part of a message is on the wire and the next one
 /// would just carry on from there, so nothing more happens on this
 /// connection. Every path that writes bytes ends up here when it fails.
@@ -289,9 +296,7 @@ fn startResponse(s: *Server) error{AlreadyAnswered}!void {
 /// Writes a response and flushes it.
 pub fn respond(s: *Server, r: Response) SendError!void {
     var out = r;
-    // A HEAD gets the headers and none of the body, and so does a
-    // CONNECT that succeeded: what follows that is a tunnel.
-    if (s.bodylessAnswer(r.status)) out.head_only = true;
+    out.carries = s.bodyFor(r.status);
     const options: Response.WriteOptions = .{ .date = s.dateValue() };
     // Reject it before we mark the request answered, so the caller can
     // still send something else.
@@ -304,6 +309,14 @@ pub fn respond(s: *Server, r: Response) SendError!void {
     try out.write(s.writer, s.keep_alive, options);
     try s.writer.flush();
     if (!r.keep_alive) s.keep_alive = false;
+    if (out.carries == .none) {
+        // A 2xx to a CONNECT is the tunnel handshake, and what comes
+        // after it is tunnel bytes. Hand over exactly like `upgrade`
+        // does.
+        s.window.handOver();
+        s.phase = .handed_over;
+        return;
+    }
     // Nothing comes after this, so the connection is done, not just
     // answered.
     if (!s.keep_alive) s.phase = .done;
@@ -324,9 +337,13 @@ pub fn respondStreaming(
     r: Response,
     out_buf: []u8,
     options: StreamOptions,
-) SendError!ResponseWriter {
+) StreamError!ResponseWriter {
     var head = r;
     head.body = "";
+    head.carries = s.bodyFor(r.status);
+    // A tunnel has no body to stream into. That answer goes out in one
+    // piece.
+    if (head.carries == .none) return error.NoBodyToStream;
     const head_options: Response.WriteOptions = .{
         .date = s.dateValue(),
         .framing = if (options.content_length) |n| .{ .length = n } else .chunked,
@@ -351,7 +368,7 @@ pub fn respondStreaming(
     return .init(
         s.writer,
         out_buf,
-        if (!head.status.mayHaveBody() or s.bodylessAnswer(r.status))
+        if (!head.status.mayHaveBody() or s.bodyFor(r.status) != .as_given)
             .discard
         else if (options.content_length) |n| .{ .length = n } else .chunked,
         .{ .ctx = s, .settled = settled },
@@ -371,14 +388,17 @@ fn settled(ctx: *anyopaque, state: BodyWriter.State) void {
     }
 }
 
-/// Whether the answer to the request in hand carries a body at all,
-/// whatever its status says. `body.response` decides the same way on
-/// the other side of the wire.
-fn bodylessAnswer(s: *const Server, status: Response.Status) bool {
-    const m = s.method orelse return false;
-    if (!m.expectsBody()) return true;
+/// What this answer does with its body. The method decides that, not
+/// just the status. `body.response` reads it back the same way.
+fn bodyFor(s: *const Server, status: Response.Status) Response.Body {
+    const m = s.method orelse return .as_given;
+    // A HEAD describes the body a GET would have had.
+    if (!m.expectsBody()) return .describe_only;
+    // A successful CONNECT is followed by a tunnel, so no body and no
+    // framing headers about one.
     const code = @intFromEnum(status);
-    return m == .CONNECT and code >= 200 and code < 300;
+    if (m == .CONNECT and code >= 200 and code < 300) return .none;
+    return .as_given;
 }
 
 /// Today's date, if the caller asked for one. `writeHead` drops it if
@@ -414,6 +434,8 @@ pub fn alive(s: *const Server) bool {
 pub fn upgrade(s: *Server, response: Response) SendError!void {
     var r = response;
     r.keep_alive = true;
+    // Same rule as the other two: a 101 has no body.
+    r.carries = s.bodyFor(r.status);
     const options: Response.WriteOptions = .{};
     // Before the handover and before the request counts as answered, so
     // a rejected 101 still lets the caller answer some other way.
@@ -1936,7 +1958,7 @@ test "a response with no request in hand says the connection is over" {
     }
 }
 
-test "a CONNECT that succeeded gets no body, like a HEAD" {
+test "what follows a successful CONNECT is a tunnel, not a body" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var s = h.init(shape, "CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -1944,9 +1966,56 @@ test "a CONNECT that succeeded gets no body, like a HEAD" {
 
         try s.respond(.text(.ok, "not a body"));
         const out = h.written();
+
+        // No body and no framing headers. An intermediary that honours
+        // a Content-Length here would read tunnel bytes as message
+        // bytes.
         try testing.expect(std.mem.indexOf(u8, out, "not a body") == null);
-        try testing.expect(std.mem.indexOf(u8, out, "Content-Length: 10") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "Content-Length") == null);
+        try testing.expect(std.mem.indexOf(u8, out, "Transfer-Encoding") == null);
+        try testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n"));
+
+        try testing.expect(s.handedOver());
+        try testing.expect(!s.alive());
+        try testing.expectEqual(@as(?Request, null), try s.receive());
     }
+}
+
+test "a HEAD still describes the body it does not send" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "HEAD / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    try s.respond(.text(.ok, "twelve bytes"));
+    const out = h.written();
+    try testing.expect(std.mem.indexOf(u8, out, "Content-Length: 12") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "twelve bytes") == null);
+}
+
+test "a tunnel has no body to stream" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    // A tunnel has no body to stream. The answer goes out in one piece.
+    var scratch: [64]u8 = undefined;
+    try testing.expectError(error.NoBodyToStream, s.respondStreaming(.{ .status = .ok }, &scratch, .{}));
+    try testing.expectEqualStrings("", h.written());
+
+    try s.respond(.{ .status = .ok });
+    try testing.expect(s.handedOver());
+}
+
+test "the handover follows the same rule" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    try s.upgrade(.{ .status = .ok, .body = "not a body" });
+    const out = h.written();
+    try testing.expect(std.mem.indexOf(u8, out, "not a body") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "Content-Length") == null);
+    try testing.expect(s.handedOver());
 }
 
 test "a CONNECT that failed answers like anything else" {

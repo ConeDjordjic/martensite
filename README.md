@@ -184,6 +184,17 @@ Clients usually send their first frame without waiting for the 101, and
 those bytes are still sitting in the reader after the handover.
 `examples/websocket.zig` is a working echo server with framing.
 
+A `CONNECT` answered with a 2xx is the other handover. What comes after
+it is a tunnel, so the answer has no body and no framing headers, and the
+connection stops being HTTP as soon as that answer goes out. After that
+`http.handedOver()` is true and the reader and writer are yours. Trying
+to stream into a tunnel gives `error.NoBodyToStream`.
+
+On the client side, a `101` or a 2xx answer to a `CONNECT` you sent comes
+back from `receive` so you can read the head, and nothing more is sent or
+received on that connection. Call `client.handOver()` when you are done
+with the head. Anything the peer sent after it is waiting in the reader.
+
 ## Routing bits
 
 ```zig

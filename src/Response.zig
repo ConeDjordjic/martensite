@@ -15,11 +15,24 @@ headers: []const Header = &.{},
 body: []const u8 = "",
 /// False closes the connection after this response.
 keep_alive: bool = true,
-/// Drop the body but keep its Content-Length. For HEAD.
-head_only: bool = false,
+/// What happens to the body. The status on its own doesn't decide this,
+/// so `Server` sets it from the request it has in hand.
+carries: Body = .as_given,
 
 /// The Scanner's one. The same `Header` for both directions.
 pub const Header = field.Header;
+
+pub const Body = enum {
+    /// Written, if the status allows a body at all.
+    as_given,
+    /// Described but not written. The head keeps its `Content-Length`
+    /// and the bytes stay where they are. This is the answer to a HEAD.
+    describe_only,
+    /// Neither written nor described. A successful CONNECT is followed
+    /// by a tunnel, and framing headers on one look to an intermediary
+    /// like the length of a body that is never going to arrive.
+    none,
+};
 
 /// Everything we can decide about a response before writing starts.
 /// Whether the connection survives is not in here, because that gets
@@ -52,7 +65,7 @@ pub const WriteError = Io.Writer.Error || error{
 
 pub fn write(r: Response, w: *Io.Writer, keep_alive: bool, options: WriteOptions) WriteError!void {
     try r.writeHead(w, keep_alive, options);
-    if (!r.head_only and r.status.mayHaveBody()) try w.writeAll(r.body);
+    if (r.carries == .as_given and r.status.mayHaveBody()) try w.writeAll(r.body);
 }
 
 /// Everything that can be rejected about a response, decided without
@@ -67,7 +80,7 @@ pub fn check(r: Response, options: WriteOptions) WriteError!void {
     // The caller's own framing has to agree with the body coming after
     // it, otherwise we write a message our own Scanner would reject.
     const announced = field.announced(r.headers) catch return error.AmbiguousFraming;
-    const writes_body = !r.head_only and r.status.mayHaveBody();
+    const writes_body = r.carries == .as_given and r.status.mayHaveBody();
 
     // Our own Scanner wants exactly three digits and a space.
     const code = @intFromEnum(r.status);
@@ -79,7 +92,7 @@ pub fn check(r: Response, options: WriteOptions) WriteError!void {
     // the headers say. 304 and the answer to a HEAD can carry a length,
     // which there describes a real body we are deliberately not
     // sending.
-    if (code < 200 or code == 204) {
+    if (code < 200 or code == 204 or r.carries == .none) {
         if (announced.length != null or announced.encoding != null)
             return error.AmbiguousFraming;
     }
@@ -138,8 +151,9 @@ pub fn writeHead(r: Response, w: *Io.Writer, keep_alive: bool, options: WriteOpt
     try field.write(w, r.headers);
 
     // 1xx, 204 and 304 have no body. A Content-Length on one makes the
-    // peer read the next response as this one's.
-    if (r.status.mayHaveBody() and
+    // peer read the next response as this one's, and framing on a tunnel
+    // promises an intermediary a body that never arrives.
+    if (r.status.mayHaveBody() and r.carries != .none and
         !r.hasHeader("content-length") and
         !r.hasHeader("transfer-encoding"))
     {
@@ -355,7 +369,7 @@ test "a caller's content length is left alone" {
 
 test "HEAD keeps the length and drops the body" {
     var buf: [256]u8 = undefined;
-    const out = try render(.{ .body = "hello", .head_only = true }, true, &buf);
+    const out = try render(.{ .body = "hello", .carries = .describe_only }, true, &buf);
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", out);
 }
 
