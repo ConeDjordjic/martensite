@@ -131,6 +131,9 @@ size on the wire. Note this is not the same kind of buffer as the one
 `bodyReader` takes, even though it sits in the same argument position.
 
 `examples/hello.zig` is a complete server in about eighty lines.
+`examples/api.zig` is the bigger one: routing on method and path, a
+streamed response, an upload that gets rejected before its body is sent,
+and trailers at the end of a chunked response.
 
 ## A client
 
@@ -178,6 +181,22 @@ _ = try b.interface.streamRemaining(&file_writer.interface);
 
 Name resolution, redirects and connection pooling are out of scope. Those
 belong in a client library.
+
+## TLS
+
+There is none, same as hyper. `Server` and `Client` take a `Reader` and a
+`Writer`, and so does `std.crypto.tls.Client`, so you can stack one on
+the other. `examples/tls_client.zig` does that.
+
+Two things to watch out for. First, `head_buf` still has to be at least
+as big as the reader's buffer, and with TLS in between that buffer is a
+TLS record, not a round 16K. Second, `send` flushes the TLS writer, but
+that only pushes the bytes into the socket writer's buffer, so you have
+to flush that one yourself. If you forget, it looks like the server
+closed without answering, which took me a while to figure out.
+
+std only ships a TLS client, not a server, so a martensite server needs
+something in front of it to terminate TLS.
 
 ## Upgrades
 
@@ -256,7 +275,10 @@ zig build test
 zig build test -Dtest-filter="real socket"
 ```
 
-Some tests run over a real socket rather than a buffer.
+Some of the tests run over a real socket instead of a buffer. Every
+`Server` test also runs a second time with the bytes arriving one at a
+time, which is what catches the difference between what was actually read
+and what the code assumed was there.
 
 Framing is where request smuggling lives, so:
 
@@ -284,6 +306,10 @@ bytes as the body still works. They have to end with `0\r\n\r\n`, and
 trailers after the last chunk go through `respondStreaming` and
 `endWithTrailers` rather than in the body.
 
+A connection costs whatever buffers you hand it, plus 184 bytes of
+bookkeeping on x86-64, 112 of which is the head window. A test pins both
+numbers, so if they grow you see it in the diff.
+
 ## Not here
 
 TLS, HTTP/2, a router, connection pooling.
@@ -296,4 +322,3 @@ zig fetch --save git+https://github.com/ConeDjordjic/martensite
 
 Zig 0.16.0. The language is not at 1.0 yet, so expect a commit per
 release.
-

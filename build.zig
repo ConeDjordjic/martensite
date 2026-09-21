@@ -34,6 +34,29 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(ws);
 
+    const api = b.addExecutable(.{
+        .name = "api",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/api.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "martensite", .module = mod }},
+        }),
+    });
+    b.installArtifact(api);
+
+    // Only built, never run here: it wants the network and a CA bundle.
+    const tls_client = b.addExecutable(.{
+        .name = "tls-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/tls_client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "martensite", .module = mod }},
+        }),
+    });
+    b.installArtifact(tls_client);
+
     const example = b.addExecutable(.{
         .name = "hello",
         .root_module = b.createModule(.{
