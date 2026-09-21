@@ -716,6 +716,19 @@ test "an encoding the Scanner would refuse is not sent" {
     try testing.expectEqualStrings("", h.sent());
 }
 
+test "a request length is read the way a response's is" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "");
+    for ([_][]const u8{ "+5", "-0", "1_0" }) |bad| {
+        try testing.expectError(error.AmbiguousFraming, c.send(.{
+            .method = "POST",
+            .headers = &.{.{ .name = "Content-Length", .value = bad }},
+            .body = "hello",
+        }));
+    }
+    try testing.expectEqualStrings("", h.sent());
+}
+
 test "one exchange at a time" {
     for (shapes) |shape| {
         var h: Harness = undefined;

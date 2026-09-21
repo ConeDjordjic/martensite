@@ -68,6 +68,22 @@ pub fn check(r: Response, options: WriteOptions) WriteError!void {
     // it, otherwise we write a message our own Scanner would reject.
     const announced = field.announced(r.headers) catch return error.AmbiguousFraming;
     const writes_body = !r.head_only and r.status.mayHaveBody();
+
+    // Our own Scanner wants exactly three digits and a space.
+    const code = @intFromEnum(r.status);
+    if (code < 100 or code > 999) return error.AmbiguousFraming;
+
+    // 1xx and 204 carry no framing at all, not even the caller's. A
+    // peer that believes it would read the next response as this one's
+    // body. `body.response` gives these statuses no body no matter what
+    // the headers say. 304 and the answer to a HEAD can carry a length,
+    // which there describes a real body we are deliberately not
+    // sending.
+    if (code < 200 or code == 204) {
+        if (announced.length != null or announced.encoding != null)
+            return error.AmbiguousFraming;
+    }
+
     switch (options.framing) {
         .from_body => {
             if (announced.length) |n| {
@@ -350,6 +366,36 @@ test "a header value cannot carry a newline" {
             .headers = &.{.{ .name = "X-Thing", .value = bad }},
         }, true, &buf));
     }
+}
+
+test "the write side reads a length the way the read side does" {
+    var buf: [256]u8 = undefined;
+    // Values other parsers accept and we don't. Writing one is how two
+    // intermediaries end up disagreeing about where a body ends.
+    for ([_][]const u8{ "+5", "-0", "1_0", " 5 x", "0x5" }) |bad| {
+        try testing.expectError(error.AmbiguousFraming, render(.{
+            .headers = &.{.{ .name = "Content-Length", .value = bad }},
+            .body = "hello",
+        }, true, &buf));
+    }
+}
+
+test "statuses that cannot have a body cannot borrow one either" {
+    var buf: [256]u8 = undefined;
+    for ([_]Status{ .@"continue", .switching_protocols, .no_content }) |status| {
+        try testing.expectError(error.AmbiguousFraming, render(.{
+            .status = status,
+            .headers = &.{.{ .name = "Content-Length", .value = "5" }},
+        }, true, &buf));
+    }
+
+    // 304 is the exception. The length there describes the body a 200
+    // would have carried.
+    const out = try render(.{
+        .status = .not_modified,
+        .headers = &.{.{ .name = "Content-Length", .value = "5" }},
+    }, true, &buf);
+    try testing.expect(std.mem.indexOf(u8, out, "Content-Length: 5") != null);
 }
 
 test "a value the Scanner refuses is not written" {

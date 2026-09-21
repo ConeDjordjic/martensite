@@ -9,6 +9,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const scan = @import("scan.zig");
+const body = @import("body.zig");
 
 /// The same `Header` the Scanner reads, so we can read back what we write.
 pub const Header = scan.Header;
@@ -58,7 +59,9 @@ pub fn announced(fields: []const Header) Error!Announced {
     var out: Announced = .{};
     for (fields) |f| {
         if (std.ascii.eqlIgnoreCase(f.name, "content-length")) {
-            const n = std.fmt.parseInt(u64, std.mem.trim(u8, f.value, " \t"), 10) catch
+            // The read side's parser, not a general one. `+5`, `-0`
+            // and `1_0` are lengths some parsers take and we don't.
+            const n = body.parseLength(std.mem.trim(u8, f.value, " \t")) orelse
                 return error.Invalid;
             // Repeating it is fine as long as it agrees.
             if (out.length) |prev| {
@@ -113,7 +116,10 @@ test "framing a caller announced for themselves" {
         .{ .name = "Content-Length", .value = "5" },
         .{ .name = "Content-Length", .value = "6" },
     }));
-    try testing.expectError(error.Invalid, announced(&.{.{ .name = "Content-Length", .value = "5x" }}));
+    // Same rejections as the read side.
+    for ([_][]const u8{ "5x", "+5", "-0", "1_0", "", "0x5" }) |bad| {
+        try testing.expectError(error.Invalid, announced(&.{.{ .name = "Content-Length", .value = bad }}));
+    }
 
     try testing.expectError(error.Invalid, announced(&.{
         .{ .name = "Transfer-Encoding", .value = "chunked" },

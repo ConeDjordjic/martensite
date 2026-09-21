@@ -126,9 +126,10 @@ pub fn endsWithChunked(value: []const u8) bool {
     return count == 1 and eqlIgnoreCase(last, "chunked");
 }
 
-/// Digits only. If two parsers read a Content-Length differently you have
-/// a smuggled request.
-fn parseLength(value: []const u8) ?u64 {
+/// Digits only. Two parsers reading a Content-Length differently is how
+/// you get a smuggled request, so the write side uses this same function
+/// instead of anything that accepts a sign or a separator.
+pub fn parseLength(value: []const u8) ?u64 {
     if (value.len == 0) return null;
     var n: u64 = 0;
     for (value) |c| {

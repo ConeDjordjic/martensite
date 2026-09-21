@@ -33,9 +33,11 @@ failure: ?FailureSource,
 
 keep_alive: bool = true,
 phase: Phase = .ready,
-/// A HEAD: describe the body, do not send it. Only meaningful while a
-/// request is in hand.
-head_only: bool = false,
+/// The method we have in hand, parsed. It decides whether the answer has
+/// a body at all. HEAD describes one without sending it, and a
+/// successful CONNECT is followed by a tunnel. This is the same rule
+/// `body.response` reads with.
+method: ?scan.Method = null,
 /// We owe the peer a 100 Continue. `expectsContinue` says what the
 /// request asked for, and this says what is still left to do about it.
 expect_continue: bool = false,
@@ -179,7 +181,7 @@ pub fn receive(s: *Server) ReceiveError!?Request {
     };
 
     s.expect_continue = try expectsContinue(taken.head);
-    s.head_only = scan.Method.parse(taken.head.method) == .HEAD;
+    s.method = scan.Method.parse(taken.head.method);
     s.keep_alive = body.keepAlive(.of(taken.head));
     s.phase = .unanswered;
 
@@ -259,7 +261,7 @@ fn writeFailed(s: *Server) void {
 /// Forgets the last request, so nothing about it leaks into a response
 /// written with no request in hand.
 fn forgetRequest(s: *Server) void {
-    s.head_only = false;
+    s.method = null;
     s.expect_continue = false;
     s.keep_alive = false;
     if (s.phase == .unanswered or s.phase == .answered) s.phase = .ready;
@@ -287,8 +289,9 @@ fn startResponse(s: *Server) error{AlreadyAnswered}!void {
 /// Writes a response and flushes it.
 pub fn respond(s: *Server, r: Response) SendError!void {
     var out = r;
-    // A HEAD gets the headers and none of the body.
-    if (s.head_only) out.head_only = true;
+    // A HEAD gets the headers and none of the body, and so does a
+    // CONNECT that succeeded: what follows that is a tunnel.
+    if (s.bodylessAnswer(r.status)) out.head_only = true;
     const options: Response.WriteOptions = .{ .date = s.dateValue() };
     // Reject it before we mark the request answered, so the caller can
     // still send something else.
@@ -348,7 +351,7 @@ pub fn respondStreaming(
     return .init(
         s.writer,
         out_buf,
-        if (!head.status.mayHaveBody() or s.head_only)
+        if (!head.status.mayHaveBody() or s.bodylessAnswer(r.status))
             .discard
         else if (options.content_length) |n| .{ .length = n } else .chunked,
         .{ .ctx = s, .settled = settled },
@@ -366,6 +369,16 @@ fn settled(ctx: *anyopaque, state: BodyWriter.State) void {
         .finished => s.phase = if (s.keep_alive) .answered else .done,
         .open => unreachable,
     }
+}
+
+/// Whether the answer to the request in hand carries a body at all,
+/// whatever its status says. `body.response` decides the same way on
+/// the other side of the wire.
+fn bodylessAnswer(s: *const Server, status: Response.Status) bool {
+    const m = s.method orelse return false;
+    if (!m.expectsBody()) return true;
+    const code = @intFromEnum(status);
+    return m == .CONNECT and code >= 200 and code < 300;
 }
 
 /// Today's date, if the caller asked for one. `writeHead` drops it if
@@ -1921,6 +1934,56 @@ test "a response with no request in hand says the connection is over" {
         try testing.expect(!s.alive());
         try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") != null);
     }
+}
+
+test "a CONNECT that succeeded gets no body, like a HEAD" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n");
+        _ = (try s.receive()).?;
+
+        try s.respond(.text(.ok, "not a body"));
+        const out = h.written();
+        try testing.expect(std.mem.indexOf(u8, out, "not a body") == null);
+        try testing.expect(std.mem.indexOf(u8, out, "Content-Length: 10") != null);
+    }
+}
+
+test "a CONNECT that failed answers like anything else" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    try s.respond(.text(.forbidden, "no tunnels here"));
+    try testing.expect(std.mem.endsWith(u8, h.written(), "no tunnels here"));
+}
+
+test "a status the Scanner could not read back is not written" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    // Three digits and a space is what `scan.response` accepts.
+    try testing.expectError(error.AmbiguousFraming, s.respond(.{ .status = @enumFromInt(7) }));
+    try testing.expectError(error.AmbiguousFraming, s.respond(.{ .status = @enumFromInt(1000) }));
+    try testing.expectEqualStrings("", h.written());
+
+    try s.respond(.{ .status = @enumFromInt(599) });
+    try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 599 "));
+}
+
+test "framing on a status that cannot carry a body is refused" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    // A peer that honours the TE would read the next status line as this
+    // response's chunk size.
+    try testing.expectError(error.AmbiguousFraming, s.respond(.{
+        .status = .no_content,
+        .headers = &.{.{ .name = "Transfer-Encoding", .value = "chunked" }},
+    }));
+    try testing.expectEqualStrings("", h.written());
 }
 
 test "no trailers is an empty slice" {
