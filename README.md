@@ -141,8 +141,15 @@ var client: martensite.Client = try .init(io, &reader.interface, &writer.interfa
 });
 try client.send(.{ .method = "POST", .target = "/things", .body = payload });
 const res = (try client.receive()) orelse return error.Closed;
+if (res.status() != 200) return error.Unexpected;
 const body = try client.readBody(&buf);
 ```
+
+A status you read is a `u16`, not the `Status` enum you write a response
+with. Usually what you care about is the class (`res.status() < 300`),
+and the number comes from the peer, not from this library. For the same
+reason `method()` and `target()` on a request give you raw bytes, with
+`knownMethod()` and `parsedTarget()` if you want a parsed form.
 
 One exchange at a time. A second `send` before the response has arrived
 is `error.ExchangeOpen`, and a `receive` with nothing outstanding is
