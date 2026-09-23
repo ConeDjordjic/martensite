@@ -168,13 +168,23 @@ fixed, so nothing more is written and the connection ends. A handler
 that returns without answering gets a 500 and `error.NoResponse`.
 Close the stream once `serve` returns.
 
+If you want your own error responses, say JSON, give the app a
+`pub fn onError(app, http, req, err) !void` and respond from there. It
+gets every handler error that comes before anything is sent, except
+`Canceled`. An error it answers doesn't end the loop and doesn't come
+back from `serve`, so log it in `onError`. The connection stays open
+unless the error came from the Server itself, like `BodyTooLarge`, or
+the handler read part of the body and stopped. In those cases the
+response says `Connection: close` whatever you pass. If `onError`
+doesn't respond, you get the default above.
+
 It doesn't route and it has no context type. If you need something it
 doesn't do, write the loop yourself.
 
 `examples/hello.zig` is a complete server built on `serve`.
-`examples/api.zig` writes its own loop, and has routing on method and
+`examples/api.zig` also uses `serve`, and has routing on method and
 path, a streamed response, an upload that gets rejected before its body
-is sent, and trailers at the end of a chunked response.
+is sent, and the trailers at the end of a chunked upload.
 
 ## A client
 

@@ -40,14 +40,23 @@ pub const Error = error{
 };
 
 /// Everything `serve` can return: what `receive` can fail with, the
-/// handler's own errors, and `Error`.
+/// errors of `handle` and `onError`, and `Error`.
 pub fn ServeError(comptime Handler: type) type {
-    const T = switch (@typeInfo(Handler)) {
+    const T = Child(Handler);
+    const E = Server.ReceiveError || Error || ErrorSet(T.handle);
+    return if (@hasDecl(T, "onError")) E || ErrorSet(T.onError) else E;
+}
+
+fn Child(comptime Handler: type) type {
+    return switch (@typeInfo(Handler)) {
         .pointer => |p| p.child,
         else => Handler,
     };
-    const returns = @typeInfo(@TypeOf(T.handle)).@"fn".return_type.?;
-    return Server.ReceiveError || Error || @typeInfo(returns).error_union.error_set;
+}
+
+fn ErrorSet(comptime f: anytype) type {
+    const returns = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
+    return @typeInfo(returns).error_union.error_set;
 }
 
 /// Receives requests and calls `handler.handle(server, request)` for
@@ -64,6 +73,17 @@ pub fn ServeError(comptime Handler: type) type {
 /// the wire and the body can't be fixed, so nothing more is written.
 /// `Canceled` never gets a response.
 ///
+/// If you want to answer handler errors yourself, give the handler
+/// `pub fn onError(handler, server, request, err) !void`. It is called
+/// for any error but `Canceled` while nothing has been sent, and it
+/// should respond. An error it answers doesn't come back from here, so
+/// log it there, and the loop carries on if the connection can. The
+/// connection closes anyway after an error from the Server itself, like
+/// a bad chunk or a body too large, because the reader may not be on a
+/// message boundary. The same goes for a body you started reading and
+/// didn't finish. If `onError` doesn't respond, or fails, you get the
+/// default above.
+///
 /// Close the stream once this returns, whatever it returns. After an
 /// upgrade the connection belongs to the handler, which should have
 /// finished with it before returning.
@@ -77,8 +97,20 @@ pub fn serve(s: *Server, handler: anytype, options: Options) ServeError(@TypeOf(
 
         setDeadline(options, options.body);
         handler.handle(s, req) catch |err| {
-            if (s.phase == .unanswered) refuse(s, err);
-            return err;
+            if (s.phase != .unanswered) return err;
+            if (!@hasDecl(Child(@TypeOf(handler)), "onError") or err == error.Canceled) {
+                refuse(s, err);
+                return err;
+            }
+            if (Response.Status.named(err) != null or !s.alive()) s.keep_alive = false;
+            handler.onError(s, req, err) catch |hook_err| {
+                if (s.phase == .unanswered) refuse(s, err);
+                return hook_err;
+            };
+            if (s.phase == .unanswered) {
+                refuse(s, err);
+                return err;
+            }
         };
 
         switch (s.phase) {
@@ -222,6 +254,103 @@ test "a handler error of its own is a 500" {
     try testing.expectError(error.DatabaseDown, serve(&s, Fails{}, h.options()));
     try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 500 "));
     try testing.expectEqual(@as(usize, 1), h.statusLines());
+}
+
+const Json = struct {
+    seen: usize = 0,
+    last: ?anyerror = null,
+    answer: bool = true,
+
+    fn handle(_: *Json, s: *Server, req: Server.Request) !void {
+        if (std.mem.eql(u8, req.target(), "/fail")) return error.DatabaseDown;
+        if (std.mem.eql(u8, req.target(), "/partial")) {
+            var scratch: [16]u8 = undefined;
+            var b = try s.bodyReader(&scratch);
+            var one: [1]u8 = undefined;
+            _ = try b.interface.readSliceShort(&one);
+            return error.DatabaseDown;
+        }
+        var buf: [4]u8 = undefined;
+        const body = try s.readBody(&buf);
+        try s.respond(.text(.ok, if (body.len != 0) body else req.target()));
+    }
+
+    fn onError(j: *Json, s: *Server, _: Server.Request, err: anyerror) !void {
+        j.seen += 1;
+        j.last = err;
+        if (!j.answer) return;
+        try s.respond(.json(.forError(err), "{\"error\":true}"));
+    }
+};
+
+test "onError answers a handler error and the connection carries on" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET /fail HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    var json: Json = .{};
+    try serve(&s, &json, h.options());
+    try testing.expectEqual(@as(usize, 1), json.seen);
+    try testing.expectEqual(error.DatabaseDown, json.last.?);
+    try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 500 "));
+    try testing.expect(std.mem.indexOf(u8, h.written(), "{\"error\":true}") != null);
+    try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") == null);
+    try testing.expect(std.mem.endsWith(u8, h.written(), "\r\n\r\n/b"));
+}
+
+test "onError can't keep the connection after a Server error" {
+    for (arrival.shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n" ++ "x" ** 10 ++
+            "GET /never HTTP/1.1\r\nHost: x\r\n\r\n");
+        var json: Json = .{};
+        try serve(&s, &json, h.options());
+        try testing.expectEqual(error.BodyTooLarge, json.last.?);
+        try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 413 "));
+        try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") != null);
+        try testing.expectEqual(@as(usize, 1), h.statusLines());
+    }
+}
+
+test "onError can't keep the connection after a body read halfway" {
+    for (arrival.shapes) |shape| {
+        var h: Harness = undefined;
+        // Longer than the handler's scratch, so the body is really unfinished.
+        var s = h.init(shape, "POST /partial HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n" ++ "x" ** 100 ++
+            "GET /never HTTP/1.1\r\nHost: x\r\n\r\n");
+        var json: Json = .{};
+        try serve(&s, &json, h.options());
+        try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 500 "));
+        try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") != null);
+        try testing.expectEqual(@as(usize, 1), h.statusLines());
+    }
+}
+
+test "onError that doesn't answer gets the default" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET /fail HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    var json: Json = .{ .answer = false };
+    try testing.expectError(error.DatabaseDown, serve(&s, &json, h.options()));
+    try testing.expectEqual(@as(usize, 1), json.seen);
+    try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 500 "));
+    try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") != null);
+    try testing.expectEqual(@as(usize, 1), h.statusLines());
+}
+
+test "onError is not called for Canceled" {
+    const Canceled = struct {
+        called: bool = false,
+        fn handle(_: *@This(), _: *Server, _: Server.Request) !void {
+            return error.Canceled;
+        }
+        fn onError(c: *@This(), _: *Server, _: Server.Request, _: anyerror) !void {
+            c.called = true;
+        }
+    };
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    var c: Canceled = .{};
+    try testing.expectError(error.Canceled, serve(&s, &c, h.options()));
+    try testing.expect(!c.called);
+    try testing.expectEqualStrings("", h.written());
 }
 
 test "a handler error after a streamed head writes nothing more" {
