@@ -1,7 +1,9 @@
 //! The loop for one connection: receive, hand the request over, repeat.
 //!
 //! It only does the protocol part that every server repeats. There is
-//! no routing and no handler type beyond "handle this request". If you
+//! no routing. The handler has `handle`, and optionally `onError` and
+//! `onReceiveError` for the responses the loop would otherwise write
+//! itself. Anything more belongs in whatever you build on top. If you
 //! need something it doesn't do, write the loop yourself. You lose
 //! nothing but the convenience.
 
@@ -43,10 +45,27 @@ pub const Error = error{
 /// errors of `handle`, `onError` and `onReceiveError`, and `Error`.
 pub fn ServeError(comptime Handler: type) type {
     const T = Child(Handler);
+    checkHooks(T);
     comptime var E = Server.ReceiveError || Error || ErrorSet(T.handle);
     if (@hasDecl(T, "onError")) E = E || ErrorSet(T.onError);
     if (@hasDecl(T, "onReceiveError")) E = E || ErrorSet(T.onReceiveError);
     return E;
+}
+
+/// Hooks are found by name, so a misspelled one would be skipped without
+/// a word. Anything public named like a hook has to be one.
+fn checkHooks(comptime T: type) void {
+    if (!@hasDecl(T, "handle")) @compileError(@typeName(T) ++ " has no handle");
+    const decls = switch (@typeInfo(T)) {
+        inline .@"struct", .@"union", .@"enum", .@"opaque" => |info| info.decls,
+        else => return,
+    };
+    for (decls) |d| {
+        const hook = d.name.len > 2 and std.mem.startsWith(u8, d.name, "on") and std.ascii.isUpper(d.name[2]);
+        if (!hook) continue;
+        if (std.mem.eql(u8, d.name, "onError") or std.mem.eql(u8, d.name, "onReceiveError")) continue;
+        @compileError(@typeName(T) ++ "." ++ d.name ++ " is not a serve hook. They are onError and onReceiveError.");
+    }
 }
 
 fn Child(comptime Handler: type) type {
