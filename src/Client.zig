@@ -165,7 +165,7 @@ pub const RequestWriter = BodyWriter;
 
 /// An unfinished body ends the connection. A finished one leaves the
 /// request outstanding, waiting to be answered.
-fn settled(ctx: *anyopaque, state: BodyWriter.State) void {
+fn settled(ctx: *anyopaque, state: BodyWriter.State, _: u64) void {
     const c: *Client = @ptrCast(@alignCast(ctx));
     switch (state) {
         .broken => c.writeFailed(),

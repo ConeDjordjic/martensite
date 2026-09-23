@@ -40,11 +40,13 @@ pub const Error = error{
 };
 
 /// Everything `serve` can return: what `receive` can fail with, the
-/// errors of `handle` and `onError`, and `Error`.
+/// errors of `handle`, `onError` and `onReceiveError`, and `Error`.
 pub fn ServeError(comptime Handler: type) type {
     const T = Child(Handler);
-    const E = Server.ReceiveError || Error || ErrorSet(T.handle);
-    return if (@hasDecl(T, "onError")) E || ErrorSet(T.onError) else E;
+    comptime var E = Server.ReceiveError || Error || ErrorSet(T.handle);
+    if (@hasDecl(T, "onError")) E = E || ErrorSet(T.onError);
+    if (@hasDecl(T, "onReceiveError")) E = E || ErrorSet(T.onReceiveError);
+    return E;
 }
 
 fn Child(comptime Handler: type) type {
@@ -84,6 +86,15 @@ fn ErrorSet(comptime f: anytype) type {
 /// didn't finish. If `onError` doesn't respond, or fails, you get the
 /// default above.
 ///
+/// `pub fn onReceiveError(handler, server, err) !void` does the same for
+/// a request that couldn't be read. There is no request to pass, and the
+/// connection always closes after it, because we don't know where the
+/// next request would start. The error still comes back from here.
+///
+/// `server.last` says what went out for each request, including what
+/// `serve` sent for you, so an access log can read it after `handle`,
+/// in `onError`, and after `serve` returns.
+///
 /// Close the stream once this returns, whatever it returns. After an
 /// upgrade the connection belongs to the handler, which should have
 /// finished with it before returning.
@@ -91,7 +102,15 @@ pub fn serve(s: *Server, handler: anytype, options: Options) ServeError(@TypeOf(
     while (true) {
         setDeadline(options, options.head);
         const req = s.receive() catch |err| {
-            refuse(s, err);
+            // `receive` cleared `last`, so it is only set if the hook
+            // answered.
+            if (@hasDecl(Child(@TypeOf(handler)), "onReceiveError") and err != error.Canceled) {
+                handler.onReceiveError(s, err) catch |hook_err| {
+                    if (s.last == null) refuse(s, err);
+                    return hook_err;
+                };
+            }
+            if (s.last == null) refuse(s, err);
             return err;
         } orelse return;
 
@@ -351,6 +370,59 @@ test "onError is not called for Canceled" {
     try testing.expectError(error.Canceled, serve(&s, &c, h.options()));
     try testing.expect(!c.called);
     try testing.expectEqualStrings("", h.written());
+}
+
+const JsonReceive = struct {
+    seen: ?anyerror = null,
+    answer: bool = true,
+
+    fn handle(_: *JsonReceive, s: *Server, _: Server.Request) !void {
+        try s.respond(.{});
+    }
+
+    fn onReceiveError(j: *JsonReceive, s: *Server, err: anyerror) !void {
+        j.seen = err;
+        if (!j.answer) return;
+        try s.respond(.json(.forError(err), "{\"error\":true}"));
+    }
+};
+
+test "onReceiveError answers a request that couldn't be read" {
+    for (arrival.shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET / HTTP/1.1\r\n\r\n");
+        var j: JsonReceive = .{};
+        try testing.expectError(error.BadHost, serve(&s, &j, h.options()));
+        try testing.expectEqual(error.BadHost, j.seen.?);
+        try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 400 "));
+        try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") != null);
+        try testing.expect(std.mem.endsWith(u8, h.written(), "{\"error\":true}"));
+        try testing.expectEqual(@as(usize, 1), h.statusLines());
+        try testing.expectEqual(Response.Status.bad_request, s.last.?.status);
+    }
+}
+
+test "onReceiveError that doesn't answer gets the default" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var j: JsonReceive = .{ .answer = false };
+    try testing.expectError(error.BadHost, serve(&s, &j, h.options()));
+    try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 400 "));
+    try testing.expect(std.mem.indexOf(u8, h.written(), "{\"error\":true}") == null);
+    try testing.expectEqual(@as(usize, 1), h.statusLines());
+}
+
+test "last covers what serve sends for you" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    const Fails = struct {
+        fn handle(_: @This(), _: *Server, _: Server.Request) !void {
+            return error.DatabaseDown;
+        }
+    };
+    try testing.expectError(error.DatabaseDown, serve(&s, Fails{}, h.options()));
+    try testing.expectEqual(Response.Status.internal_server_error, s.last.?.status);
+    try testing.expect(s.last.?.complete);
 }
 
 test "a handler error after a streamed head writes nothing more" {

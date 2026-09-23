@@ -98,14 +98,17 @@ connection closes and the writer is done. `end` and `endWithTrailers`
 also return `Finished`, and `flush` returns `WriteFailed`, which is the
 only error `Io.Writer` has.
 
-If the handler never reads the body, the connection ends, and the
-response says `Connection: close` so the peer knows. Reading a body you
-already rejected is up to you, so you have to say how much of it you will
-take:
+If the handler never reads the body, the Server reads it and throws it
+away before the next request, up to `max_drain` bytes. The default is
+64 KiB, so answering a POST with a 401 or a 404 without reading it
+doesn't cost the peer its connection. A bigger body ends the connection,
+and the response says `Connection: close` so the peer knows. Pass
+`.max_drain = 0` to never read a body you didn't ask for.
+`http.setMaxDrain(n)` changes the limit for the current request only,
+for example on an upload route that answers early.
 
-```zig
-.max_drain = 64 * 1024,   // default is 0: don't read it, close instead
-```
+Every response gets a `Date` header unless it already has one. Pass
+`.date = false` to leave it out.
 
 For bodies that are too big to buffer, stream them:
 
@@ -157,6 +160,15 @@ to be `pub`. The deadline for `head` covers waiting for the next request
 and reading its head. The one for `body` starts when the handler is
 called. Without `.deadline` nothing is timed.
 
+The deadlines and the timeout you give `TimedReader.init` both apply.
+The one from `init` limits a single read and starts again on every read.
+A deadline limits a whole stage. Each read gives up at whichever comes
+first, so a peer that sends a byte every few seconds gets past the
+per-read timeout but not the deadline. Whenever you use a `TimedReader`,
+also pass `.failure = reader.failureSource()` to `Server.init`. Without
+it a timeout looks like any other failed read and gets a 400 instead of
+a 408.
+
 The first error ends the loop and comes back to you. Before that the
 peer gets what it is still owed. A request that couldn't be read gets
 `Status.forError` with `Connection: close`, and so does an error from
@@ -177,6 +189,17 @@ unless the error came from the Server itself, like `BodyTooLarge`, or
 the handler read part of the body and stopped. In those cases the
 response says `Connection: close` whatever you pass. If `onError`
 doesn't respond, you get the default above.
+
+`pub fn onReceiveError(app, http, err) !void` does the same for a
+request that couldn't be read, like a bad head or a timeout. There is no
+request to pass it. The connection always closes afterwards, because
+there is no telling where the next request would start, and the error
+still comes back from `serve`.
+
+For an access log, read `http.last`. It holds the status of the last
+response, how many body bytes went out and whether all of it did. It
+also covers the responses `serve` writes for you, so read it after
+`handle`, in `onError` and after `serve` returns. `receive` clears it.
 
 It doesn't route and it has no context type. If you need something it
 doesn't do, write the loop yourself.
@@ -209,6 +232,8 @@ with. Usually what you care about is the class (`res.status() < 300`),
 and the number comes from the peer, not from this library. For the same
 reason `method()` and `target()` on a request give you raw bytes, with
 `knownMethod()` and `parsedTarget()` if you want a parsed form.
+`knownMethod()` is null for a method outside the eight in RFC 9110 and
+PATCH. The usual answer to one of those is 501.
 
 You have to pass `Host` yourself, because the client doesn't know which
 host it is talking to. A request without one, or with a `Host` a server
@@ -301,10 +326,14 @@ with the head. Anything the peer sent after it is waiting in the reader.
 const t = req.parsedTarget() orelse return;      // t.path, t.query, t.form
 var pairs: martensite.target.Pairs = .init(t.query);
 const decoded = try martensite.target.decode(t.path, &buf);
+const q = martensite.target.Pairs.get(t.query, "q") orelse "";
+const words = try martensite.target.decodeQuery(q, &buf);
 ```
 
 `decode` leaves `+` alone. It only means space in a form body, and
-decoding it inside a path breaks filenames. For headers that can show up
+decoding it inside a path breaks filenames. Names and values from the
+query go through `decodeQuery` instead, which also turns `+` into a
+space. A `%2B` still comes out as `+`. For headers that can show up
 more than once, `req.headerIter(name)` walks all of them.
 
 Headers like `Accept-Encoding`, `Cache-Control` and `Content-Type` are

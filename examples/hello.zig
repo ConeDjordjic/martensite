@@ -36,7 +36,6 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
     var write_buf: [16 * 1024]u8 = undefined;
     var headers: [64]martensite.Header = undefined;
     var head_buf: [16 * 1024]u8 = undefined;
-    var date: martensite.Date = .{};
 
     // A plain stream.reader works too, but then a silent peer ties this
     // fiber up forever.
@@ -47,7 +46,6 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
     var http: martensite.Server = martensite.Server.init(io, &reader.interface, &writer.interface, .{
         .headers = &headers,
         .head_buf = &head_buf,
-        .date = &date,
         .failure = reader.failureSource(),
     }) catch return;
 

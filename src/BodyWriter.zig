@@ -25,17 +25,20 @@ interface: Io.Writer,
 mode: Mode,
 owner: Owner,
 state: State = .open,
+/// Body bytes that went out, not counting chunk framing.
+written: u64 = 0,
 
 /// `body.outgoing` decides this, along with the head.
 pub const Mode = body.Mode;
 
 pub const State = enum { open, finished, broken };
 
-/// How the writer reports back. Server and Client both close on
-/// `broken`, but they move to different phases on `finished`.
+/// How the writer reports back, along with `written`. Server and Client
+/// both close on `broken`, but they move to different phases on
+/// `finished`.
 pub const Owner = struct {
     ctx: *anyopaque,
-    settled: *const fn (*anyopaque, State) void,
+    settled: *const fn (*anyopaque, State, u64) void,
 };
 
 pub const EndError = Io.Writer.Error || error{
@@ -108,7 +111,7 @@ pub fn endWithTrailers(b: *BodyWriter, fields: []const field.Header) EndError!vo
     b.out.flush() catch |err| return b.fail(err);
 
     b.state = .finished;
-    b.owner.settled(b.owner.ctx, .finished);
+    b.owner.settled(b.owner.ctx, .finished, b.written);
 }
 
 fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
@@ -138,7 +141,7 @@ fn emit(b: *BodyWriter, bytes: []const u8) Io.Writer.Error!void {
     if (bytes.len == 0) return;
     if (b.state != .open) return error.WriteFailed;
     switch (b.mode) {
-        .discard => {},
+        .discard => return,
         .length => |*left| {
             // Anything past the end reads as the next message.
             if (bytes.len > left.*) return b.fail(error.WriteFailed);
@@ -147,6 +150,7 @@ fn emit(b: *BodyWriter, bytes: []const u8) Io.Writer.Error!void {
         },
         .chunked => b.chunk(bytes) catch |err| return b.fail(err),
     }
+    b.written += bytes.len;
 }
 
 fn chunk(b: *BodyWriter, bytes: []const u8) Io.Writer.Error!void {
@@ -167,7 +171,7 @@ fn terminate(b: *BodyWriter, fields: []const field.Header) Io.Writer.Error!void 
 fn fail(b: *BodyWriter, err: anytype) @TypeOf(err) {
     if (b.state == .open) {
         b.state = .broken;
-        b.owner.settled(b.owner.ctx, .broken);
+        b.owner.settled(b.owner.ctx, .broken, b.written);
     }
     return err;
 }

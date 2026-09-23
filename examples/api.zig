@@ -38,7 +38,6 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
     var write_buf: [16 * 1024]u8 = undefined;
     var headers: [64]martensite.Header = undefined;
     var head_buf: [16 * 1024]u8 = undefined;
-    var date: martensite.Date = .{};
     var trailer_buf: [512]u8 = undefined;
 
     var reader: martensite.TimedReader = .init(io, stream, &read_buf, .{
@@ -48,13 +47,9 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
     var http: martensite.Server = martensite.Server.init(io, &reader.interface, &writer.interface, .{
         .headers = &headers,
         .head_buf = &head_buf,
-        .date = &date,
         .failure = reader.failureSource(),
         // Leaving this empty drops trailers, and /upload wants them.
         .trailer_buf = &trailer_buf,
-        // A rejected upload is still on the wire. Read up to this much
-        // and the connection survives for the next request.
-        .max_drain = 64 * 1024,
     }) catch return;
 
     var app: App = .{ .reader = &reader };

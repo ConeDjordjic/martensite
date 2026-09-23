@@ -24,7 +24,9 @@ io: Io,
 writer: *Io.Writer,
 /// Owns where the reader is: head, body, drain.
 window: HeadWindow,
-date: ?*DateHeader,
+date: ?DateHeader,
+/// What `max_drain` goes back to for each new request.
+max_drain: u64,
 
 keep_alive: bool = true,
 phase: Phase = .ready,
@@ -33,6 +35,18 @@ phase: Phase = .ready,
 method: ?scan.Method = null,
 /// We still owe the peer a 100 Continue.
 expect_continue: bool = false,
+/// The last final response, for an access log. It includes the ones
+/// `serve` writes for you. `receive` clears it.
+last: ?Sent = null,
+
+pub const Sent = struct {
+    status: Response.Status,
+    /// Body bytes, not counting chunk framing. Zero for a HEAD.
+    body_bytes: u64 = 0,
+    /// False while a streamed body is still open, and for good if a
+    /// write failed or the body was never ended.
+    complete: bool = false,
+};
 
 /// Where the connection is in the request/response cycle.
 ///
@@ -76,16 +90,19 @@ pub const Options = struct {
     /// Holds trailer lines. Leaving it empty drops them, which is
     /// usually fine.
     trailer_buf: []u8 = &.{},
-    /// Pass one and responses get a Date header. It caches, so you get
-    /// one clock read per second instead of one per response.
-    date: ?*DateHeader = null,
+    /// Adds a Date header to every response that doesn't have one. HTTP
+    /// asks for it from any server with a clock. It is rendered at most
+    /// once a second.
+    date: bool = true,
     /// How much of an unread body we will read to keep the connection.
-    /// Zero, which is the default, closes it instead. Answering without
-    /// reading is common, and reading a body you already rejected is
-    /// your call.
-    max_drain: u64 = 0,
+    /// Zero closes it instead. Answering a POST without reading it, say
+    /// with a 401 or a 404, is common, and without a drain each of those
+    /// costs the peer a new connection. `setMaxDrain` changes it for one
+    /// request.
+    max_drain: u64 = 64 * 1024,
     /// Pass one and `receive` can tell a quiet peer from a dead one.
-    /// `TimedReader.failureSource()` gives you one.
+    /// `TimedReader.failureSource()` gives you one. Always pass it with a
+    /// TimedReader, or a timeout gets a 400 instead of a 408.
     failure: ?FailureSource = null,
 };
 
@@ -104,8 +121,17 @@ pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) In
             .max_drain = options.max_drain,
             .failure = options.failure,
         }),
-        .date = options.date,
+        .date = if (options.date) .{} else null,
+        .max_drain = options.max_drain,
     };
+}
+
+/// Changes `max_drain` for the current request, for example to let an
+/// upload route answer early and still keep the connection. The next
+/// `receive` uses it to drain this request's body, then puts the value
+/// from `Options` back.
+pub fn setMaxDrain(s: *Server, n: u64) void {
+    s.window.max_drain = n;
 }
 
 /// Points into the connection's buffers and is valid until the next
@@ -150,6 +176,7 @@ pub fn receive(s: *Server) ReceiveError!?Request {
         .ready, .answered => {},
     }
     if (!s.keep_alive) return null;
+    s.last = null;
 
     // Drop the request whenever something fails, so nothing about the
     // last one leaks into the response an error path is about to
@@ -164,6 +191,8 @@ pub fn receive(s: *Server) ReceiveError!?Request {
         s.phase = .done;
         return null;
     };
+    // The last request's body is drained now, so its limit is done with.
+    s.window.max_drain = s.max_drain;
 
     try field.checkHost(req.head.headers, req.head.minor_version >= 1);
     s.expect_continue = try Message.expectation(req.head.headers);
@@ -302,6 +331,7 @@ fn writeHead(s: *Server, r: Response, out: body.Outgoing) SendError!body.Plan {
         // from a closed socket.
         if (s.window.endsHere()) s.keep_alive = false;
         s.phase = .answered;
+        s.last = .{ .status = r.status };
         // Once an answer is on the wire, a 100 would be a second response.
         s.expect_continue = false;
     }
@@ -329,6 +359,11 @@ pub fn respond(s: *Server, r: Response) SendError!void {
     if (plan.mode != .discard) try s.writer.writeAll(r.body);
     try s.writer.flush();
     const answer = s.answerTo(r.status);
+    if (answer != .interim) s.last = .{
+        .status = r.status,
+        .body_bytes = if (plan.mode == .discard) 0 else r.body.len,
+        .complete = true,
+    };
     if (answer.switches()) {
         s.phase = .handed_over;
     } else if (answer != .interim and !s.keep_alive) {
@@ -370,8 +405,12 @@ pub const ResponseWriter = BodyWriter;
 
 /// An unfinished body ends the connection. A finished one means the
 /// request is answered.
-fn settled(ctx: *anyopaque, state: BodyWriter.State) void {
+fn settled(ctx: *anyopaque, state: BodyWriter.State, written: u64) void {
     const s: *Server = @ptrCast(@alignCast(ctx));
+    if (s.last) |*l| {
+        l.body_bytes = written;
+        l.complete = state == .finished;
+    }
     switch (state) {
         .broken => s.writeFailed(),
         .finished => s.phase = if (s.keep_alive) .answered else .done,
@@ -379,10 +418,10 @@ fn settled(ctx: *anyopaque, state: BodyWriter.State) void {
     }
 }
 
-/// Today's date, if the caller asked for one. It is left out if the
+/// Today's date, unless it was turned off. It is left out if the
 /// response already has a Date.
 fn dateValue(s: *Server) ?[]const u8 {
-    const d = s.date orelse return null;
+    const d = if (s.date) |*d| d else return null;
     return d.value(s.io);
 }
 
@@ -445,6 +484,8 @@ const Harness = struct {
     const Setup = struct {
         /// Read a body the handler ignored. Off by default.
         max_drain: u64 = 0,
+        /// Off by default, so tests can compare whole responses.
+        date: bool = false,
         /// Somewhere to keep a head while its body is read.
         keep_head: bool = true,
         /// Somewhere to keep the peer's trailers. Off by default.
@@ -475,6 +516,7 @@ const Harness = struct {
             .head_buf = if (setup.keep_head) &h.head_buf else &.{},
             .trailer_buf = if (setup.keep_trailers) &h.trailer_buf else &.{},
             .max_drain = setup.max_drain,
+            .date = setup.date,
         }) catch unreachable;
     }
 
@@ -1319,7 +1361,7 @@ test "a streamed body reaches the peer before it ends" {
 test "what a connection costs, apart from its buffers" {
     // Pinned, so if it grows you see it in a diff. Everything else a
     // connection uses is a buffer the caller sized.
-    try testing.expectEqual(@as(usize, 176), @sizeOf(Server));
+    try testing.expectEqual(@as(usize, 248), @sizeOf(Server));
     try testing.expectEqual(@as(usize, 136), @sizeOf(HeadWindow));
     try testing.expectEqual(@as(usize, 88), @sizeOf(Request));
 }
@@ -2029,11 +2071,12 @@ test "end after an overrun is refused" {
     try testing.expectError(error.Finished, rw.end());
 }
 
-test "a Date header when one is asked for" {
+test "a Date header by default" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-    var date: DateHeader = .{};
-    s.date = &date;
+    h.writer = .fixed(&h.out);
+    var s = try Server.init(testing.io, h.source.reader(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n"), &h.writer, .{
+        .headers = &h.headers,
+    });
     _ = (try s.receive()).?;
     try s.respond(.text(.ok, "hi"));
 
@@ -2042,7 +2085,7 @@ test "a Date header when one is asked for" {
     try testing.expectEqualStrings(" GMT\r\n", out[at + 6 + 25 ..][0..6]);
 }
 
-test "no Date unless one is asked for" {
+test "no Date when it is turned off" {
     var h: Harness = undefined;
     var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
@@ -2053,8 +2096,7 @@ test "no Date unless one is asked for" {
 test "a caller's own Date is left alone" {
     var h: Harness = undefined;
     var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-    var date: DateHeader = .{};
-    s.date = &date;
+    s.date = .{};
     _ = (try s.receive()).?;
     try s.respond(.{
         .headers = &.{.{ .name = "Date", .value = "Sun, 06 Nov 1994 08:49:37 GMT" }},
@@ -2067,8 +2109,7 @@ test "a caller's own Date is left alone" {
 test "a streamed response gets a Date too" {
     var h: Harness = undefined;
     var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-    var date: DateHeader = .{};
-    s.date = &date;
+    s.date = .{};
     _ = (try s.receive()).?;
 
     var scratch: [64]u8 = undefined;
@@ -2137,7 +2178,7 @@ test "an unread body is never scanned as the next request" {
 
         try s.respond(.{ .status = .unauthorized });
 
-        // Draining is off by default, so there is a body here nobody
+        // The harness turns draining off, so there is a body here nobody
         // will read, and the window says so before anyone asks it to
         // scan.
         try testing.expect(!s.alive());
@@ -2185,9 +2226,8 @@ test "a 100 Continue that cannot be written ends the connection" {
 
 test "a response with more headers than the old splice buffer held" {
     var h: Harness = undefined;
-    var date: DateHeader = .{};
     var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-    s.date = &date;
+    s.date = .{};
 
     var many: [40]Response.Header = undefined;
     for (&many, 0..) |*f, i| {
@@ -2498,4 +2538,80 @@ test "a 100 sent by hand is the one we owed" {
     _ = try s.readBody(&buf);
     try s.respond(.{});
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, h.written(), "100 Continue"));
+}
+
+test "an unread body is drained by default" {
+    var h: Harness = undefined;
+    h.writer = .fixed(&h.out);
+    var s = try Server.init(testing.io, h.source.reader(.whole, "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello" ++
+        "GET /b HTTP/1.1\r\nHost: x\r\n\r\n"), &h.writer, .{
+        .headers = &h.headers,
+        .head_buf = &h.head_buf,
+    });
+    _ = (try s.receive()).?;
+    try s.respond(.{ .status = .unauthorized });
+    try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") == null);
+    try testing.expectEqualStrings("/b", (try s.receive()).?.target());
+}
+
+test "setMaxDrain lasts for one request" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        const post = "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+        var s = h.init(shape, post ++ post);
+
+        _ = (try s.receive()).?;
+        s.setMaxDrain(1024);
+        try s.respond(.{});
+        try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") == null);
+
+        // The harness has no drain, and that is back for this one.
+        _ = (try s.receive()).?;
+        try s.respond(.{});
+        try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") != null);
+        try testing.expect(!s.alive());
+    }
+}
+
+test "last says what went out" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\nHEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expectEqual(@as(?Sent, null), s.last);
+
+    _ = (try s.receive()).?;
+    try s.respond(.{ .status = .early_hints });
+    try testing.expectEqual(@as(?Sent, null), s.last);
+    try s.respond(.text(.not_found, "nope"));
+    try testing.expectEqual(Sent{ .status = .not_found, .body_bytes = 4, .complete = true }, s.last.?);
+
+    _ = (try s.receive()).?;
+    try testing.expectEqual(@as(?Sent, null), s.last);
+    try s.respond(.text(.ok, "hello"));
+    try testing.expectEqual(Sent{ .status = .ok, .body_bytes = 0, .complete = true }, s.last.?);
+}
+
+test "last follows a streamed body" {
+    for ([_]?u64{ null, 7 }) |length| {
+        var h: Harness = undefined;
+        var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        _ = (try s.receive()).?;
+
+        var scratch: [4]u8 = undefined;
+        var rw = try s.respondStreaming(.{}, &scratch, .{ .content_length = length });
+        try testing.expectEqual(Sent{ .status = .ok }, s.last.?);
+        try rw.interface.writeAll("abcdefg");
+        try rw.end();
+        try testing.expectEqual(Sent{ .status = .ok, .body_bytes = 7, .complete = true }, s.last.?);
+    }
+}
+
+test "last says a streamed body broke" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    var scratch: [4]u8 = undefined;
+    var rw = try s.respondStreaming(.{}, &scratch, .{ .content_length = 3 });
+    try testing.expectError(error.LengthMismatch, rw.end());
+    try testing.expectEqual(Sent{ .status = .ok, .body_bytes = 0, .complete = false }, s.last.?);
 }

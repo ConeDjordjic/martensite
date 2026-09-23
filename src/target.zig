@@ -81,15 +81,25 @@ pub const DecodeError = error{
 /// so an `out` the same length as `raw` is always enough.
 ///
 /// `+` is left alone. It only means space in a form body, and decoding
-/// it inside a path breaks filenames.
+/// it inside a path breaks filenames. Use `decodeQuery` for query values.
 pub fn decode(raw: []const u8, out: []u8) DecodeError![]u8 {
+    return decodeWith(raw, out, false);
+}
+
+/// `decode` for a name or value from the query, where `+` is a space.
+/// A `%2B` is still a `+`.
+pub fn decodeQuery(raw: []const u8, out: []u8) DecodeError![]u8 {
+    return decodeWith(raw, out, true);
+}
+
+fn decodeWith(raw: []const u8, out: []u8, plus_is_space: bool) DecodeError![]u8 {
     var n: usize = 0;
     var i: usize = 0;
     while (i < raw.len) {
         if (n == out.len) return error.NoSpace;
         const c = raw[i];
         if (c != '%') {
-            out[n] = c;
+            out[n] = if (plus_is_space and c == '+') ' ' else c;
             n += 1;
             i += 1;
             continue;
@@ -113,7 +123,8 @@ fn hex(c: u8) ?u8 {
     };
 }
 
-/// Walks `key=value` pairs. The values are still encoded.
+/// Walks `key=value` pairs. Names and values are still encoded, so pass
+/// them to `decodeQuery`.
 pub const Pairs = struct {
     rest: []const u8,
 
@@ -134,6 +145,16 @@ pub const Pairs = struct {
                 .name = if (eq) |i| item[0..i] else item,
                 .value = if (eq) |i| item[i + 1 ..] else "",
             };
+        }
+        return null;
+    }
+
+    /// The first value for `name`, still encoded. `name` is compared
+    /// with the name as it was sent, so give it encoded too.
+    pub fn get(query: []const u8, name: []const u8) ?[]const u8 {
+        var p: Pairs = .init(query);
+        while (p.next()) |pair| {
+            if (std.mem.eql(u8, pair.name, name)) return pair.value;
         }
         return null;
     }
@@ -263,4 +284,18 @@ test "empty and doubled separators" {
 test "no query at all" {
     var it: Pairs = .init("");
     try testing.expectEqual(@as(?Pairs.Pair, null), it.next());
+}
+
+test "a query value decodes plus as a space" {
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("a b+c", try decodeQuery("a+b%2Bc", &buf));
+    try testing.expectEqualStrings("a+b+c", try decode("a+b%2Bc", &buf));
+    try testing.expectError(error.BadEscape, decodeQuery("a+%2", &buf));
+}
+
+test "get a query value by name" {
+    try testing.expectEqualStrings("2", Pairs.get("a=1&b=2&b=3", "b").?);
+    try testing.expectEqualStrings("", Pairs.get("a&b=2", "a").?);
+    try testing.expect(Pairs.get("a=1", "c") == null);
+    try testing.expect(Pairs.get("", "a") == null);
 }
