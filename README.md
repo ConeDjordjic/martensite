@@ -76,6 +76,11 @@ is not known until you read it, and also for a request with no body at
 all. Use `req.hasBody()` to tell those two apart. `Client.Response` has
 both methods too.
 
+Under `serve`, let an error from `readBody` go up with `try`. `serve`
+answers `BodyTooLarge` with a 413 and a broken body with a 400. If you
+catch it and answer yourself, it is easy to turn all of them into the
+same 400.
+
 `receive` refuses an HTTP/1.1 request with no `Host`, more than one, or
 one that isn't a host with an optional port. That is `error.BadHost`,
 and the answer is 400. HTTP/1.0 requests can leave `Host` out. For a
@@ -203,6 +208,17 @@ unless the error came from the Server itself, like `BodyTooLarge`, or
 the handler read part of the body and stopped. In those cases the
 response says `Connection: close` whatever you pass. If `onError`
 doesn't respond, you get the default above.
+
+`Status.forError` already knows which errors are the peer's fault, so
+you don't need a table of your own:
+
+```zig
+pub fn onError(app: *App, http: *martensite.Server, _: martensite.Server.Request, err: anyerror) !void {
+    const status: martensite.Status = .forError(err);
+    if (@intFromEnum(status) >= 500) app.log(err);   // ours, not the peer's
+    try http.respond(.text(status, status.phrase()));
+}
+```
 
 `pub fn onReceiveError(app, http, err) !void` does the same for a
 request that couldn't be read, like a bad head or a timeout. There is no
