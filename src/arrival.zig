@@ -90,6 +90,8 @@ pub const Failing = struct {
     interface: Io.Reader = undefined,
     buf: [64]u8 = undefined,
     why: anyerror = error.Timeout,
+    /// Handed out before the failure.
+    first: []const u8 = "",
 
     pub fn init(f: *Failing) void {
         f.interface = .{
@@ -100,8 +102,12 @@ pub const Failing = struct {
         };
     }
 
-    fn stream(_: *Io.Reader, _: *Io.Writer, _: Io.Limit) Io.Reader.StreamError!usize {
-        return error.ReadFailed;
+    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const f: *Failing = @alignCast(@fieldParentPtr("interface", r));
+        if (f.first.len == 0) return error.ReadFailed;
+        const n = try w.write(f.first[0..limit.minInt(f.first.len)]);
+        f.first = f.first[n..];
+        return n;
     }
 
     fn cause(ctx: *anyopaque) ?anyerror {

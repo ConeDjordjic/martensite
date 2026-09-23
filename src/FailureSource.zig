@@ -16,12 +16,26 @@ pub fn last(f: FailureSource) ?anyerror {
     return f.cause(f.ctx);
 }
 
-/// What to report a `ReadFailed` as. Only `Timeout` gets its own error.
-/// Reset, no route and out of resources all end the connection the same
-/// way, so there would be nothing for the caller to decide.
+/// What to report a `ReadFailed` as. `Timeout` and `Canceled` get their
+/// own errors. Reset, no route and out of resources all end the
+/// connection the same way, so there would be nothing for the caller to
+/// decide. `Canceled` has to come through as itself, or `serve` answers
+/// a connection that is being shut down with a 400.
 /// Takes an optional so callers without a source can still call it.
-pub fn readError(f: ?FailureSource) error{ Timeout, ReadFailed } {
+pub fn readError(f: ?FailureSource) error{ Timeout, ReadFailed, Canceled } {
     const src = f orelse return error.ReadFailed;
     const cause = src.last() orelse return error.ReadFailed;
-    return if (cause == error.Timeout) error.Timeout else error.ReadFailed;
+    return switch (cause) {
+        error.Timeout => error.Timeout,
+        error.Canceled => error.Canceled,
+        else => error.ReadFailed,
+    };
+}
+
+/// `readError` for a body, which has no `Timeout` of its own.
+pub fn bodyReadError(f: ?FailureSource) error{ ReadFailed, Canceled } {
+    return switch (readError(f)) {
+        error.Canceled => error.Canceled,
+        error.Timeout, error.ReadFailed => error.ReadFailed,
+    };
 }

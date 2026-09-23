@@ -387,7 +387,7 @@ pub fn readBody(w: *HeadWindow, buf: []u8) BodyError![]u8 {
             const want: usize = @intCast(n);
             w.reader.readSliceAll(buf[0..want]) catch |err| switch (err) {
                 error.EndOfStream => return w.giveUp(error.Incomplete),
-                error.ReadFailed => return w.giveUp(error.ReadFailed),
+                error.ReadFailed => return w.giveUp(FailureSource.bodyReadError(w.failure)),
             };
             w.pending = .none;
             return buf[0..want];
@@ -401,7 +401,7 @@ pub fn readBody(w: *HeadWindow, buf: []u8) BodyError![]u8 {
                 // and a close-delimited body has no boundary after it
                 // anyway.
                 error.WriteFailed => return w.giveUp(error.BodyTooLarge),
-                error.ReadFailed => return w.giveUp(error.ReadFailed),
+                error.ReadFailed => return w.giveUp(FailureSource.bodyReadError(w.failure)),
             };
             // The body ended because the connection did. There is no
             // next message on a socket that is going away.
@@ -442,7 +442,7 @@ pub fn readBody(w: *HeadWindow, buf: []u8) BodyError![]u8 {
                     .more => continue,
                     .need_fill => w.reader.fillMore() catch |err| switch (err) {
                         error.EndOfStream => return w.giveUp(error.Incomplete),
-                        error.ReadFailed => return w.giveUp(error.ReadFailed),
+                        error.ReadFailed => return w.giveUp(FailureSource.bodyReadError(w.failure)),
                     },
                 }
             }
@@ -572,7 +572,7 @@ pub const BodyReader = struct {
                 return error.ReadFailed;
             },
             error.ReadFailed => {
-                b.fail(error.ReadFailed);
+                b.fail(FailureSource.bodyReadError(w.failure));
                 return error.ReadFailed;
             },
         };

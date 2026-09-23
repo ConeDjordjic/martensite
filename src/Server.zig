@@ -2302,7 +2302,7 @@ test "a peer that went quiet is told apart from one that went away" {
     var out: [64]u8 = undefined;
     var headers: [8]scan.Header = undefined;
 
-    for ([_]anyerror{ error.Timeout, error.ConnectionResetByPeer }) |why| {
+    for ([_]anyerror{ error.Timeout, error.ConnectionResetByPeer, error.Canceled }) |why| {
         var f: arrival.Failing = .{ .why = why };
         f.init();
         var w: Io.Writer = .fixed(&out);
@@ -2310,10 +2310,11 @@ test "a peer that went quiet is told apart from one that went away" {
             .headers = &headers,
             .failure = f.source(),
         });
-        try testing.expectError(
-            if (why == error.Timeout) error.Timeout else error.ReadFailed,
-            s.receive(),
-        );
+        try testing.expectError(switch (why) {
+            error.Timeout => error.Timeout,
+            error.Canceled => error.Canceled,
+            else => error.ReadFailed,
+        }, s.receive());
     }
 
     // With no failure source there is nobody to ask, so it stays a read
@@ -2323,6 +2324,36 @@ test "a peer that went quiet is told apart from one that went away" {
     var w: Io.Writer = .fixed(&out);
     var s = try Server.init(testing.io, &f.interface, &w, .{ .headers = &headers });
     try testing.expectError(error.ReadFailed, s.receive());
+}
+
+test "a body read that was canceled says so" {
+    var out: [64]u8 = undefined;
+    var headers: [8]scan.Header = undefined;
+    var head_buf: [64]u8 = undefined;
+
+    for ([_]bool{ false, true }) |stream| {
+        var f: arrival.Failing = .{
+            .why = error.Canceled,
+            .first = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc",
+        };
+        f.init();
+        var w: Io.Writer = .fixed(&out);
+        var s = try Server.init(testing.io, &f.interface, &w, .{
+            .headers = &headers,
+            .head_buf = &head_buf,
+            .failure = f.source(),
+        });
+        _ = (try s.receive()).?;
+        var buf: [16]u8 = undefined;
+        if (stream) {
+            var b = try s.bodyReader(&buf);
+            var sink: [16]u8 = undefined;
+            try testing.expectError(error.ReadFailed, b.interface.readSliceAll(&sink));
+            try testing.expectEqual(@as(?BodyError, error.Canceled), b.failure());
+        } else {
+            try testing.expectError(error.Canceled, s.readBody(&buf));
+        }
+    }
 }
 
 test "the body's length is knowable before reading it" {

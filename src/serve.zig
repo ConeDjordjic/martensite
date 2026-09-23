@@ -513,6 +513,17 @@ test "canceled gets no response" {
     try testing.expectEqualStrings("", h.written());
 }
 
+test "a connection canceled while waiting for a request gets no response" {
+    var f: arrival.Failing = .{ .why = error.Canceled };
+    f.init();
+    var out: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&out);
+    var headers: [8]scan.Header = undefined;
+    var s = try Server.init(testing.io, &f.interface, &w, .{ .headers = &headers, .failure = f.source() });
+    try testing.expectError(error.Canceled, serve(&s, Echo{}, .{}));
+    try testing.expectEqualStrings("", w.buffered());
+}
+
 test "an upgrade ends the loop without reading the next protocol" {
     const Upgrades = struct {
         fn handle(_: @This(), s: *Server, _: Server.Request) !void {
