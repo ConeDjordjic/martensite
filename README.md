@@ -76,6 +76,12 @@ is not known until you read it, and also for a request with no body at
 all. Use `req.hasBody()` to tell those two apart. `Client.Response` has
 both methods too.
 
+`receive` refuses an HTTP/1.1 request with no `Host`, more than one, or
+one that isn't a host with an optional port. That is `error.BadHost`,
+and the answer is 400. HTTP/1.0 requests can leave `Host` out. For a
+target like `http://a/x` the target's host is the one that counts, and
+`Host` only has to be there once.
+
 One request gets one response. Calling `respond` twice for the same
 request gives you `error.AlreadyAnswered`, because the second one would
 go out as the answer to a request the peer has not sent yet. Reading
@@ -133,10 +139,42 @@ piece that goes out in one write. With chunked encoding that is the chunk
 size on the wire. Note this is not the same kind of buffer as the one
 `bodyReader` takes, even though it sits in the same argument position.
 
-`examples/hello.zig` is a complete server in about eighty lines.
-`examples/api.zig` is the bigger one: routing on method and path, a
-streamed response, an upload that gets rejected before its body is sent,
-and trailers at the end of a chunked response.
+### The loop
+
+The loop at the top leaves out what happens when something fails.
+`serve` runs it for you:
+
+```zig
+http.serve(&app, .{
+    .deadline = reader.deadlines(),   // reader is a TimedReader
+    .head = .{ .duration = seconds(10) },
+    .body = .{ .duration = seconds(30) },
+}) catch |err| log(err);
+```
+
+`app.handle(&http, req)` gets called for each request, and `handle` has
+to be `pub`. The deadline for `head` covers waiting for the next request
+and reading its head. The one for `body` starts when the handler is
+called. Without `.deadline` nothing is timed.
+
+The first error ends the loop and comes back to you. Before that the
+peer gets what it is still owed. A request that couldn't be read gets
+`Status.forError` with `Connection: close`, and so does an error from
+the handler if nothing has been sent yet. So a handler that does
+`try http.readBody(&buf)` answers 413 for a body that doesn't fit, and
+any error of its own is a 500. If the handler fails after
+`respondStreaming`, the head is already out and the body can't be
+fixed, so nothing more is written and the connection ends. A handler
+that returns without answering gets a 500 and `error.NoResponse`.
+Close the stream once `serve` returns.
+
+It doesn't route and it has no context type. If you need something it
+doesn't do, write the loop yourself.
+
+`examples/hello.zig` is a complete server built on `serve`.
+`examples/api.zig` writes its own loop, and has routing on method and
+path, a streamed response, an upload that gets rejected before its body
+is sent, and trailers at the end of a chunked response.
 
 ## A client
 
@@ -145,7 +183,12 @@ var client: martensite.Client = try .init(io, &reader.interface, &writer.interfa
     .headers = &headers,
     .head_buf = &head_buf,
 });
-try client.send(.{ .method = "POST", .target = "/things", .body = payload });
+try client.send(.{
+    .method = "POST",
+    .target = "/things",
+    .headers = &.{.{ .name = "Host", .value = "example.com" }},
+    .body = payload,
+});
 const res = (try client.receive()) orelse return error.Closed;
 if (res.status() != 200) return error.Unexpected;
 const body = try client.readBody(&buf);
@@ -156,6 +199,10 @@ with. Usually what you care about is the class (`res.status() < 300`),
 and the number comes from the peer, not from this library. For the same
 reason `method()` and `target()` on a request give you raw bytes, with
 `knownMethod()` and `parsedTarget()` if you want a parsed form.
+
+You have to pass `Host` yourself, because the client doesn't know which
+host it is talking to. A request without one, or with a `Host` a server
+would refuse, is `error.BadHost` and nothing gets written.
 
 One exchange at a time. A second `send` before the response has arrived
 is `error.ExchangeOpen`, and a `receive` with nothing outstanding is
@@ -172,7 +219,11 @@ A request body too big to hold in memory goes out the same way a response
 does:
 
 ```zig
-var rw = try client.sendStreaming(.{ .method = "POST", .target = "/upload" }, &out_buf, .{});
+var rw = try client.sendStreaming(.{
+    .method = "POST",
+    .target = "/upload",
+    .headers = &.{.{ .name = "Host", .value = "example.com" }},
+}, &out_buf, .{});
 _ = try file_reader.interface.streamRemaining(&rw.interface);
 try rw.end();
 ```
@@ -245,6 +296,27 @@ const decoded = try martensite.target.decode(t.path, &buf);
 `decode` leaves `+` alone. It only means space in a form body, and
 decoding it inside a path breaks filenames. For headers that can show up
 more than once, `req.headerIter(name)` walks all of them.
+
+Headers like `Accept-Encoding`, `Cache-Control` and `Content-Type` are
+lists of tokens with parameters, and a quoted value can have a comma in
+it. `field.list` splits them without allocating:
+
+```zig
+var items = martensite.field.list(req.header("accept-encoding") orelse "");
+while (try items.next()) |item| {        // item.token is "gzip", "br"
+    var params = item.params();
+    while (params.next()) |p| {          // p.name is "q", p.value is "0.8"
+        const bytes = try martensite.field.unquote(p.value, &buf);
+    }
+}
+```
+
+Values come back as they were sent, still quoted if they were, and `q`
+stays a string. `next` returns `error.Malformed` for an item that
+doesn't fit, like an unterminated quote, and after that the list is
+over. The items before it are still good. Empty items are skipped.
+ETags and `Link` URLs aren't lists of tokens, so don't read them with
+this.
 
 ## Runtimes
 

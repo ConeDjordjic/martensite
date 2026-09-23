@@ -110,6 +110,7 @@ pub const Status = enum(u16) {
             error.UnsupportedEncoding => .not_implemented,
             // The rest all mean "not a request we are going to serve".
             error.BadRequest,
+            error.BadHost,
             error.Ambiguous,
             error.Incomplete,
             error.BadChunk,
@@ -133,6 +134,8 @@ pub const Status = enum(u16) {
             error.InvalidTrailer,
             error.LengthMismatch,
             error.Finished,
+            // A handler that didn't answer.
+            error.NoResponse,
             => .internal_server_error,
             else => null,
         };

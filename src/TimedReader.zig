@@ -7,6 +7,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const FailureSource = @import("FailureSource.zig");
+const serve = @import("serve.zig");
 
 const TimedReader = @This();
 
@@ -46,6 +47,16 @@ pub fn init(io: Io, stream: net.Stream, buffer: []u8, timeout: Io.Timeout) Timed
 /// stall by sending one byte at a time. `.none` clears it.
 pub fn startDeadline(r: *TimedReader, total: Io.Timeout) void {
     r.deadline = total.toDeadline(r.io);
+}
+
+/// `startDeadline`, in the form `Server.serve` wants.
+pub fn deadlines(r: *TimedReader) serve.Deadline {
+    return .{ .ctx = r, .start = start };
+}
+
+fn start(ctx: *anyopaque, total: Io.Timeout) void {
+    const r: *TimedReader = @ptrCast(@alignCast(ctx));
+    r.startDeadline(total);
 }
 
 /// Why the last read failed.

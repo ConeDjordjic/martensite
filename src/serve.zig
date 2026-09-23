@@ -1,0 +1,325 @@
+//! The loop for one connection: receive, hand the request over, repeat.
+//!
+//! It only does the protocol part that every server repeats. There is
+//! no routing and no handler type beyond "handle this request". If you
+//! need something it doesn't do, write the loop yourself. You lose
+//! nothing but the convenience.
+
+const std = @import("std");
+const Io = std.Io;
+
+const Server = @import("Server.zig");
+const Response = @import("Response.zig");
+
+/// Sets a read deadline on whatever reader the Server was given.
+/// `TimedReader.deadlines()` gives you one.
+///
+/// This exists so the loop can time things without the Server knowing
+/// what kind of reader it has, the same as `FailureSource`.
+pub const Deadline = struct {
+    ctx: *anyopaque,
+    start: *const fn (*anyopaque, Io.Timeout) void,
+};
+
+pub const Options = struct {
+    /// Without one nothing is timed, and a quiet peer holds the
+    /// connection for as long as it likes.
+    deadline: ?Deadline = null,
+    /// Waiting for the next request and reading its head.
+    head: Io.Timeout = .none,
+    /// The handler's time, once the head is in. Reading the body counts.
+    body: Io.Timeout = .none,
+};
+
+pub const Error = error{
+    /// The handler returned without answering. The peer got a 500.
+    NoResponse,
+    /// The handler returned with a streamed response still open. The
+    /// connection ends, because the body can't be finished for it.
+    ResponseOpen,
+};
+
+/// Everything `serve` can return: what `receive` can fail with, the
+/// handler's own errors, and `Error`.
+pub fn ServeError(comptime Handler: type) type {
+    const T = switch (@typeInfo(Handler)) {
+        .pointer => |p| p.child,
+        else => Handler,
+    };
+    const returns = @typeInfo(@TypeOf(T.handle)).@"fn".return_type.?;
+    return Server.ReceiveError || Error || @typeInfo(returns).error_union.error_set;
+}
+
+/// Receives requests and calls `handler.handle(server, request)` for
+/// each one, until the connection ends. A clean close returns nothing.
+/// `handler` can be a value or a pointer, and `handle` has to be `pub`
+/// and return an error union.
+///
+/// The first error ends the loop, and you get it back to log. Before
+/// that the peer gets whatever it is still owed. A request that couldn't
+/// be read, or a handler error with nothing sent yet, is answered with
+/// `Status.forError` and `Connection: close`. So a handler that just does
+/// `try server.readBody(buf)` gets a 413 for a body that is too large.
+/// If the handler fails after `respondStreaming`, the head is already on
+/// the wire and the body can't be fixed, so nothing more is written.
+/// `Canceled` never gets a response.
+///
+/// Close the stream once this returns, whatever it returns. After an
+/// upgrade the connection belongs to the handler, which should have
+/// finished with it before returning.
+pub fn serve(s: *Server, handler: anytype, options: Options) ServeError(@TypeOf(handler))!void {
+    while (true) {
+        setDeadline(options, options.head);
+        const req = s.receive() catch |err| {
+            refuse(s, err);
+            return err;
+        } orelse return;
+
+        setDeadline(options, options.body);
+        handler.handle(s, req) catch |err| {
+            if (s.phase == .unanswered) refuse(s, err);
+            return err;
+        };
+
+        switch (s.phase) {
+            .unanswered => {
+                refuse(s, error.NoResponse);
+                return error.NoResponse;
+            },
+            .streaming => return error.ResponseOpen,
+            .handed_over, .done => return,
+            .ready, .answered => {},
+        }
+        if (!s.alive()) return;
+    }
+}
+
+fn setDeadline(options: Options, timeout: Io.Timeout) void {
+    const d = options.deadline orelse return;
+    d.start(d.ctx, timeout);
+}
+
+/// The last response on this connection. If it can't be written the
+/// connection is going anyway.
+fn refuse(s: *Server, err: anyerror) void {
+    if (err == error.Canceled) return;
+    s.respond(.{ .status = .forError(err), .keep_alive = false }) catch {};
+}
+
+const testing = std.testing;
+const scan = @import("scan.zig");
+const arrival = @import("arrival.zig");
+
+const Harness = struct {
+    source: arrival.Source(1024, 512),
+    writer: Io.Writer,
+    headers: [16]scan.Header,
+    head_buf: [4096]u8,
+    out: [4096]u8,
+    /// Every deadline the loop set, in order.
+    set: [16]Io.Timeout,
+    set_len: usize,
+
+    fn init(h: *Harness, shape: arrival.Shape, input: []const u8) Server {
+        h.writer = .fixed(&h.out);
+        h.set_len = 0;
+        return Server.init(testing.io, h.source.reader(shape, input), &h.writer, .{
+            .headers = &h.headers,
+            .head_buf = &h.head_buf,
+        }) catch unreachable;
+    }
+
+    fn options(h: *Harness) Options {
+        return .{
+            .deadline = .{ .ctx = h, .start = record },
+            .head = .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } },
+            .body = .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } },
+        };
+    }
+
+    fn record(ctx: *anyopaque, t: Io.Timeout) void {
+        const h: *Harness = @ptrCast(@alignCast(ctx));
+        h.set[h.set_len] = t;
+        h.set_len += 1;
+    }
+
+    /// 1 for head, 2 for body, in the order they were set.
+    fn deadlines(h: *Harness, buf: []u8) []const u8 {
+        for (h.set[0..h.set_len], 0..) |t, i| buf[i] = '0' + @as(u8, @intCast(t.duration.raw.toSeconds()));
+        return buf[0..h.set_len];
+    }
+
+    fn written(h: *Harness) []const u8 {
+        return h.writer.buffered();
+    }
+
+    fn statusLines(h: *Harness) usize {
+        return std.mem.count(u8, h.written(), "HTTP/1.1 ");
+    }
+};
+
+const Echo = struct {
+    fn handle(_: Echo, s: *Server, req: Server.Request) !void {
+        var buf: [64]u8 = undefined;
+        const body = try s.readBody(&buf);
+        try s.respond(.text(.ok, if (body.len != 0) body else req.target()));
+    }
+};
+
+test "each request gets the handler and the right deadline" {
+    for (arrival.shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n" ++
+            "POST /b HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc");
+        try serve(&s, Echo{}, h.options());
+
+        try testing.expectEqual(@as(usize, 2), h.statusLines());
+        try testing.expect(std.mem.indexOf(u8, h.written(), "\r\n\r\n/a") != null);
+        try testing.expect(std.mem.endsWith(u8, h.written(), "\r\n\r\nabc"));
+        var buf: [16]u8 = undefined;
+        // The last head deadline is the wait that found the close.
+        try testing.expectEqualStrings("12121", h.deadlines(&buf));
+    }
+}
+
+test "no deadline means nothing is timed" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    try serve(&s, Echo{}, .{});
+    try testing.expectEqual(@as(usize, 1), h.statusLines());
+}
+
+test "a request that can't be read gets its status and ends the loop" {
+    for (arrival.shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "GET / HTTP/1.1\r\n\r\nGET /never HTTP/1.1\r\nHost: x\r\n\r\n");
+        try testing.expectError(error.BadHost, serve(&s, Echo{}, h.options()));
+        try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 400 "));
+        try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") != null);
+        try testing.expectEqual(@as(usize, 1), h.statusLines());
+    }
+}
+
+test "a handler error with nothing sent gets the status for it" {
+    for (arrival.shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n" ++ "x" ** 100);
+        try testing.expectError(error.BodyTooLarge, serve(&s, Echo{}, h.options()));
+        try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 413 "));
+        try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") != null);
+        try testing.expect(!s.alive());
+    }
+}
+
+test "a handler error of its own is a 500" {
+    const Fails = struct {
+        fn handle(_: @This(), _: *Server, _: Server.Request) !void {
+            return error.DatabaseDown;
+        }
+    };
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expectError(error.DatabaseDown, serve(&s, Fails{}, h.options()));
+    try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 500 "));
+    try testing.expectEqual(@as(usize, 1), h.statusLines());
+}
+
+test "a handler error after a streamed head writes nothing more" {
+    const Breaks = struct {
+        fn handle(_: @This(), s: *Server, _: Server.Request) !void {
+            var buf: [16]u8 = undefined;
+            var rw = try s.respondStreaming(.{}, &buf, .{});
+            try rw.interface.writeAll("part");
+            try rw.interface.flush();
+            return error.DatabaseDown;
+        }
+    };
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expectError(error.DatabaseDown, serve(&s, Breaks{}, h.options()));
+    try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 200 "));
+    try testing.expectEqual(@as(usize, 1), h.statusLines());
+    // No last chunk, so the peer can tell the body was cut short.
+    try testing.expect(!std.mem.endsWith(u8, h.written(), "0\r\n\r\n"));
+    try testing.expect(!s.alive());
+}
+
+test "a streamed response left open ends the connection" {
+    const LeavesOpen = struct {
+        fn handle(_: @This(), s: *Server, _: Server.Request) !void {
+            var buf: [16]u8 = undefined;
+            _ = try s.respondStreaming(.{}, &buf, .{});
+        }
+    };
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expectError(error.ResponseOpen, serve(&s, LeavesOpen{}, h.options()));
+    try testing.expectEqual(@as(usize, 1), h.statusLines());
+}
+
+test "a handler that forgets to answer gets a 500 sent for it" {
+    const Forgets = struct {
+        fn handle(_: @This(), _: *Server, _: Server.Request) !void {}
+    };
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expectError(error.NoResponse, serve(&s, Forgets{}, h.options()));
+    try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 500 "));
+    try testing.expectEqual(@as(usize, 1), h.statusLines());
+}
+
+test "a 103 alone is not an answer" {
+    const HintsOnly = struct {
+        fn handle(_: @This(), s: *Server, _: Server.Request) !void {
+            try s.respond(.{ .status = .early_hints });
+        }
+    };
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expectError(error.NoResponse, serve(&s, HintsOnly{}, h.options()));
+    try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 103 "));
+    try testing.expect(std.mem.indexOf(u8, h.written(), "HTTP/1.1 500 ") != null);
+}
+
+test "canceled gets no response" {
+    const Canceled = struct {
+        fn handle(_: @This(), _: *Server, _: Server.Request) !void {
+            return error.Canceled;
+        }
+    };
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expectError(error.Canceled, serve(&s, Canceled{}, h.options()));
+    try testing.expectEqualStrings("", h.written());
+}
+
+test "an upgrade ends the loop without reading the next protocol" {
+    const Upgrades = struct {
+        fn handle(_: @This(), s: *Server, _: Server.Request) !void {
+            try s.upgrade(.{ .status = .switching_protocols, .headers = &.{
+                .{ .name = "Connection", .value = "Upgrade" },
+                .{ .name = "Upgrade", .value = "x" },
+            } });
+        }
+    };
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\nnot http at all");
+    try serve(&s, Upgrades{}, h.options());
+    try testing.expect(s.handedOver());
+    try testing.expectEqual(@as(usize, 1), h.statusLines());
+}
+
+test "the handler can be a pointer with state" {
+    const Counts = struct {
+        n: usize = 0,
+        fn handle(c: *@This(), s: *Server, _: Server.Request) !void {
+            c.n += 1;
+            try s.respond(.{});
+        }
+    };
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    var counts: Counts = .{};
+    try serve(&s, &counts, h.options());
+    try testing.expectEqual(@as(usize, 2), counts.n);
+}

@@ -108,6 +108,10 @@ pub const Request = struct {
 pub const SendError = field.HeadError || Io.Writer.Error || error{
     /// The method or target doesn't fit in a request line.
     InvalidRequest,
+    /// No Host, more than one, or one that isn't a host and port. A
+    /// server has to refuse these, so we don't send them. See
+    /// `field.checkHost`.
+    BadHost,
     /// The last request hasn't been answered yet. Receive first.
     ExchangeOpen,
     /// Finished. Either a response ran to close, or we couldn't read
@@ -190,6 +194,7 @@ fn writeHead(c: *Client, r: Request, out: body.Outgoing) SendError!body.Plan {
     if (!scan.validFieldName(r.method)) return error.InvalidRequest;
     if (r.target.len == 0 or hasControl(r.target) or
         std.mem.indexOfScalar(u8, r.target, ' ') != null) return error.InvalidRequest;
+    try field.checkHost(r.headers, true);
 
     const h: field.Head = .{ .fields = r.headers, .body = out };
     const plan = try field.checkHead(h);
@@ -340,6 +345,8 @@ fn hasControl(bytes: []const u8) bool {
 
 const testing = std.testing;
 
+const host: []const Header = &.{.{ .name = "Host", .value = "x" }};
+
 const arrival = @import("arrival.zig");
 const Shape = arrival.Shape;
 const shapes = arrival.shapes;
@@ -398,8 +405,8 @@ test "a body gets a length" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "");
-        try c.send(.{ .method = "POST", .target = "/x", .body = "hello" });
-        try testing.expectEqualStrings("POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", h.sent());
+        try c.send(.{ .method = "POST", .target = "/x", .body = "hello", .headers = host });
+        try testing.expectEqualStrings("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello", h.sent());
     }
 }
 
@@ -409,7 +416,7 @@ test "a caller's own framing is left alone" {
         var c = h.init(shape, "");
         try c.send(.{
             .method = "POST",
-            .headers = &.{.{ .name = "Transfer-Encoding", .value = "chunked" }},
+            .headers = &.{ .{ .name = "Host", .value = "x" }, .{ .name = "Transfer-Encoding", .value = "chunked" } },
             .body = "5\r\nhello\r\n0\r\n\r\n",
         });
         try testing.expect(std.mem.indexOf(u8, h.sent(), "Content-Length") == null);
@@ -434,7 +441,7 @@ test "a response answers the questions a request does" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nContent-Length: 2\r\nSet-Cookie: b=2\r\n\r\nhi");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         const res = (try c.receive()).?;
 
         try testing.expectEqual(@as(?u64, 2), res.contentLength());
@@ -456,13 +463,13 @@ test "a server that says close ends the connection" {
             "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi",
             .{},
         );
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         _ = (try c.receive()).?;
         var buf: [8]u8 = undefined;
         try testing.expectEqualStrings("hi", try c.readBody(&buf));
 
         try testing.expect(!c.alive());
-        try testing.expectError(error.Closed, c.send(.{}));
+        try testing.expectError(error.Closed, c.send(.{ .headers = host }));
     }
 }
 
@@ -470,7 +477,7 @@ test "an HTTP/1.0 response without keep-alive ends the connection" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         _ = (try c.receive()).?;
         try testing.expect(!c.alive());
     }
@@ -480,7 +487,7 @@ test "a body that ran to the close leaves nothing to send on" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.0 200 OK\r\n\r\neverything after the head");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         _ = (try c.receive()).?;
         var buf: [64]u8 = undefined;
         _ = try c.readBody(&buf);
@@ -492,7 +499,7 @@ test "an interim response does not decide the connection" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         _ = (try c.receive()).?;
         _ = (try c.receive()).?;
         try testing.expect(c.alive());
@@ -505,7 +512,7 @@ test "a streamed request body is chunked when the length is unknown" {
         var c = h.init(shape, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
 
         var scratch: [64]u8 = undefined;
-        var rw = try c.sendStreaming(.{ .method = "POST", .target = "/up" }, &scratch, .{});
+        var rw = try c.sendStreaming(.{ .method = "POST", .target = "/up", .headers = host }, &scratch, .{});
         try rw.interface.writeAll("hello ");
         try rw.interface.writeAll("world");
         try rw.end();
@@ -524,7 +531,7 @@ test "a streamed request with a known length is not chunked" {
     var c = h.init(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
 
     var scratch: [64]u8 = undefined;
-    var rw = try c.sendStreaming(.{ .method = "PUT", .target = "/f" }, &scratch, .{ .content_length = 5 });
+    var rw = try c.sendStreaming(.{ .method = "PUT", .target = "/f", .headers = host }, &scratch, .{ .content_length = 5 });
     try rw.interface.writeAll("hello");
     try rw.end();
 
@@ -539,7 +546,7 @@ test "a streamed request body that stops short is refused" {
     var c = h.init(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
 
     var scratch: [64]u8 = undefined;
-    var rw = try c.sendStreaming(.{ .method = "PUT", .target = "/f" }, &scratch, .{ .content_length = 100 });
+    var rw = try c.sendStreaming(.{ .method = "PUT", .target = "/f", .headers = host }, &scratch, .{ .content_length = 100 });
     try rw.interface.writeAll("not enough");
     try testing.expectError(error.LengthMismatch, rw.end());
     try testing.expect(!c.alive());
@@ -551,11 +558,11 @@ test "nothing else happens while a request body is open" {
     var c = h.init(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
 
     var scratch: [64]u8 = undefined;
-    var rw = try c.sendStreaming(.{ .method = "POST", .target = "/a" }, &scratch, .{});
+    var rw = try c.sendStreaming(.{ .method = "POST", .target = "/a", .headers = host }, &scratch, .{});
     try rw.interface.writeAll("part");
 
     try testing.expectError(error.RequestOpen, c.receive());
-    try testing.expectError(error.ExchangeOpen, c.send(.{}));
+    try testing.expectError(error.ExchangeOpen, c.send(.{ .headers = host }));
     try testing.expect(!c.alive());
 
     try rw.end();
@@ -567,7 +574,7 @@ test "a HEAD sent as a streamed request still frames its answer" {
     var c = h.init(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n");
 
     var scratch: [64]u8 = undefined;
-    var rw = try c.sendStreaming(.{ .method = "HEAD", .target = "/x" }, &scratch, .{ .content_length = 0 });
+    var rw = try c.sendStreaming(.{ .method = "HEAD", .target = "/x", .headers = host }, &scratch, .{ .content_length = 0 });
     try rw.end();
 
     const res = (try c.receive()).?;
@@ -579,10 +586,10 @@ test "a request the writer cannot hold ends the connection" {
     var c = h.initWith(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", .{ .tight_writer = true });
 
     // 16 bytes of room, and the request line alone doesn't fit.
-    try testing.expectError(error.WriteFailed, c.send(.{ .target = "/a-long-target" }));
+    try testing.expectError(error.WriteFailed, c.send(.{ .target = "/a-long-target", .headers = host }));
 
     try testing.expect(!c.alive());
-    try testing.expectError(error.Closed, c.send(.{ .target = "/b" }));
+    try testing.expectError(error.Closed, c.send(.{ .target = "/b", .headers = host }));
     try testing.expectEqual(@as(?Response, null), try c.receive());
 }
 
@@ -593,7 +600,7 @@ test "a streamed request whose head cannot be written ends the connection" {
     var scratch: [32]u8 = undefined;
     try testing.expectError(
         error.WriteFailed,
-        c.sendStreaming(.{ .method = "POST", .target = "/a-long-target" }, &scratch, .{}),
+        c.sendStreaming(.{ .method = "POST", .target = "/a-long-target", .headers = host }, &scratch, .{}),
     );
     try testing.expect(!c.alive());
 }
@@ -604,9 +611,9 @@ test "a body the writer cannot hold ends the connection" {
 
     // The head fits in 16 bytes and the body doesn't, so the failure
     // happens after `writeHead`.
-    try testing.expectError(error.WriteFailed, c.send(.{ .method = "PUT", .target = "/", .body = "hello" }));
+    try testing.expectError(error.WriteFailed, c.send(.{ .method = "PUT", .target = "/", .body = "hello", .headers = host }));
     try testing.expect(!c.alive());
-    try testing.expectError(error.Closed, c.send(.{}));
+    try testing.expectError(error.Closed, c.send(.{ .headers = host }));
 }
 
 test "a request cannot be framed two ways at once" {
@@ -616,7 +623,7 @@ test "a request cannot be framed two ways at once" {
     try testing.expectError(error.AmbiguousFraming, c.send(.{
         .method = "POST",
         .headers = &.{
-            .{ .name = "Content-Length", .value = "5" },
+            .{ .name = "Host", .value = "x" },                    .{ .name = "Content-Length", .value = "5" },
             .{ .name = "Transfer-Encoding", .value = "chunked" },
         },
         .body = "hello",
@@ -635,7 +642,7 @@ test "a 101 is the peer agreeing to stop speaking HTTP" {
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\nEARLYFRAME",
         );
         try c.send(.{ .target = "/ws", .headers = &.{
-            .{ .name = "Connection", .value = "Upgrade" },
+            .{ .name = "Host", .value = "x" },            .{ .name = "Connection", .value = "Upgrade" },
             .{ .name = "Upgrade", .value = "websocket" },
         } });
 
@@ -647,7 +654,7 @@ test "a 101 is the peer agreeing to stop speaking HTTP" {
         // peer's first frame as a head.
         try testing.expect(!c.alive());
         try testing.expectEqual(@as(?Response, null), try c.receive());
-        try testing.expectError(error.Closed, c.send(.{}));
+        try testing.expectError(error.Closed, c.send(.{ .headers = host }));
 
         c.handOver();
         try testing.expect(c.handedOver());
@@ -657,14 +664,14 @@ test "a 101 is the peer agreeing to stop speaking HTTP" {
 test "a 2xx answer to a CONNECT is a tunnel here too" {
     var h: Harness = undefined;
     var c = h.init(.whole, "HTTP/1.1 200 Connection Established\r\n\r\nTUNNELBYTES");
-    try c.send(.{ .method = "CONNECT", .target = "example.com:443" });
+    try c.send(.{ .method = "CONNECT", .target = "example.com:443", .headers = host });
 
     const res = (try c.receive()).?;
     try testing.expectEqual(@as(u16, 200), res.status());
     try testing.expectEqual(body.Framing.none, res.framing);
 
     try testing.expect(!c.alive());
-    try testing.expectError(error.Closed, c.send(.{}));
+    try testing.expectError(error.Closed, c.send(.{ .headers = host }));
 
     c.handOver();
     try testing.expect(c.handedOver());
@@ -679,7 +686,7 @@ test "a 2xx answer to a CONNECT is a tunnel here too" {
 test "a 1xx that is not a 101 is still interim" {
     var h: Harness = undefined;
     var c = h.init(.whole, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-    try c.send(.{ .method = "POST" });
+    try c.send(.{ .method = "POST", .headers = host });
 
     _ = (try c.receive()).?;
     const final = (try c.receive()).?;
@@ -694,11 +701,11 @@ test "one exchange at a time" {
 
         try testing.expectError(error.NothingSent, c.receive());
 
-        try c.send(.{ .target = "/a" });
+        try c.send(.{ .target = "/a", .headers = host });
         try testing.expect(!c.alive());
         // Pipelining would frame the first response with the second
         // request's method.
-        try testing.expectError(error.ExchangeOpen, c.send(.{ .target = "/b" }));
+        try testing.expectError(error.ExchangeOpen, c.send(.{ .target = "/b", .headers = host }));
 
         _ = (try c.receive()).?;
         try testing.expect(c.alive());
@@ -710,7 +717,7 @@ test "an interim response leaves the exchange open" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
-        try c.send(.{ .method = "POST", .headers = &.{.{ .name = "Expect", .value = "100-continue" }} });
+        try c.send(.{ .method = "POST", .headers = &.{ .{ .name = "Host", .value = "x" }, .{ .name = "Expect", .value = "100-continue" } } });
 
         const interim = (try c.receive()).?;
         try testing.expectEqual(@as(u16, 100), interim.status());
@@ -726,10 +733,10 @@ test "a response that could not be read ends the exchange" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "this is not http\r\n\r\n");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         try testing.expectError(error.BadResponse, c.receive());
         try testing.expect(!c.alive());
-        try testing.expectError(error.Closed, c.send(.{}));
+        try testing.expectError(error.Closed, c.send(.{ .headers = host }));
     }
 }
 
@@ -745,7 +752,7 @@ test "a peer that went quiet is told apart from one that went away" {
             .headers = &headers,
             .failure = f.source(),
         });
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         try testing.expectError(
             if (why == error.Timeout) error.Timeout else error.ReadFailed,
             c.receive(),
@@ -756,7 +763,7 @@ test "a peer that went quiet is told apart from one that went away" {
     f.init();
     var w: Io.Writer = .fixed(&out);
     var c = try Client.init(testing.io, &f.interface, &w, .{ .headers = &headers });
-    try c.send(.{});
+    try c.send(.{ .headers = host });
     try testing.expectError(error.ReadFailed, c.receive());
 }
 
@@ -764,7 +771,7 @@ test "a response arrives however the bytes do" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.initWith(shape, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", .{});
-        try c.send(.{});
+        try c.send(.{ .headers = host });
 
         const res = (try c.receive()).?;
         try testing.expectEqual(@as(u16, 200), res.status());
@@ -782,7 +789,7 @@ test "a chunked response, and its trailers" {
                 "5\r\nhello\r\n0\r\nX-Sum: 42\r\n\r\n",
             .{},
         );
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         _ = (try c.receive()).?;
 
         var buf: [64]u8 = undefined;
@@ -813,20 +820,30 @@ test "a request line that cannot be written" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "");
-        try testing.expectError(error.InvalidRequest, c.send(.{ .method = "GE T" }));
-        try testing.expectError(error.InvalidRequest, c.send(.{ .target = "/a b" }));
-        try testing.expectError(error.InvalidRequest, c.send(.{ .target = "/a\r\nX: 1" }));
+        try testing.expectError(error.InvalidRequest, c.send(.{ .method = "GE T", .headers = host }));
+        try testing.expectError(error.InvalidRequest, c.send(.{ .target = "/a b", .headers = host }));
+        try testing.expectError(error.InvalidRequest, c.send(.{ .target = "/a\r\nX: 1", .headers = host }));
         try testing.expectError(error.InvalidHeader, c.send(.{
-            .headers = &.{.{ .name = "X", .value = "a\r\nY: 2" }},
+            .headers = &.{ .{ .name = "Host", .value = "x" }, .{ .name = "X", .value = "a\r\nY: 2" } },
         }));
     }
+}
+
+test "a Host a server would refuse is not sent" {
+    var h: Harness = undefined;
+    var c = h.init(.whole, "");
+    try testing.expectError(error.BadHost, c.send(.{}));
+    try testing.expectError(error.BadHost, c.send(.{ .headers = &.{ .{ .name = "Host", .value = "a" }, .{ .name = "host", .value = "a" } } }));
+    try testing.expectError(error.BadHost, c.send(.{ .headers = &.{.{ .name = "Host", .value = "a b" }} }));
+    try testing.expectEqualStrings("", h.sent());
+    try c.send(.{ .headers = &.{.{ .name = "Host", .value = "" }} });
 }
 
 test "a response with a length" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
 
         const res = (try c.receive()).?;
         try testing.expectEqual(@as(u16, 200), res.status());
@@ -842,7 +859,7 @@ test "a chunked response" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         _ = (try c.receive()).?;
         var buf: [64]u8 = undefined;
         try testing.expectEqualStrings("abcdefg", try c.readBody(&buf));
@@ -853,7 +870,7 @@ test "a response that runs until the connection closes" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.0 200 OK\r\n\r\neverything after the head");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         const res = (try c.receive()).?;
         try testing.expectEqual(body.Framing.until_close, res.framing);
         var buf: [64]u8 = undefined;
@@ -865,12 +882,12 @@ test "204 has no body even when it claims one" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         const first = (try c.receive()).?;
         try testing.expectEqual(@as(u16, 204), first.status());
         try testing.expectEqual(body.Framing.none, first.framing);
 
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         const second = (try c.receive()).?;
         try testing.expectEqual(@as(u16, 200), second.status());
     }
@@ -880,10 +897,10 @@ test "a HEAD response is not read as having a body" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
-        try c.send(.{ .method = "HEAD" });
+        try c.send(.{ .method = "HEAD", .headers = host });
         const first = (try c.receive()).?;
         try testing.expectEqual(body.Framing.none, first.framing);
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         const second = (try c.receive()).?;
         try testing.expectEqual(@as(u16, 200), second.status());
     }
@@ -893,14 +910,14 @@ test "two responses on one connection" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\naHTTP/1.1 404 Not Found\r\nContent-Length: 1\r\n\r\nb");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
 
         const first = (try c.receive()).?;
         try testing.expectEqual(@as(u16, 200), first.status());
         var buf: [8]u8 = undefined;
         try testing.expectEqualStrings("a", try c.readBody(&buf));
 
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         const second = (try c.receive()).?;
         try testing.expectEqual(@as(u16, 404), second.status());
         try testing.expectEqualStrings("b", try c.readBody(&buf));
@@ -915,9 +932,9 @@ test "an unread body is dropped before the next response" {
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloHTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
             .{ .max_drain = 64 * 1024 },
         );
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         _ = (try c.receive()).?;
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         const second = (try c.receive()).?;
         try testing.expectEqual(@as(u16, 404), second.status());
     }
@@ -927,10 +944,10 @@ test "a stale response is caught" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nHTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         const first = (try c.receive()).?;
         try testing.expect(first.live());
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         _ = (try c.receive()).?;
         try testing.expect(!first.live());
     }
@@ -940,7 +957,7 @@ test "garbage is not a response" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "this is not http\r\n\r\n");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         try testing.expectError(error.BadResponse, c.receive());
     }
 }
@@ -949,7 +966,7 @@ test "a clean close before any response" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         try testing.expectEqual(@as(?Response, null), try c.receive());
     }
 }
@@ -958,7 +975,7 @@ test "a smuggling response is refused" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         try testing.expectError(error.Ambiguous, c.receive());
     }
 }
@@ -967,7 +984,7 @@ test "a response says how long its body is" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         const res = (try c.receive()).?;
         try testing.expectEqual(@as(?u64, 5), res.contentLength());
         try testing.expect(res.hasBody());
@@ -978,7 +995,7 @@ test "a chunked response has no length to report" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var c = h.init(shape, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
-        try c.send(.{});
+        try c.send(.{ .headers = host });
         const res = (try c.receive()).?;
         try testing.expectEqual(@as(?u64, null), res.contentLength());
         try testing.expect(res.hasBody());
@@ -989,8 +1006,8 @@ test "a Connection: close we sent ends the connection" {
     var h: Harness = undefined;
     // The server doesn't have to say close back.
     var c = h.init(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-    try c.send(.{ .headers = &.{.{ .name = "Connection", .value = "close" }} });
+    try c.send(.{ .headers = &.{ .{ .name = "Host", .value = "x" }, .{ .name = "Connection", .value = "close" } } });
     _ = (try c.receive()).?;
     try testing.expect(!c.alive());
-    try testing.expectError(error.Closed, c.send(.{}));
+    try testing.expectError(error.Closed, c.send(.{ .headers = host }));
 }

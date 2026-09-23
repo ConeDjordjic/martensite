@@ -214,7 +214,7 @@ test "an adversarial peer gets one refusal and smuggles nothing" {
     const payloads = [_][]const u8{
         // Content-Length and Transfer-Encoding together.
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n" ++
-            "0\r\n\r\nGET /evil HTTP/1.1\r\n\r\n",
+            "0\r\n\r\nGET /evil HTTP/1.1\r\nHost: x\r\n\r\n",
         // Two lengths that disagree.
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\nContent-Length: 5\r\n\r\nhelloX",
         // A folded header hides a second one from the first reader.
@@ -302,7 +302,7 @@ test "keep-alive over a real socket" {
             const reply = out.ok(send(
                 inner,
                 address,
-                "GET /one HTTP/1.1\r\n\r\nGET /two HTTP/1.1\r\n\r\n",
+                "GET /one HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n",
                 &reply_buf,
             )) orelse return;
             out.expect(std.mem.indexOf(u8, reply, "/one") != null);
@@ -321,7 +321,7 @@ test "a chunked body over a real socket, arriving in pieces" {
             var writer = stream.writer(inner, &wbuf);
 
             const pieces = [_][]const u8{
-                "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
                 "5\r\nhello",
                 "\r\n6\r\n world",
                 "\r\n0\r\n\r\n",
@@ -348,7 +348,7 @@ test "a streamed response over a real socket" {
     try exchange(io, 39400, plainHandler, struct {
         fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
             var reply_buf: [4096]u8 = undefined;
-            const reply = out.ok(send(inner, address, "GET /stream HTTP/1.1\r\n\r\n", &reply_buf)) orelse return;
+            const reply = out.ok(send(inner, address, "GET /stream HTTP/1.1\r\nHost: x\r\n\r\n", &reply_buf)) orelse return;
             out.expect(std.mem.indexOf(u8, reply, "Transfer-Encoding: chunked") != null);
             out.expect(std.mem.endsWith(u8, reply, "0\r\n\r\n"));
             std.debug.assert(std.mem.indexOf(u8, reply, "0,1,2,3,4,") != null or
@@ -385,7 +385,7 @@ test "TimedReader reads a whole request, byte count and all" {
         fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
             var request: [2200]u8 = undefined;
             var w: Io.Writer = .fixed(&request);
-            _ = out.ok(w.writeAll("POST /upload HTTP/1.1\r\nContent-Length: 2000\r\n\r\n")) orelse return;
+            _ = out.ok(w.writeAll("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 2000\r\n\r\n")) orelse return;
             _ = out.ok(w.splatByteAll('z', 2000)) orelse return;
 
             var reply_buf: [1024]u8 = undefined;
@@ -458,7 +458,7 @@ test "TimedReader bounds the whole head as well as each read" {
             defer stream.close(inner);
             var wbuf: [512]u8 = undefined;
             var writer = stream.writer(inner, &wbuf);
-            _ = out.ok(writer.interface.writeAll("GET / HTTP/1.1\r\n")) orelse return;
+            _ = out.ok(writer.interface.writeAll("GET / HTTP/1.1\r\nHost: x\r\n")) orelse return;
             _ = out.ok(writer.interface.flush()) orelse return;
             // A header every 50ms and never finishing. The server hangs
             // up at 300ms, so a failed write from here is expected.
@@ -511,7 +511,7 @@ test "upgrade over a real socket keeps the early bytes" {
             const reply = out.ok(send(
                 inner,
                 address,
-                "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nEARLYFRAME",
+                "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nEARLYFRAME",
                 &reply_buf,
             )) orelse return;
             out.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 101 "));
@@ -530,7 +530,7 @@ test "100-continue over a real socket" {
             var writer = stream.writer(inner, &wbuf);
 
             _ = out.ok(writer.interface.writeAll(
-                "POST /echo HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n",
+                "POST /echo HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n",
             )) orelse return;
             _ = out.ok(writer.interface.flush()) orelse return;
 
@@ -614,12 +614,66 @@ test "the client reads a chunked response from the server" {
                 .head_buf = &head_buf,
             }) catch unreachable;
 
-            _ = out.ok(client.send(.{ .target = "/stream" })) orelse return;
+            _ = out.ok(client.send(.{ .target = "/stream", .headers = &.{.{ .name = "Host", .value = "x" }} })) orelse return;
             const res = (client.receive() catch return) orelse return;
             out.expect(std.mem.eql(u8, res.header("transfer-encoding").?, "chunked"));
             var buf: [256]u8 = undefined;
             const b = out.ok(client.readBody(&buf)) orelse return;
             out.expect(std.mem.eql(u8, b, "0,1,2,3,4,"));
+        }
+    }.f);
+}
+
+test "serve times out a quiet peer with a 408" {
+    const io = testing.io;
+    try exchange(io, 40400, struct {
+        fn f(inner: Io, stream: net.Stream) !void {
+            var read_buf: [4096]u8 = undefined;
+            var write_buf: [4096]u8 = undefined;
+            var headers: [32]martensite.Header = undefined;
+
+            var reader: TimedReader = .init(inner, stream, &read_buf, .{ .duration = seconds(5) });
+            var writer = stream.writer(inner, &write_buf);
+            var http: Server = try .init(inner, &reader.interface, &writer.interface, .{
+                .headers = &headers,
+                .failure = reader.failureSource(),
+            });
+            const Hello = struct {
+                pub fn handle(_: @This(), s: *Server, _: Server.Request) !void {
+                    try s.respond(.text(.ok, "hi"));
+                }
+            };
+            // Each read is allowed 5s, so only the head deadline can
+            // end this.
+            try testing.expectError(error.Timeout, http.serve(Hello{}, .{
+                .deadline = reader.deadlines(),
+                .head = .{ .duration = millis(300) },
+                .body = .{ .duration = seconds(5) },
+            }));
+        }
+    }.f, struct {
+        fn f(inner: Io, address: net.IpAddress, out: *Outcome) Io.Cancelable!void {
+            const stream = out.ok(address.connect(inner, .{ .mode = .stream })) orelse return;
+            defer stream.close(inner);
+            var wbuf: [512]u8 = undefined;
+            var writer = stream.writer(inner, &wbuf);
+            _ = out.ok(writer.interface.writeAll("GET / HTTP/1.1\r\nHost: x\r\n\r\n")) orelse return;
+            _ = out.ok(writer.interface.flush()) orelse return;
+
+            var rbuf: [1024]u8 = undefined;
+            var reader = stream.reader(inner, &rbuf);
+            // The first answer, then silence until the server gives up
+            // and says so.
+            var got: [1024]u8 = undefined;
+            var n: usize = 0;
+            while (n < got.len) {
+                const k = reader.interface.readSliceShort(got[n..]) catch break;
+                if (k == 0) break;
+                n += k;
+            }
+            const reply = got[0..n];
+            out.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 200 "));
+            out.expect(std.mem.indexOf(u8, reply, "HTTP/1.1 408 ") != null);
         }
     }.f);
 }

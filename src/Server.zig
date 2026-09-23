@@ -16,6 +16,7 @@ const Response = @import("Response.zig");
 const Message = @import("Message.zig");
 const field = @import("field.zig");
 const BodyWriter = @import("BodyWriter.zig");
+const serve_mod = @import("serve.zig");
 
 const Server = @This();
 
@@ -120,6 +121,9 @@ pub const ReceiveError = error{
     ResponseOpen,
     /// The request we have hasn't been answered. Answer it first.
     RequestUnanswered,
+    /// No Host on an HTTP/1.1 request, more than one, or one that isn't
+    /// a host and port.
+    BadHost,
     /// An Expect we don't support. Answer 417.
     UnsupportedExpectation,
     /// The head didn't fit, or it had too many headers.
@@ -161,6 +165,7 @@ pub fn receive(s: *Server) ReceiveError!?Request {
         return null;
     };
 
+    try field.checkHost(req.head.headers, req.head.minor_version >= 1);
     s.expect_continue = try Message.expectation(req.head.headers);
     s.method = scan.Method.parse(req.head.method);
     s.keep_alive = body.keepAlive(.of(req.head));
@@ -398,6 +403,10 @@ pub fn alive(s: *const Server) bool {
     return s.keep_alive and s.window.usable();
 }
 
+/// Runs the request loop for this connection. See `serve.zig`.
+pub const serve = serve_mod.serve;
+pub const ServeOptions = serve_mod.Options;
+
 /// Answers the handshake and stops speaking HTTP. The reader and writer
 /// are yours after this. It is `respond` with a check that the status
 /// really does switch.
@@ -494,7 +503,7 @@ test "one request and one response" {
 test "two requests on one connection" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+        var s = h.init(shape, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
 
         const first = (try s.receive()).?;
         try testing.expectEqualStrings("/a", first.target());
@@ -511,7 +520,7 @@ test "two requests on one connection" {
 test "a body with a length" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
 
         const req = (try s.receive()).?;
         try testing.expectEqual(@as(u64, 5), req.framing.length);
@@ -525,7 +534,7 @@ test "a body with a length" {
 test "a chunked body" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n");
+        var s = h.init(shape, "POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n");
 
         const req = (try s.receive()).?;
         var buf: [64]u8 = undefined;
@@ -537,7 +546,7 @@ test "a chunked body" {
 test "an unread body is dropped before the next request" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.initDraining(shape, "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n\r\n");
+        var s = h.initDraining(shape, "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
 
         _ = (try s.receive()).?;
         try s.respond(.{});
@@ -550,7 +559,7 @@ test "an unread body is dropped before the next request" {
 test "an unread chunked body is dropped too" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.initDraining(shape, "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+        var s = h.initDraining(shape, "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
 
         _ = (try s.receive()).?;
         try s.respond(.{});
@@ -563,7 +572,7 @@ test "an unread chunked body is dropped too" {
 test "connection close ends the loop" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET / HTTP/1.1\r\nConnection: close\r\n\r\nGET /again HTTP/1.1\r\n\r\n");
+        var s = h.init(shape, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nGET /again HTTP/1.1\r\nHost: x\r\n\r\n");
 
         _ = (try s.receive()).?;
         try testing.expect(!s.alive());
@@ -597,10 +606,45 @@ test "garbage is a bad request" {
     }
 }
 
+test "an HTTP/1.1 request needs exactly one good Host" {
+    const bad = [_][]const u8{
+        "GET / HTTP/1.1\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nHost: a\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nhost: b\r\n\r\n",
+        "GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a b\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a:\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a:x1\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: [::1\r\n\r\n",
+    };
+    for (shapes) |shape| for (bad) |input| {
+        var h: Harness = undefined;
+        var s = h.init(shape, input);
+        try testing.expectError(error.BadHost, s.receive());
+    };
+    try testing.expectEqual(Response.Status.bad_request, Response.Status.forError(error.BadHost));
+
+    const good = [_][]const u8{
+        "GET / HTTP/1.0\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost:\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: [::1]:80\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        // The target's authority wins, so Host doesn't have to match it.
+        "GET http://a/x HTTP/1.1\r\nHost: b\r\n\r\n",
+    };
+    for (shapes) |shape| for (good) |input| {
+        var h: Harness = undefined;
+        var s = h.init(shape, input);
+        _ = (try s.receive()).?;
+    };
+}
+
 test "ambiguous framing is refused before the handler sees it" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello");
         try testing.expectError(error.Ambiguous, s.receive());
     }
 }
@@ -608,7 +652,7 @@ test "ambiguous framing is refused before the handler sees it" {
 test "more headers than there is room for" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET / HTTP/1.1\r\n" ++ ("X: y\r\n" ** 20) ++ "\r\n");
+        var s = h.init(shape, "GET / HTTP/1.1\r\nHost: x\r\n" ++ ("X: y\r\n" ** 20) ++ "\r\n");
         try testing.expectError(error.HeadTooLarge, s.receive());
     }
 }
@@ -616,7 +660,7 @@ test "more headers than there is room for" {
 test "a body bigger than the caller's buffer" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\n" ++ ("x" ** 100));
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n" ++ ("x" ** 100));
         _ = (try s.receive()).?;
         var buf: [10]u8 = undefined;
         try testing.expectError(error.BodyTooLarge, s.readBody(&buf));
@@ -626,7 +670,7 @@ test "a body bigger than the caller's buffer" {
 test "a truncated body" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nshort");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nshort");
         _ = (try s.receive()).?;
         var buf: [64]u8 = undefined;
         try testing.expectError(error.Incomplete, s.readBody(&buf));
@@ -636,7 +680,7 @@ test "a truncated body" {
 test "the head survives reading the body" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST /the-target-here HTTP/1.1\r\nContent-Length: 20\r\n\r\n01234567890123456789");
+        var s = h.init(shape, "POST /the-target-here HTTP/1.1\r\nHost: x\r\nContent-Length: 20\r\n\r\n01234567890123456789");
 
         const req = (try s.receive()).?;
         var buf: [64]u8 = undefined;
@@ -649,7 +693,7 @@ test "the head survives reading the body" {
 test "the head survives reading a chunked body" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST /the-target-here HTTP/1.1\r\nTransfer-Encoding: chunked\r\nX-Tag: keepme\r\n\r\n14\r\n01234567890123456789\r\n0\r\n\r\n");
+        var s = h.init(shape, "POST /the-target-here HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nX-Tag: keepme\r\n\r\n14\r\n01234567890123456789\r\n0\r\n\r\n");
 
         const req = (try s.receive()).?;
         var buf: [64]u8 = undefined;
@@ -662,7 +706,7 @@ test "the head survives reading a chunked body" {
 test "a body with nowhere to keep the head" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.initWith(shape, "POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi", .{ .keep_head = false });
+        var s = h.initWith(shape, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi", .{ .keep_head = false });
         try testing.expectError(error.HeadTooLarge, s.receive());
     }
 }
@@ -680,7 +724,7 @@ test "no body means no copy and no head_buf needed" {
 test "a request knows when it is no longer the current one" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+        var s = h.init(shape, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
 
         const first = (try s.receive()).?;
         try testing.expect(first.live());
@@ -696,7 +740,7 @@ test "a request knows when it is no longer the current one" {
 test "streaming a body with a length" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello world");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world");
         _ = (try s.receive()).?;
 
         var sink: [64]u8 = undefined;
@@ -711,7 +755,7 @@ test "streaming a body with a length" {
 test "streaming a chunked body" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n");
         _ = (try s.receive()).?;
 
         var sink: [64]u8 = undefined;
@@ -726,7 +770,7 @@ test "streaming a chunked body" {
 test "streaming into something with no buffer of its own" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n");
         _ = (try s.receive()).?;
 
         var counter: Io.Writer.Discarding = .init(&.{});
@@ -740,7 +784,7 @@ test "streaming into something with no buffer of its own" {
 test "a scratch barely big enough" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n");
         _ = (try s.receive()).?;
 
         var sink: [64]u8 = undefined;
@@ -756,7 +800,7 @@ test "streaming a body bigger than any buffer here" {
     const chunk = "0123456789" ** 100;
     const total = 200;
     var calls: [total + 1]std.testing.Reader.Call = undefined;
-    calls[0] = .{ .buffer = "POST / HTTP/1.1\r\nContent-Length: 200000\r\n\r\n" };
+    calls[0] = .{ .buffer = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 200000\r\n\r\n" };
     for (calls[1..]) |*c| c.* = .{ .buffer = chunk };
 
     var buf: [256]u8 = undefined;
@@ -783,7 +827,7 @@ test "streaming a body bigger than any buffer here" {
 test "a truncated body reports why" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nContent-Length: 50\r\n\r\nshort");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 50\r\n\r\nshort");
         _ = (try s.receive()).?;
 
         var sink: [64]u8 = undefined;
@@ -798,7 +842,7 @@ test "a truncated body reports why" {
 test "a bad chunk reports why" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\nabc\r\n0\r\n\r\n");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\nabc\r\n0\r\n\r\n");
         _ = (try s.receive()).?;
 
         var sink: [64]u8 = undefined;
@@ -813,7 +857,7 @@ test "a bad chunk reports why" {
 test "streaming leaves the connection on the next request" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n\r\n");
+        var s = h.init(shape, "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
         _ = (try s.receive()).?;
 
         var sink: [64]u8 = undefined;
@@ -832,7 +876,7 @@ test "streaming leaves the connection on the next request" {
 test "100 Continue goes out when the body is read" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello");
 
         const req = (try s.receive()).?;
         try testing.expect(req.expectsContinue());
@@ -849,7 +893,7 @@ test "100 Continue goes out when the body is read" {
 test "100 Continue is not sent when the body is refused" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello");
 
         const req = (try s.receive()).?;
         try testing.expect(req.expectsContinue());
@@ -863,7 +907,7 @@ test "100 Continue is not sent when the body is refused" {
 test "an expectation we do not know is a 417" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nExpect: something-else\r\nContent-Length: 5\r\n\r\nhello");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nExpect: something-else\r\nContent-Length: 5\r\n\r\nhello");
         try testing.expectError(error.UnsupportedExpectation, s.receive());
     }
 }
@@ -871,7 +915,7 @@ test "an expectation we do not know is a 417" {
 test "no Expect means no continue" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
         const req = (try s.receive()).?;
         try testing.expect(!req.expectsContinue());
         var buf: [64]u8 = undefined;
@@ -883,7 +927,7 @@ test "no Expect means no continue" {
 test "streaming sends the continue too" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
         _ = (try s.receive()).?;
 
         var sink: [64]u8 = undefined;
@@ -899,7 +943,7 @@ test "streaming sends the continue too" {
 test "a streamed response is chunked when the length is unknown" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET / HTTP/1.1\r\n\r\n");
+        var s = h.init(shape, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
         _ = (try s.receive()).?;
 
         var scratch: [64]u8 = undefined;
@@ -918,7 +962,7 @@ test "a streamed response is chunked when the length is unknown" {
 test "a streamed response with a known length is not chunked" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET / HTTP/1.1\r\n\r\n");
+        var s = h.init(shape, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
         _ = (try s.receive()).?;
 
         var scratch: [64]u8 = undefined;
@@ -935,7 +979,7 @@ test "a streamed response with a known length is not chunked" {
 
 test "writing more than the promised length is refused" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     var scratch: [4]u8 = undefined;
@@ -945,7 +989,7 @@ test "writing more than the promised length is refused" {
 
 test "stopping short of the promised length is refused" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     var scratch: [64]u8 = undefined;
@@ -958,7 +1002,7 @@ test "stopping short of the promised length is refused" {
 test "a streamed response survives a keep-alive connection" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+        var s = h.init(shape, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
         _ = (try s.receive()).?;
 
         var scratch: [64]u8 = undefined;
@@ -974,7 +1018,7 @@ test "a streamed response survives a keep-alive connection" {
 test "HEAD gets the headers and none of the body" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "HEAD /thing HTTP/1.1\r\n\r\n");
+        var s = h.init(shape, "HEAD /thing HTTP/1.1\r\nHost: x\r\n\r\n");
         _ = (try s.receive()).?;
         try s.respond(Response.text(.ok, "twelve bytes"));
 
@@ -988,7 +1032,7 @@ test "HEAD gets the headers and none of the body" {
 test "a streamed body is dropped for HEAD" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "HEAD / HTTP/1.1\r\n\r\n");
+        var s = h.init(shape, "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
         _ = (try s.receive()).?;
 
         var scratch: [64]u8 = undefined;
@@ -1003,7 +1047,7 @@ test "a streamed body is dropped for HEAD" {
 
 test "many small writes become many chunks" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     // No buffer, so every write becomes its own chunk.
@@ -1017,7 +1061,7 @@ test "many small writes become many chunks" {
 test "an upgrade request is recognised" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+        var s = h.init(shape, "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
         const req = (try s.receive()).?;
         try testing.expectEqualStrings("websocket", req.upgradeTo().?);
     }
@@ -1026,7 +1070,7 @@ test "an upgrade request is recognised" {
 test "Upgrade without Connection: upgrade is not one" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET / HTTP/1.1\r\nUpgrade: websocket\r\n\r\n");
+        var s = h.init(shape, "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n");
         const req = (try s.receive()).?;
         try testing.expectEqual(@as(?[]const u8, null), req.upgradeTo());
     }
@@ -1035,7 +1079,7 @@ test "Upgrade without Connection: upgrade is not one" {
 test "Connection: keep-alive, Upgrade counts" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET / HTTP/1.1\r\nConnection: keep-alive, Upgrade\r\nUpgrade: h2c\r\n\r\n");
+        var s = h.init(shape, "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, Upgrade\r\nUpgrade: h2c\r\n\r\n");
         const req = (try s.receive()).?;
         try testing.expectEqualStrings("h2c", req.upgradeTo().?);
     }
@@ -1044,7 +1088,7 @@ test "Connection: keep-alive, Upgrade counts" {
 test "upgrading hands the connection over" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nFRAMEBYTES");
+        var s = h.init(shape, "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nFRAMEBYTES");
 
         const req = (try s.receive()).?;
         try testing.expectEqualStrings("websocket", req.upgradeTo().?);
@@ -1076,7 +1120,7 @@ test "upgrading hands the connection over" {
 test "the target comes apart" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET /users/7?tab=posts&page=2 HTTP/1.1\r\n\r\n");
+        var s = h.init(shape, "GET /users/7?tab=posts&page=2 HTTP/1.1\r\nHost: x\r\n\r\n");
         const req = (try s.receive()).?;
         const t = req.parsedTarget().?;
         try testing.expectEqualStrings("/users/7", t.path);
@@ -1091,7 +1135,7 @@ test "the target comes apart" {
 test "repeated headers all come back" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "GET / HTTP/1.1\r\nAccept: a\r\nX: 1\r\nAccept: b\r\n\r\n");
+        var s = h.init(shape, "GET / HTTP/1.1\r\nHost: x\r\nAccept: a\r\nX: 1\r\nAccept: b\r\n\r\n");
         const req = (try s.receive()).?;
 
         var it = req.headerIter("accept");
@@ -1104,7 +1148,7 @@ test "repeated headers all come back" {
 test "the method comes back as an enum when it is one we name" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "PROPFIND / HTTP/1.1\r\n\r\n");
+        var s = h.init(shape, "PROPFIND / HTTP/1.1\r\nHost: x\r\n\r\n");
         const req = (try s.receive()).?;
         try testing.expectEqual(@as(?scan.Method, null), req.knownMethod());
         try testing.expectEqualStrings("PROPFIND", req.method());
@@ -1116,7 +1160,7 @@ test "request trailers" {
         var h: Harness = undefined;
         var s = h.init(
             shape,
-            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sum\r\n\r\n" ++
+            "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sum\r\n\r\n" ++
                 "5\r\nhello\r\n0\r\nX-Sum: 42\r\nX-Other: y\r\n\r\n",
         );
         _ = (try s.receive()).?;
@@ -1137,7 +1181,7 @@ test "trailers are borrowed from the caller's trailer_buf" {
     var h: Harness = undefined;
     var s = h.init(
         .whole,
-        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
             "5\r\nhello\r\n0\r\nX-Sum: 42\r\n\r\n",
     );
     _ = (try s.receive()).?;
@@ -1160,7 +1204,7 @@ test "a trailer block bigger than storage is TooManyHeaders" {
     var h: Harness = undefined;
     var s = h.init(
         .whole,
-        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
             "0\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n",
     );
     _ = (try s.receive()).?;
@@ -1175,8 +1219,8 @@ test "a refused Expect does not carry the last request's HEAD over" {
     var h: Harness = undefined;
     var s = h.init(
         .whole,
-        "HEAD /a HTTP/1.1\r\n\r\n" ++
-            "POST /b HTTP/1.1\r\nContent-Length: 2\r\nExpect: something-else\r\n\r\nhi",
+        "HEAD /a HTTP/1.1\r\nHost: x\r\n\r\n" ++
+            "POST /b HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nExpect: something-else\r\n\r\nhi",
     );
     _ = (try s.receive()).?;
     try s.respond(.text(.ok, "twelve bytes"));
@@ -1190,7 +1234,7 @@ test "a refused Expect does not carry the last request's HEAD over" {
 
 test "a second request before the first is answered is refused" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
     const first = (try s.receive()).?;
     try testing.expectEqualStrings("/a", first.target());
 
@@ -1206,7 +1250,7 @@ test "a second request before the first is answered is refused" {
 test "what the request asked for outlives the 100 we sent" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
         const req = (try s.receive()).?;
         try testing.expect(req.expectsContinue());
 
@@ -1221,7 +1265,7 @@ test "what the request asked for outlives the 100 we sent" {
 test "a body can only be handed out once" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\n\r\n");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\nHost: x\r\n\r\n");
         _ = (try s.receive()).?;
 
         var scratch: [16]u8 = undefined;
@@ -1245,7 +1289,7 @@ test "a body can only be handed out once" {
 
 test "reading the body twice is refused" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
     _ = (try s.receive()).?;
 
     var buf: [64]u8 = undefined;
@@ -1255,7 +1299,7 @@ test "reading the body twice is refused" {
 
 test "a streamed body reaches the peer before it ends" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     var scratch: [64]u8 = undefined;
@@ -1282,7 +1326,7 @@ test "what a connection costs, apart from its buffers" {
 
 test "a splat through a streamed body" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     var scratch: [64]u8 = undefined;
@@ -1310,8 +1354,8 @@ test "a chunked body that does not fit ends the connection" {
         // be read from a position nobody can account for.
         var s = h.initDraining(
             shape,
-            "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
-                "10\r\nAAAAAAAAAAAAAAAA\r\n0\r\n\r\nGET /evil HTTP/1.1\r\n\r\n",
+            "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+                "10\r\nAAAAAAAAAAAAAAAA\r\n0\r\n\r\nGET /evil HTTP/1.1\r\nHost: x\r\n\r\n",
         );
         _ = (try s.receive()).?;
 
@@ -1328,7 +1372,7 @@ test "a chunked body that does not fit ends the connection" {
 
 test "a HEAD drops trailers with the body it describes" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "HEAD / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     var scratch: [64]u8 = undefined;
@@ -1346,7 +1390,7 @@ test "a HEAD drops trailers with the body it describes" {
 
 test "trailers on a counted body have nowhere to go" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     var scratch: [64]u8 = undefined;
@@ -1358,7 +1402,7 @@ test "trailers on a counted body have nowhere to go" {
 test "a chunked body that exactly fits is not too large" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
         _ = (try s.receive()).?;
 
         // 5 bytes of body, 5 bytes of buffer. The terminator is still
@@ -1374,8 +1418,8 @@ test "a body left unfinished ends the connection, whatever stopped it" {
         var h: Harness = undefined;
         var s = h.initDraining(
             shape,
-            "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
-                "10\r\nAAAAAAAAAAAAAAAA\r\n0\r\n\r\nGET /evil HTTP/1.1\r\n\r\n",
+            "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+                "10\r\nAAAAAAAAAAAAAAAA\r\n0\r\n\r\nGET /evil HTTP/1.1\r\nHost: x\r\n\r\n",
         );
         _ = (try s.receive()).?;
 
@@ -1402,9 +1446,9 @@ test "every body reader needs somewhere to buffer" {
     // whatever the framing is, and an unbuffered `Io.Reader` panics
     // inside std on the first take.
     for ([_][]const u8{
-        "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello",
-        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n",
-        "POST / HTTP/1.1\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\n\r\n",
     }) |input| {
         var h: Harness = undefined;
         var s = h.init(.whole, input);
@@ -1418,7 +1462,7 @@ test "every body reader needs somewhere to buffer" {
 
 test "a counted body takes what it is given as buffer" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
     _ = (try s.receive()).?;
 
     var tiny: [2]u8 = undefined;
@@ -1434,7 +1478,7 @@ test "an upgrade the writer cannot hold ends the connection" {
     var h: Harness = undefined;
     var s = h.initTight(
         .whole,
-        "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nEARLYFRAME",
+        "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nEARLYFRAME",
     );
     const req = (try s.receive()).?;
     try testing.expectEqualStrings("websocket", req.upgradeTo().?);
@@ -1448,7 +1492,7 @@ test "an upgrade the writer cannot hold ends the connection" {
 
 test "answering settles the continue we owed" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
     _ = (try s.receive()).?;
 
     try s.respond(.{ .status = .payload_too_large, .keep_alive = false });
@@ -1467,7 +1511,7 @@ test "no trailer_buf drops trailers rather than failing" {
         // Nobody asked for room, so the trailers get dropped.
         var s = h.initWith(
             shape,
-            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\nX: y\r\n\r\n",
+            "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\nX: y\r\n\r\n",
             .{ .keep_trailers = false },
         );
         _ = (try s.receive()).?;
@@ -1483,7 +1527,7 @@ test "no trailer_buf drops trailers rather than failing" {
 
 test "a body too large for the buffer may be asked for again" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
     _ = (try s.receive()).?;
 
     var small: [2]u8 = undefined;
@@ -1494,7 +1538,7 @@ test "a body too large for the buffer may be asked for again" {
 
 test "a sink that kept some of it and then gave out breaks the body" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcdefgh\r\n0\r\n\r\n");
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcdefgh\r\n0\r\n\r\n");
     _ = (try s.receive()).?;
 
     var small: [2]u8 = undefined;
@@ -1512,7 +1556,7 @@ test "a sink that kept some of it and then gave out breaks the body" {
 
 test "a counted body into a sink that gave out partway" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 8\r\n\r\nabcdefgh");
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\n\r\nabcdefgh");
     _ = (try s.receive()).?;
 
     var small: [2]u8 = undefined;
@@ -1547,8 +1591,8 @@ const HalfThenBroken = struct {
 
 test "a sink with no buffer can still have kept a prefix" {
     for ([_][]const u8{
-        "POST / HTTP/1.1\r\nContent-Length: 8\r\n\r\nabcdefgh",
-        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcdefgh\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\n\r\nabcdefgh",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcdefgh\r\n0\r\n\r\n",
     }) |input| {
         var h: Harness = undefined;
         var s = h.init(.whole, input);
@@ -1571,7 +1615,7 @@ test "a sink with no buffer can still have kept a prefix" {
 
 test "a counted body into a sink that takes nothing" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 8\r\n\r\nabcdefgh");
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\n\r\nabcdefgh");
     _ = (try s.receive()).?;
 
     var scratch: [8]u8 = undefined;
@@ -1589,7 +1633,7 @@ test "a counted body into a sink that takes nothing" {
 
 test "a sink that takes nothing leaves the body where it was" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nAAAAAAAA\r\n0\r\n\r\n");
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nAAAAAAAA\r\n0\r\n\r\n");
     _ = (try s.receive()).?;
 
     var scratch: [16]u8 = undefined;
@@ -1612,7 +1656,7 @@ test "looking for a delimiter that is not there leaves the body readable" {
     var h: Harness = undefined;
     var s = h.init(
         .whole,
-        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nc\r\nline one two\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nc\r\nline one two\r\n0\r\n\r\n",
     );
     _ = (try s.receive()).?;
 
@@ -1632,8 +1676,8 @@ test "a body read partway cannot be drained past" {
     var h: Harness = undefined;
     // A 0x20-byte chunk whose contents look like the end of a body
     // followed by another request.
-    var s = h.initDraining(.whole, "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
-        "20\r\nAAAA0\r\n\r\nGET /evil HTTP/1.1\r\n\r\nA\r\n0\r\n\r\n");
+    var s = h.initDraining(.whole, "POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "20\r\nAAAA0\r\n\r\nGET /evil HTTP/1.1\r\nHost: x\r\n\r\nA\r\n0\r\n\r\n");
     _ = (try s.receive()).?;
 
     var out: [64]u8 = undefined;
@@ -1655,7 +1699,7 @@ test "a counted body read partway is not discarded by its old length" {
     var h: Harness = undefined;
     var s = h.initDraining(
         .whole,
-        "POST /a HTTP/1.1\r\nContent-Length: 10\r\n\r\n0123456789GET /b HTTP/1.1\r\n\r\n",
+        "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n0123456789GET /b HTTP/1.1\r\nHost: x\r\n\r\n",
     );
     _ = (try s.receive()).?;
 
@@ -1674,7 +1718,7 @@ test "a counted body read partway is not discarded by its old length" {
 
 test "a body read to its end still leaves the connection usable" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     var out: [8]u8 = undefined;
@@ -1693,7 +1737,7 @@ test "a body read to its end still leaves the connection usable" {
 test "the body reader works with buffered reader calls" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nc\r\nline\none\ntwo\r\n0\r\n\r\n");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nc\r\nline\none\ntwo\r\n0\r\n\r\n");
         _ = (try s.receive()).?;
 
         var scratch: [64]u8 = undefined;
@@ -1711,7 +1755,7 @@ test "the body reader works with buffered reader calls" {
 test "a chunked body streamed in small bites" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
             "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
         _ = (try s.receive()).?;
 
@@ -1736,7 +1780,7 @@ test "a chunked body streamed in small bites" {
 
 test "a streamed response cannot contradict its own head" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     // A caller-supplied length with a chunked writer. The peer would
@@ -1755,7 +1799,7 @@ test "a streamed response cannot contradict its own head" {
 
 test "a response refused before it is written leaves the request answerable" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     try testing.expectError(error.InvalidHeader, s.respond(.{
@@ -1770,7 +1814,7 @@ test "a response refused before it is written leaves the request answerable" {
 
 test "a 101 refused before the handover leaves the request answerable" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+    var s = h.init(.whole, "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
     _ = (try s.receive()).?;
 
     try testing.expectError(error.InvalidHeader, s.upgrade(.{
@@ -1832,7 +1876,7 @@ test "a successful CONNECT gets no body and is handed over" {
 
 test "a HEAD still describes the body it does not send" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "HEAD / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     try s.respond(.text(.ok, "twelve bytes"));
@@ -1878,7 +1922,7 @@ test "a CONNECT that failed answers like anything else" {
 
 test "a status the Scanner could not read back is not written" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     // Three digits and a space is what `scan.response` accepts.
@@ -1893,7 +1937,7 @@ test "a status the Scanner could not read back is not written" {
 test "no trailers is an empty slice" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n");
         _ = (try s.receive()).?;
         var buf: [64]u8 = undefined;
         _ = try s.readBody(&buf);
@@ -1904,7 +1948,7 @@ test "no trailers is an empty slice" {
 
 test "writing trailers on a streamed response" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     var scratch: [64]u8 = undefined;
@@ -1920,7 +1964,7 @@ test "writing trailers on a streamed response" {
 test "a trailer that would change the framing is refused" {
     for ([_][]const u8{ "Content-Length", "Transfer-Encoding", "Connection", "Host" }) |name| {
         var h: Harness = undefined;
-        var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+        var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
         _ = (try s.receive()).?;
 
         var scratch: [64]u8 = undefined;
@@ -1940,7 +1984,7 @@ test "a trailer that would change the framing is refused" {
 
 test "a refused trailer leaves the writer finished" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     var scratch: [64]u8 = undefined;
@@ -1955,7 +1999,7 @@ test "a refused trailer leaves the writer finished" {
 
 test "a second request is refused while a streamed response is open" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     var scratch: [64]u8 = undefined;
@@ -1973,7 +2017,7 @@ test "a second request is refused while a streamed response is open" {
 
 test "end after an overrun is refused" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     var scratch: [4]u8 = undefined;
@@ -1987,7 +2031,7 @@ test "end after an overrun is refused" {
 
 test "a Date header when one is asked for" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     var date: DateHeader = .{};
     s.date = &date;
     _ = (try s.receive()).?;
@@ -2000,7 +2044,7 @@ test "a Date header when one is asked for" {
 
 test "no Date unless one is asked for" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
     try s.respond(.text(.ok, "hi"));
     try testing.expect(std.mem.indexOf(u8, h.written(), "Date:") == null);
@@ -2008,7 +2052,7 @@ test "no Date unless one is asked for" {
 
 test "a caller's own Date is left alone" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     var date: DateHeader = .{};
     s.date = &date;
     _ = (try s.receive()).?;
@@ -2022,7 +2066,7 @@ test "a caller's own Date is left alone" {
 
 test "a streamed response gets a Date too" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     var date: DateHeader = .{};
     s.date = &date;
     _ = (try s.receive()).?;
@@ -2043,7 +2087,7 @@ test "a head sent together with a body that fills the buffer" {
     const body_len = 4000;
     var input: [4200]u8 = undefined;
     var w: Io.Writer = .fixed(&input);
-    try w.print("POST /upload HTTP/1.1\r\nContent-Length: {d}\r\n\r\n", .{body_len});
+    try w.print("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\n\r\n", .{body_len});
     try w.splatByteAll('x', body_len);
 
     var buf: [512]u8 = undefined;
@@ -2069,7 +2113,7 @@ test "a head sent together with a body that fills the buffer" {
 }
 
 test "a head that genuinely does not fit is still refused" {
-    const long = "GET / HTTP/1.1\r\n" ++ ("X-Padding-Header: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n" ** 40) ++ "\r\n";
+    const long = "GET / HTTP/1.1\r\nHost: x\r\n" ++ ("X-Padding-Header: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n" ** 40) ++ "\r\n";
     var buf: [256]u8 = undefined;
     var src: std.testing.Reader = .init(&buf, &.{.{ .buffer = long }});
     var out: [256]u8 = undefined;
@@ -2103,7 +2147,7 @@ test "an unread body is never scanned as the next request" {
 
 test "a response the writer cannot hold ends the connection" {
     var h: Harness = undefined;
-    var s = h.initTight(.whole, "GET /hi HTTP/1.1\r\nHost: x\r\n\r\nGET /next HTTP/1.1\r\n\r\n");
+    var s = h.initTight(.whole, "GET /hi HTTP/1.1\r\nHost: x\r\n\r\nGET /next HTTP/1.1\r\nHost: x\r\n\r\n");
 
     const req = (try s.receive()).?;
     try testing.expectEqualStrings("/hi", req.target());
@@ -2118,7 +2162,7 @@ test "a response the writer cannot hold ends the connection" {
 
 test "a streamed head the writer cannot hold ends the connection" {
     var h: Harness = undefined;
-    var s = h.initTight(.whole, "GET /hi HTTP/1.1\r\n\r\n");
+    var s = h.initTight(.whole, "GET /hi HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     var scratch: [32]u8 = undefined;
@@ -2130,7 +2174,7 @@ test "a 100 Continue that cannot be written ends the connection" {
     var h: Harness = undefined;
     var s = h.initTight(
         .whole,
-        "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi",
+        "POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi",
     );
     _ = (try s.receive()).?;
 
@@ -2280,7 +2324,7 @@ test "a request with no body reports neither" {
 }
 
 test "an upgrade with the request body still in the way" {
-    const input = "POST /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: h2c\r\nContent-Length: 5\r\n\r\nhelloFRAME";
+    const input = "POST /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: h2c\r\nContent-Length: 5\r\n\r\nhelloFRAME";
     const switching: Response = .{
         .status = .switching_protocols,
         .headers = &.{ .{ .name = "Upgrade", .value = "h2c" }, .{ .name = "Connection", .value = "Upgrade" } },
@@ -2311,7 +2355,7 @@ test "an upgrade with the request body still in the way" {
 
 test "an upgrade needs a status that switches" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+    var s = h.init(.whole, "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
     _ = (try s.receive()).?;
 
     try testing.expectError(error.NotSwitching, s.upgrade(.{ .status = .ok }));
@@ -2322,7 +2366,7 @@ test "an upgrade needs a status that switches" {
 
 test "a 101 through respond hands the connection over too" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET /ws HTTP/1.1\r\nConnection: Upgrade, close\r\nUpgrade: websocket\r\n\r\n");
+    var s = h.init(.whole, "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade, close\r\nUpgrade: websocket\r\n\r\n");
     _ = (try s.receive()).?;
 
     try s.respond(.{ .status = .switching_protocols });
@@ -2334,7 +2378,7 @@ test "a 101 through respond hands the connection over too" {
 test "no 100 Continue before a read that is going to be refused" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        var s = h.init(shape, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello");
+        var s = h.init(shape, "POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello");
         _ = (try s.receive()).?;
 
         var small: [2]u8 = undefined;
@@ -2352,7 +2396,7 @@ test "every error a server hands you has a status on purpose" {
     // `forError` falls back to 500 for anything it doesn't know. That is
     // the right answer for most of these, but it should be a decision,
     // so a new error fails here until it gets a line in `named`.
-    const sets = .{ ReceiveError, ReadBodyError, HeadWindow.BodyReaderError, UpgradeError, StreamError, BodyWriter.EndError };
+    const sets = .{ ReceiveError, ReadBodyError, HeadWindow.BodyReaderError, UpgradeError, StreamError, BodyWriter.EndError, serve_mod.Error };
     inline for (sets) |Set| {
         inline for (@typeInfo(Set).error_set.?) |e| {
             if (Response.Status.named(@field(anyerror, e.name)) == null) {
@@ -2365,7 +2409,7 @@ test "every error a server hands you has a status on purpose" {
 
 test "a Connection: close the caller wrote ends the connection and goes out once" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+    var s = h.init(.whole, "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
     _ = (try s.receive()).?;
 
     try s.respond(.{ .headers = &.{.{ .name = "Connection", .value = "close" }} });
@@ -2377,7 +2421,7 @@ test "a Connection: close the caller wrote ends the connection and goes out once
 }
 
 test "an unread body the drain won't take makes the response say close" {
-    const input = "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n\r\n";
+    const input = "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
     for (shapes) |shape| {
         var h: Harness = undefined;
         var s = h.init(shape, input);
@@ -2406,7 +2450,7 @@ test "an unread body the drain won't take makes the response say close" {
 
 test "a body being streamed back doesn't make the response say close" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
     _ = (try s.receive()).?;
 
     var decode: [64]u8 = undefined;
@@ -2424,7 +2468,7 @@ test "a 103 goes out ahead of the real response" {
         var h: Harness = undefined;
         // Asking to close doesn't stop the real response coming after
         // the hint.
-        var s = h.init(shape, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+        var s = h.init(shape, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         _ = (try s.receive()).?;
 
         var scratch: [64]u8 = undefined;
@@ -2446,7 +2490,7 @@ test "a 103 goes out ahead of the real response" {
 
 test "a 100 sent by hand is the one we owed" {
     var h: Harness = undefined;
-    var s = h.init(.whole, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
     _ = (try s.receive()).?;
 
     try s.respond(.{ .status = .@"continue" });

@@ -51,56 +51,48 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
         .failure = reader.failureSource(),
     }) catch return;
 
-    while (true) {
-        // This one is for the whole head, not for a single read.
-        reader.startDeadline(.{ .duration = seconds(10) });
+    var app: App = .{ .reader = &reader };
+    http.serve(&app, .{
+        .deadline = reader.deadlines(),
+        // For the whole head, not for a single read.
+        .head = .{ .duration = seconds(10) },
+        .body = .{ .duration = seconds(30) },
+    }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        // The peer already got whatever it was owed, so all that is
+        // left is closing the connection.
+        else => return,
+    };
+}
 
-        const req = http.receive() catch |err| {
-            _ = http.respond(errorResponse(err)) catch {};
-            return;
-        } orelse return;
+const App = struct {
+    reader: *martensite.TimedReader,
 
+    pub fn handle(app: *App, http: *martensite.Server, req: martensite.Server.Request) !void {
         // Any size of body, without holding it in memory.
         if (std.mem.eql(u8, req.target(), "/drain")) {
-            reader.startDeadline(.{ .duration = seconds(60) });
+            app.reader.startDeadline(.{ .duration = seconds(60) });
             var counter: Io.Writer.Discarding = .init(&.{});
             var scratch: [4096]u8 = undefined;
-            var b = http.bodyReader(&scratch) catch return;
-            _ = b.interface.streamRemaining(&counter.writer) catch {
-                _ = http.respond(.{ .status = .bad_request, .keep_alive = false }) catch {};
-                return;
-            };
+            var b = try http.bodyReader(&scratch);
+            _ = b.interface.streamRemaining(&counter.writer) catch return error.BadRequest;
             var line: [64]u8 = undefined;
             const text = std.fmt.bufPrint(&line, "{d} bytes\n", .{counter.count}) catch "counted\n";
-            http.respond(.text(.ok, text)) catch return;
-            if (!http.alive()) return;
-            continue;
+            return http.respond(.text(.ok, text));
         }
 
-        reader.startDeadline(.{ .duration = seconds(30) });
-
+        // A body that doesn't fit is a 413 without anything more here.
         var body_buf: [64 * 1024]u8 = undefined;
-        const body = http.readBody(&body_buf) catch |err| {
-            _ = http.respond(errorResponse(err)) catch {};
-            return;
-        };
+        const body = try http.readBody(&body_buf);
 
         const res: martensite.Response = if (std.mem.eql(u8, req.target(), "/echo"))
             .text(.ok, body)
         else
             .text(.ok, "hello\n");
-
-        http.respond(res) catch return;
-        if (!http.alive()) return;
+        try http.respond(res);
     }
-}
+};
 
 fn seconds(n: i64) Io.Clock.Duration {
     return .{ .raw = .fromSeconds(n), .clock = .awake };
-}
-
-fn errorResponse(err: anyerror) martensite.Response {
-    // The library already knows which rejection is which. All we add
-    // here is the decision to close, which all of them imply anyway.
-    return .{ .status = .forError(err), .keep_alive = false };
 }

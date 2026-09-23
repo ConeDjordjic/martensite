@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const scan = @import("scan.zig");
+const field = @import("field.zig");
 
 pub const Framing = union(enum) {
     none,
@@ -236,36 +237,49 @@ pub const Connection = struct {
 
 /// Whether the connection can carry another message after this one.
 pub fn keepAlive(c: Connection) bool {
-    if (connectionHas(c, "close")) return false;
+    if (connectionHas(c, "close") or connectionMalformed(c)) return false;
     if (connectionHas(c, "keep-alive")) return true;
     return c.minor_version >= 1;
 }
 
-/// Whether Connection lists `token`. It is comma separated, so a plain
-/// substring search would find "close" inside "not-close".
+/// Whether Connection lists `token`. It is a list, so a plain substring
+/// search would find "close" inside "not-close".
 pub fn connectionHas(c: Connection, token: []const u8) bool {
     for (c.headers) |h| {
         if (!eqlIgnoreCase(h.name, "connection")) continue;
-        var it = std.mem.splitScalar(u8, h.value, ',');
-        while (it.next()) |raw| {
-            if (eqlIgnoreCase(std.mem.trim(u8, raw, " \t"), token)) return true;
+        var items = field.list(h.value);
+        while (items.next() catch null) |item| {
+            if (eqlIgnoreCase(item.token, token)) return true;
         }
     }
     return false;
 }
 
-/// chunked has to be last and can only appear once.
-fn endsWithChunked(value: []const u8) bool {
-    var last: []const u8 = "";
-    var count: usize = 0;
-    var it = std.mem.splitScalar(u8, value, ',');
-    while (it.next()) |raw| {
-        const token = std.mem.trim(u8, raw, " \t");
-        if (token.len == 0) continue;
-        if (eqlIgnoreCase(token, "chunked")) count += 1;
-        last = token;
+/// A Connection we can't read might have said close, so `keepAlive`
+/// treats it as if it did.
+fn connectionMalformed(c: Connection) bool {
+    for (c.headers) |h| {
+        if (!eqlIgnoreCase(h.name, "connection")) continue;
+        var items = field.list(h.value);
+        while (items.next() catch return true) |_| {}
     }
-    return count == 1 and eqlIgnoreCase(last, "chunked");
+    return false;
+}
+
+/// chunked has to be last and can only appear once. A coding with a
+/// value, or a value we can't read, is refused.
+fn endsWithChunked(value: []const u8) bool {
+    var last: ?field.List.Item = null;
+    var count: usize = 0;
+    var items = field.list(value);
+    while (items.next() catch return false) |item| {
+        if (item.value.len != 0) return false;
+        if (eqlIgnoreCase(item.token, "chunked")) count += 1;
+        last = item;
+    }
+    const l = last orelse return false;
+    // chunked takes no parameters.
+    return count == 1 and eqlIgnoreCase(l.token, "chunked") and l.raw_params.len == 0;
 }
 
 /// Digits only. Two parsers reading a Content-Length differently is how
@@ -364,6 +378,28 @@ test "chunked must be last" {
     )));
 }
 
+test "a Transfer-Encoding that only looks like it ends in chunked" {
+    var h: [8]scan.Header = undefined;
+    for ([_][]const u8{
+        "chunked;x=1",
+        "gzip;x=\"1, chunked\"",
+        "gzip=1, chunked",
+        "gzip, \"chunked\"",
+        "gzip x, chunked",
+    }) |te| {
+        var buf: [128]u8 = undefined;
+        const bytes = try std.fmt.bufPrint(&buf, "POST / HTTP/1.1\r\nTransfer-Encoding: {s}\r\n\r\n", .{te});
+        try testing.expectError(error.UnsupportedEncoding, request(parse(bytes, &h)));
+    }
+    // A quoted comma in a parameter doesn't hide the real last coding,
+    // and a trailing comma is just an empty item.
+    for ([_][]const u8{ "gzip;x=\"1, 2\", chunked", "gzip, chunked," }) |te| {
+        var buf: [128]u8 = undefined;
+        const bytes = try std.fmt.bufPrint(&buf, "POST / HTTP/1.1\r\nTransfer-Encoding: {s}\r\n\r\n", .{te});
+        try testing.expectEqual(Framing.chunked, try request(parse(bytes, &h)));
+    }
+}
+
 test "a length that is not a number" {
     var h: [8]scan.Header = undefined;
     // "5 " is missing on purpose. The scanner trims OWS, so it gets
@@ -444,6 +480,8 @@ test "connection close and keep-alive" {
     try testing.expect(keepAlive(.of(parse("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", &h))));
     try testing.expect(!keepAlive(.of(parse("GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n", &h))));
     try testing.expect(!keepAlive(.of(parse("GET / HTTP/1.1\r\nconnection: CLOSE\r\n\r\n", &h))));
+    // Nobody can say whether this one meant close.
+    try testing.expect(!keepAlive(.of(parse("GET / HTTP/1.1\r\nConnection: keep-alive \"close\r\n\r\n", &h))));
 }
 
 test "what comes after a response head" {

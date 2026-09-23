@@ -16,6 +16,7 @@ pub const Server = @import("Server.zig");
 pub const Client = @import("Client.zig");
 pub const TimedReader = @import("TimedReader.zig");
 pub const FailureSource = @import("FailureSource.zig");
+pub const serve = @import("serve.zig");
 
 pub const Header = scan.Header;
 pub const Head = scan.Head;
@@ -35,6 +36,7 @@ test {
     _ = Client;
     _ = TimedReader;
     _ = FailureSource;
+    _ = serve;
     // Not exported, but we still want to run its tests.
     _ = @import("HeadWindow.zig");
     _ = @import("integration_test.zig");
