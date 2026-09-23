@@ -1,4 +1,4 @@
-//! Test only: bytes arriving all at once, or one per read.
+//! For tests. Bytes arrive either all at once or one per read.
 //!
 //! `split` is where the reading bugs turn up, because it is the only
 //! thing that separates what we actually read from what we assumed was

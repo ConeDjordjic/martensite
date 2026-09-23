@@ -1,6 +1,6 @@
 //! A WebSocket echo server.
 //!
-//! The framing is as small as it gets: no fragmentation, no close codes
+//! The framing is kept minimal. It has no fragmentation, no close codes
 //! and no UTF-8 checks.
 
 const std = @import("std");

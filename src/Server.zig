@@ -1,15 +1,13 @@
 //! One connection, read as a series of requests.
 //!
-//! This is the only file here that needs an Io. Everything under it
-//! works on byte slices, so you can skip it and drive the bytes
-//! yourself.
+//! Everything under this works on byte slices, so you can skip it and
+//! drive the bytes yourself.
 
 const std = @import("std");
 const Io = std.Io;
 
 const scan = @import("scan.zig");
 const body = @import("body.zig");
-const chunked = @import("chunked.zig");
 const target_mod = @import("target.zig");
 const DateHeader = @import("Date.zig");
 const HeadWindow = @import("HeadWindow.zig");
@@ -22,34 +20,26 @@ const BodyWriter = @import("BodyWriter.zig");
 const Server = @This();
 
 io: Io,
-/// Kept around for the handover. Reading through it is the window's job.
-reader: *Io.Reader,
 writer: *Io.Writer,
 /// Owns where the reader is: head, body, drain.
 window: HeadWindow,
 date: ?*DateHeader,
-/// Where to ask why a read failed, if the reader keeps track of that.
-failure: ?FailureSource,
 
 keep_alive: bool = true,
 phase: Phase = .ready,
-/// The method we have in hand, parsed. It decides whether the answer has
-/// a body at all. HEAD describes one without sending it, and a
-/// successful CONNECT is followed by a tunnel. This is the same rule
-/// `body.response` reads with.
+/// The method we have in hand, parsed. Together with the status it
+/// decides what comes after the response head. See `body.answer`.
 method: ?scan.Method = null,
-/// We owe the peer a 100 Continue. `expectsContinue` says what the
-/// request asked for, and this says what is still left to do about it.
+/// We still owe the peer a 100 Continue.
 expect_continue: bool = false,
 
 /// Where the connection is in the request/response cycle.
 ///
 /// A single value answers both "can I read another head" and "can I
-/// write a response", so there are no two flags to drift apart and
-/// disagree. It does not answer "will the connection outlive this
-/// message". That one is `keep_alive`, which the peer sets with its
-/// `Connection` header and a failed write can take back. `alive()` is
-/// where the two meet.
+/// write a response", so there are no two flags to drift apart. It does
+/// not answer "will the connection outlive this message". That is
+/// `keep_alive`, which either side's `Connection` header can clear, and
+/// so can a failed write. `alive()` checks both.
 ///
 /// `Client.Phase` is the mirror of this, with the two middle states in
 /// the opposite order.
@@ -105,16 +95,15 @@ pub const InitError = HeadWindow.InitError;
 pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) InitError!Server {
     return .{
         .io = io,
-        .reader = reader,
         .writer = writer,
         .window = try .init(reader, .{
             .headers = options.headers,
             .head_buf = options.head_buf,
             .trailer_buf = options.trailer_buf,
             .max_drain = options.max_drain,
+            .failure = options.failure,
         }),
         .date = options.date,
-        .failure = options.failure,
     };
 }
 
@@ -150,7 +139,7 @@ pub fn receive(s: *Server) ReceiveError!?Request {
     switch (s.phase) {
         .handed_over, .done => return null,
         .streaming => return error.ResponseOpen,
-        // One request, one response. Reading the next one first would
+        // Each request gets one response. Reading the next one first would
         // frame the answer from the wrong request, and the peer would
         // read it as the answer to the one still outstanding.
         .unanswered => return error.RequestUnanswered,
@@ -163,34 +152,21 @@ pub fn receive(s: *Server) ReceiveError!?Request {
     // write.
     errdefer s.forgetRequest();
 
-    const taken = (s.window.takeRequest() catch |err| {
-        // Listed one by one instead of `else => |e| e`, which would
-        // make the window's error set part of ours by accident.
-        return switch (err) {
-            error.Invalid => error.BadRequest,
-            error.ReadFailed => FailureSource.readError(s.failure),
-            error.HeadTooLarge => error.HeadTooLarge,
-            error.Ambiguous => error.Ambiguous,
-            error.UnsupportedEncoding => error.UnsupportedEncoding,
-            error.Canceled => error.Canceled,
-        };
+    const req = (s.window.takeRequest() catch |err| return switch (err) {
+        error.Invalid => error.BadRequest,
+        else => |e| e,
     }) orelse {
         s.forgetRequest();
         s.phase = .done;
         return null;
     };
 
-    s.expect_continue = try expectsContinue(taken.head);
-    s.method = scan.Method.parse(taken.head.method);
-    s.keep_alive = body.keepAlive(.of(taken.head));
+    s.expect_continue = try Message.expectation(req.head.headers);
+    s.method = scan.Method.parse(req.head.method);
+    s.keep_alive = body.keepAlive(.of(req.head));
     s.phase = .unanswered;
 
-    return .{
-        .head = taken.head,
-        .framing = taken.framing,
-        .window = &s.window,
-        .generation = s.window.generation,
-    };
+    return req;
 }
 
 /// The request body as an `Io.Reader`, for bodies too big to hold in
@@ -204,12 +180,13 @@ pub const BodyReader = HeadWindow.BodyReader;
 /// It is not the size of the body and not the connection's buffer. A few
 /// hundred bytes is plenty, and two is the minimum.
 pub fn bodyReader(s: *Server, decode_buf: []u8) (Io.Writer.Error || HeadWindow.BodyReaderError)!BodyReader {
+    try s.window.checkReader(decode_buf.len);
     try s.sendContinue();
     return s.window.bodyReader(decode_buf);
 }
 
 /// Tells a waiting peer to send its body. `readBody` and `bodyReader`
-/// do this for you.
+/// do this for you, once they know they are going to read it.
 pub fn sendContinue(s: *Server) Io.Writer.Error!void {
     if (!s.expect_continue) return;
     s.expect_continue = false;
@@ -218,43 +195,41 @@ pub fn sendContinue(s: *Server) Io.Writer.Error!void {
     try s.writer.flush();
 }
 
-/// 100-continue is the only one we take. Anything else gets a 417.
-fn expectsContinue(head: scan.Head) error{UnsupportedExpectation}!bool {
-    var found = false;
-    for (head.headers) |h| {
-        if (!std.ascii.eqlIgnoreCase(h.name, "expect")) continue;
-        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, h.value, " \t"), "100-continue")) {
-            return error.UnsupportedExpectation;
-        }
-        found = true;
-    }
-    return found;
-}
-
 pub const BodyError = HeadWindow.BodyError;
 
 /// The body's own errors, plus the 100 Continue that reading a body owes
 /// a waiting peer.
 pub const ReadBodyError = BodyError || Io.Writer.Error;
 
-/// Reads the whole body into `buf`. If it doesn't fit you get an error,
-/// not a short read.
+/// Reads the whole body into `buf`. If it doesn't fit you get an error
+/// instead of a short read.
 pub fn readBody(s: *Server, buf: []u8) ReadBodyError![]u8 {
+    try s.window.checkRead(buf.len);
     try s.sendContinue();
     return s.window.readBody(buf);
 }
 
-pub const SendError = Response.WriteError || error{
+pub const SendError = field.HeadError || Io.Writer.Error || error{
     /// Already answered. A second response would be read as the answer
     /// to a request the peer hasn't sent yet.
     AlreadyAnswered,
+    /// This answer hands the connection over, but part of the request
+    /// body is still in the reader and couldn't be drained within
+    /// `max_drain`. The next protocol would read it as its own bytes.
+    /// The request is still unanswered, and the connection closes after
+    /// whatever you send instead.
+    BodyPending,
 };
 
 pub const StreamError = SendError || error{
-    /// This answer is a tunnel, so there is no body to stream. Use
-    /// `respond`, which hands the connection over once the head is
-    /// out.
+    /// A 101 or a tunnel has no body to stream. Use `respond` or
+    /// `upgrade`, which hand the connection over once the head is out.
     NoBodyToStream,
+};
+
+pub const UpgradeError = SendError || error{
+    /// Not a 101, and not a 2xx to a CONNECT.
+    NotSwitching,
 };
 
 /// A write failed. Part of a message is on the wire and the next one
@@ -274,52 +249,67 @@ fn forgetRequest(s: *Server) void {
     if (s.phase == .unanswered or s.phase == .answered) s.phase = .ready;
 }
 
-/// Checks that a response can be written and records that one was. It
-/// also settles any 100 Continue we owed, because once an answer is on
-/// the wire a 100 would be a second response.
-fn startResponse(s: *Server) error{AlreadyAnswered}!void {
-    switch (s.phase) {
-        .unanswered => s.phase = .answered,
-        // Standalone final response. It closes, because there is
-        // nothing left to keep the connection for.
-        .ready => {
-            s.keep_alive = false;
-            s.phase = .done;
-        },
-        .streaming, .answered, .handed_over, .done => return error.AlreadyAnswered,
-    }
-    // A rejected response leaves it alone. A 100 after an answer would
-    // be a second response.
-    s.expect_continue = false;
+/// What comes after a response with this status, given the request we
+/// have.
+fn answerTo(s: *const Server, status: Response.Status) body.Answer {
+    return body.answer(s.method, @intFromEnum(status));
 }
 
-/// Writes a response and flushes it.
-pub fn respond(s: *Server, r: Response) SendError!void {
-    var out = r;
-    out.carries = s.bodyFor(r.status);
-    const options: Response.WriteOptions = .{ .date = s.dateValue() };
-    // Reject it before we mark the request answered, so the caller can
-    // still send something else.
-    try out.check(options);
-
-    try s.startResponse();
-    errdefer s.writeFailed();
-    // Read after `startResponse`, which is where a standalone response
-    // decides the connection is over.
-    try out.write(s.writer, s.keep_alive, options);
-    try s.writer.flush();
-    if (!r.keep_alive) s.keep_alive = false;
-    if (out.carries == .none) {
-        // A 2xx to a CONNECT is the tunnel handshake, and what comes
-        // after it is tunnel bytes. Hand over exactly like `upgrade`
-        // does.
-        s.window.handOver();
-        s.phase = .handed_over;
-        return;
+/// Checks a response, then writes its head. Everything that can be
+/// refused is refused before anything changes, so the caller can still
+/// answer some other way.
+fn writeHead(s: *Server, r: Response, out: body.Outgoing) SendError!body.Plan {
+    switch (s.phase) {
+        .ready, .unanswered => {},
+        .streaming, .answered, .handed_over, .done => return error.AlreadyAnswered,
     }
-    // Nothing comes after this, so the connection is done, not just
-    // answered.
-    if (!s.keep_alive) s.phase = .done;
+    // Our own Scanner wants exactly three digits.
+    const code = @intFromEnum(r.status);
+    if (code < 100 or code > 999) return error.AmbiguousFraming;
+
+    const answer = s.answerTo(r.status);
+    var h: field.Head = .{
+        .fields = r.headers,
+        .body = out,
+        .answer = answer,
+        .date = s.dateValue(),
+    };
+    const plan = try field.checkHead(h);
+    // After a 101 the reader belongs to someone else, so a body still in
+    // it has to go before we say yes.
+    if (answer.switches()) s.window.handOver() catch {
+        s.keep_alive = false;
+        return error.BodyPending;
+    };
+
+    // With no request in hand there is nothing to keep the connection
+    // for.
+    if (s.phase == .ready) s.keep_alive = false;
+    if (!r.keep_alive or !body.keepAlive(.ours(r.headers))) s.keep_alive = false;
+    s.phase = .answered;
+    // Once an answer is on the wire, a 100 would be a second response.
+    s.expect_continue = false;
+
+    errdefer s.writeFailed();
+    try s.writer.print("HTTP/1.1 {d} {s}\r\n", .{ code, r.status.phrase() });
+    // A connection that switches protocols isn't closing.
+    h.close = !s.keep_alive and !answer.switches();
+    try field.writeHead(s.writer, h, plan);
+    return plan;
+}
+
+/// Writes a response and flushes it. A 101, or a 2xx to a CONNECT, hands
+/// the connection over like `upgrade` does.
+pub fn respond(s: *Server, r: Response) SendError!void {
+    const plan = try s.writeHead(r, .{ .complete = r.body });
+    errdefer s.writeFailed();
+    if (plan.mode != .discard) try s.writer.writeAll(r.body);
+    try s.writer.flush();
+    if (s.answerTo(r.status).switches()) {
+        s.phase = .handed_over;
+    } else if (!s.keep_alive) {
+        s.phase = .done;
+    }
 }
 
 pub const StreamOptions = struct {
@@ -330,55 +320,31 @@ pub const StreamOptions = struct {
 /// Starts a response whose body gets written afterwards. Finish it with
 /// `end`. `out_buf` becomes the writer's buffer, so its size is the
 /// biggest piece that goes out in one write. With chunked encoding that
-/// is the chunk size on the wire. Note this is not the same kind of
-/// buffer as `bodyReader`'s, even though it sits in the same place.
+/// is the chunk size on the wire. This is not the same kind of buffer as
+/// `bodyReader`'s, even though it sits in the same place.
 pub fn respondStreaming(
     s: *Server,
     r: Response,
     out_buf: []u8,
     options: StreamOptions,
 ) StreamError!ResponseWriter {
-    var head = r;
-    head.body = "";
-    head.carries = s.bodyFor(r.status);
-    // A tunnel has no body to stream into. That answer goes out in one
-    // piece.
-    if (head.carries == .none) return error.NoBodyToStream;
-    const head_options: Response.WriteOptions = .{
-        .date = s.dateValue(),
-        .framing = if (options.content_length) |n| .{ .length = n } else .chunked,
-    };
-    // Same as `respond`: reject it before the request counts as
-    // answered.
-    try head.check(head_options);
-
-    try s.startResponse();
+    if (s.answerTo(r.status).switches()) return error.NoBodyToStream;
+    const plan = try s.writeHead(r, if (options.content_length) |n| .{ .length = n } else .chunked);
     // There is no `ResponseWriter` yet, so nothing else would settle the
     // connection if the head doesn't go out.
     errdefer s.writeFailed();
-
-    try head.writeHead(s.writer, s.keep_alive, head_options);
-    if (!r.keep_alive) s.keep_alive = false;
-    // The head goes out now, not when the body ends. Otherwise a peer
-    // waiting on the status line waits for a body that is waiting on
-    // it.
+    // The head goes out now instead of when the body ends, because the
+    // peer might be waiting for it before it sends anything else.
     try s.writer.flush();
     s.phase = .streaming;
-
-    return .init(
-        s.writer,
-        out_buf,
-        if (!head.status.mayHaveBody() or s.bodyFor(r.status) != .as_given)
-            .discard
-        else if (options.content_length) |n| .{ .length = n } else .chunked,
-        .{ .ctx = s, .settled = settled },
-    );
+    return .init(s.writer, out_buf, plan.mode, .{ .ctx = s, .settled = settled });
 }
 
 /// Writes the response body a piece at a time. See `BodyWriter`.
 pub const ResponseWriter = BodyWriter;
 
-/// An unfinished body ends the connection. A finished one ends the turn.
+/// An unfinished body ends the connection. A finished one means the
+/// request is answered.
 fn settled(ctx: *anyopaque, state: BodyWriter.State) void {
     const s: *Server = @ptrCast(@alignCast(ctx));
     switch (state) {
@@ -388,21 +354,8 @@ fn settled(ctx: *anyopaque, state: BodyWriter.State) void {
     }
 }
 
-/// What this answer does with its body. The method decides that, not
-/// just the status. `body.response` reads it back the same way.
-fn bodyFor(s: *const Server, status: Response.Status) Response.Body {
-    const m = s.method orelse return .as_given;
-    // A HEAD describes the body a GET would have had.
-    if (!m.expectsBody()) return .describe_only;
-    // A successful CONNECT is followed by a tunnel, so no body and no
-    // framing headers about one.
-    const code = @intFromEnum(status);
-    if (m == .CONNECT and code >= 200 and code < 300) return .none;
-    return .as_given;
-}
-
-/// Today's date, if the caller asked for one. `writeHead` drops it if
-/// the response already has a Date.
+/// Today's date, if the caller asked for one. It is left out if the
+/// response already has a Date.
 fn dateValue(s: *Server) ?[]const u8 {
     const d = s.date orelse return null;
     return d.value(s.io);
@@ -426,30 +379,16 @@ pub fn alive(s: *const Server) bool {
 }
 
 /// Answers the handshake and stops speaking HTTP. The reader and writer
-/// are yours after this.
+/// are yours after this. It is `respond` with a check that the status
+/// really does switch.
 ///
-/// Anything the peer sent after the head is still sitting in the reader,
+/// Anything the peer sent after the request is still in the reader,
 /// since clients often send their first frame without waiting for the
-/// 101.
-pub fn upgrade(s: *Server, response: Response) SendError!void {
-    var r = response;
-    r.keep_alive = true;
-    // Same rule as the other two: a 101 has no body.
-    r.carries = s.bodyFor(r.status);
-    const options: Response.WriteOptions = .{};
-    // Before the handover and before the request counts as answered, so
-    // a rejected 101 still lets the caller answer some other way.
-    try r.check(options);
-
-    try s.startResponse();
-    errdefer s.writeFailed();
-    s.window.handOver();
-
-    // The connection carries on under another protocol.
-    try r.write(s.writer, true, options);
-    try s.writer.flush();
-
-    s.phase = .handed_over;
+/// 101. A request body that hasn't been read gets drained first, and if
+/// it can't be you get `BodyPending`.
+pub fn upgrade(s: *Server, r: Response) UpgradeError!void {
+    if (!s.answerTo(r.status).switches()) return error.NotSwitching;
+    return s.respond(r);
 }
 
 /// Has it been handed to another protocol?
@@ -1109,7 +1048,7 @@ test "upgrading hands the connection over" {
 
         // Bytes sent before the 101 are still there for the new owner.
         var rest: [32]u8 = undefined;
-        const n = try s.reader.readSliceShort(&rest);
+        const n = try s.window.reader.readSliceShort(&rest);
         try testing.expectEqualStrings("FRAMEBYTES", rest[0..n]);
     }
 }
@@ -1259,7 +1198,7 @@ test "what the request asked for outlives the 100 we sent" {
     }
 }
 
-test "a body is handed out once, one way" {
+test "a body can only be handed out once" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var s = h.init(shape, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\n\r\n");
@@ -1316,8 +1255,8 @@ test "a streamed body reaches the peer before it ends" {
 test "what a connection costs, apart from its buffers" {
     // Pinned, so if it grows you see it in a diff. Everything else a
     // connection uses is a buffer the caller sized.
-    try testing.expectEqual(@as(usize, 184), @sizeOf(Server));
-    try testing.expectEqual(@as(usize, 112), @sizeOf(HeadWindow));
+    try testing.expectEqual(@as(usize, 176), @sizeOf(Server));
+    try testing.expectEqual(@as(usize, 136), @sizeOf(HeadWindow));
     try testing.expectEqual(@as(usize, 88), @sizeOf(Request));
 }
 
@@ -1347,8 +1286,8 @@ test "a splat through a streamed body" {
 test "a chunked body that does not fit ends the connection" {
     for (shapes) |shape| {
         var h: Harness = undefined;
-        // 16 bytes of body with a valid request behind it. Does
-        // anything get read from a position nobody can account for?
+        // 16 bytes of body with a valid request behind it. Nothing should
+        // be read from a position nobody can account for.
         var s = h.initDraining(
             shape,
             "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
@@ -1731,7 +1670,7 @@ test "a body read to its end still leaves the connection usable" {
     try testing.expectEqualStrings("/b", second.target());
 }
 
-test "the body reader is a reader, buffered calls and all" {
+test "the body reader works with buffered reader calls" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var s = h.init(shape, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nc\r\nline\none\ntwo\r\n0\r\n\r\n");
@@ -1775,47 +1714,6 @@ test "a chunked body streamed in small bites" {
     }
 }
 
-test "a response cannot be framed two ways at once" {
-    var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
-    _ = (try s.receive()).?;
-
-    try testing.expectError(error.AmbiguousFraming, s.respond(.{
-        .headers = &.{
-            .{ .name = "Content-Length", .value = "5" },
-            .{ .name = "Transfer-Encoding", .value = "chunked" },
-        },
-        .body = "hello",
-    }));
-    try testing.expectEqualStrings("", h.written());
-}
-
-test "a response length that is not the body's is refused" {
-    var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
-    _ = (try s.receive()).?;
-
-    // `Content-Length: 0` with a body puts the body exactly where the
-    // peer looks for the next response.
-    try testing.expectError(error.AmbiguousFraming, s.respond(.{
-        .headers = &.{.{ .name = "Content-Length", .value = "0" }},
-        .body = "hello",
-    }));
-    try testing.expectEqualStrings("", h.written());
-}
-
-test "a caller's own length may agree with the body" {
-    var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
-    _ = (try s.receive()).?;
-
-    try s.respond(.{
-        .headers = &.{.{ .name = "Content-Length", .value = "5" }},
-        .body = "hello",
-    });
-    try testing.expect(std.mem.endsWith(u8, h.written(), "\r\n\r\nhello"));
-}
-
 test "a streamed response cannot contradict its own head" {
     var h: Harness = undefined;
     var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
@@ -1835,52 +1733,6 @@ test "a streamed response cannot contradict its own head" {
     try testing.expect(std.mem.endsWith(u8, h.written(), "sorry"));
 }
 
-test "a HEAD may describe a body it does not write" {
-    var h: Harness = undefined;
-    var s = h.init(.whole, "HEAD / HTTP/1.1\r\n\r\n");
-    _ = (try s.receive()).?;
-
-    // The length describes the body a GET would have got, and no body
-    // comes after it, so there is nothing to disagree with.
-    try s.respond(.{
-        .headers = &.{.{ .name = "Content-Length", .value = "12" }},
-        .body = "",
-    });
-    try testing.expect(std.mem.indexOf(u8, h.written(), "Content-Length: 12") != null);
-}
-
-test "an encoding this library cannot read is not written either" {
-    var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
-    _ = (try s.receive()).?;
-
-    // The read side calls this head UnsupportedEncoding, and dropping
-    // the Content-Length would leave the body unframed.
-    try testing.expectError(error.AmbiguousFraming, s.respond(.{
-        .headers = &.{.{ .name = "Transfer-Encoding", .value = "gzip" }},
-        .body = "hello",
-    }));
-    try testing.expectEqualStrings("", h.written());
-}
-
-test "chunked framing the caller wrote has to be chunked" {
-    var h: Harness = undefined;
-    var s = h.init(.whole, "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
-    _ = (try s.receive()).?;
-
-    try testing.expectError(error.AmbiguousFraming, s.respond(.{
-        .headers = &.{.{ .name = "Transfer-Encoding", .value = "chunked" }},
-        .body = "hello",
-    }));
-
-    try s.respond(.{
-        .headers = &.{.{ .name = "Transfer-Encoding", .value = "chunked" }},
-        .body = "5\r\nhello\r\n0\r\n\r\n",
-    });
-    try testing.expect(std.mem.endsWith(u8, h.written(), "5\r\nhello\r\n0\r\n\r\n"));
-    try testing.expect(std.mem.indexOf(u8, h.written(), "Content-Length") == null);
-}
-
 test "a response refused before it is written leaves the request answerable" {
     var h: Harness = undefined;
     var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
@@ -1894,29 +1746,6 @@ test "a response refused before it is written leaves the request answerable" {
 
     try s.respond(.text(.ok, "second thoughts"));
     try testing.expect(std.mem.endsWith(u8, h.written(), "second thoughts"));
-}
-
-test "a streamed body cannot go out under an encoding that is not chunked" {
-    var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
-    _ = (try s.receive()).?;
-
-    // The writer chunks the body whatever the head says, so the head has
-    // to say chunked.
-    var scratch: [64]u8 = undefined;
-    try testing.expectError(error.AmbiguousFraming, s.respondStreaming(.{
-        .headers = &.{.{ .name = "Transfer-Encoding", .value = "gzip" }},
-    }, &scratch, .{}));
-    try testing.expectEqualStrings("", h.written());
-
-    // Saying it twice is agreement, and it goes out once because
-    // `writeHead` leaves the caller's header alone.
-    var rw = try s.respondStreaming(.{
-        .headers = &.{.{ .name = "Transfer-Encoding", .value = "chunked" }},
-    }, &scratch, .{});
-    try rw.interface.writeAll("hi");
-    try rw.end();
-    try testing.expect(std.mem.endsWith(u8, h.written(), "2\r\nhi\r\n0\r\n\r\n"));
 }
 
 test "a 101 refused before the handover leaves the request answerable" {
@@ -1958,7 +1787,7 @@ test "a response with no request in hand says the connection is over" {
     }
 }
 
-test "what follows a successful CONNECT is a tunnel, not a body" {
+test "a successful CONNECT gets no body and is handed over" {
     for (shapes) |shape| {
         var h: Harness = undefined;
         var s = h.init(shape, "CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -2039,20 +1868,6 @@ test "a status the Scanner could not read back is not written" {
 
     try s.respond(.{ .status = @enumFromInt(599) });
     try testing.expect(std.mem.startsWith(u8, h.written(), "HTTP/1.1 599 "));
-}
-
-test "framing on a status that cannot carry a body is refused" {
-    var h: Harness = undefined;
-    var s = h.init(.whole, "GET / HTTP/1.1\r\n\r\n");
-    _ = (try s.receive()).?;
-
-    // A peer that honours the TE would read the next status line as this
-    // response's chunk size.
-    try testing.expectError(error.AmbiguousFraming, s.respond(.{
-        .status = .no_content,
-        .headers = &.{.{ .name = "Transfer-Encoding", .value = "chunked" }},
-    }));
-    try testing.expectEqualStrings("", h.written());
 }
 
 test "no trailers is an empty slice" {
@@ -2274,8 +2089,7 @@ test "a response the writer cannot hold ends the connection" {
     try testing.expectEqualStrings("/hi", req.target());
 
     // 16 bytes of room and a longer status line. Part of a head is on
-    // the wire and can't be taken back, so the question is what happens
-    // next.
+    // the wire and can't be taken back.
     try testing.expectError(error.WriteFailed, s.respond(Response.text(.ok, "yes")));
     try testing.expect(!s.alive());
     try testing.expectError(error.AlreadyAnswered, s.respond(.{}));
@@ -2414,8 +2228,8 @@ test "the body's length is knowable before reading it" {
         try testing.expectEqual(@as(?u64, 5), req.contentLength());
         try testing.expect(req.hasBody());
 
-        // This is the point of knowing the length: size the buffer to
-        // this body, not to the biggest one we would accept.
+        // Knowing the length lets you size the buffer for this body
+        // instead of the biggest one you would accept.
         var exact: [5]u8 = undefined;
         const n: usize = @intCast(req.contentLength().?);
         try testing.expectEqualStrings("hello", try s.readBody(exact[0..n]));
@@ -2443,4 +2257,101 @@ test "a request with no body reports neither" {
         try testing.expectEqual(@as(?u64, null), req.contentLength());
         try testing.expect(!req.hasBody());
     }
+}
+
+test "an upgrade with the request body still in the way" {
+    const input = "POST /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: h2c\r\nContent-Length: 5\r\n\r\nhelloFRAME";
+    const switching: Response = .{
+        .status = .switching_protocols,
+        .headers = &.{ .{ .name = "Upgrade", .value = "h2c" }, .{ .name = "Connection", .value = "Upgrade" } },
+    };
+    for (shapes) |shape| {
+        // Nothing to drain with. The 101 doesn't go out, and the request
+        // can still be answered, on a connection that then closes.
+        var h: Harness = undefined;
+        var s = h.init(shape, input);
+        _ = (try s.receive()).?;
+        try testing.expectError(error.BodyPending, s.upgrade(switching));
+        try testing.expectEqualStrings("", h.written());
+        try testing.expect(!s.handedOver());
+        try s.respond(.text(.bad_request, "no"));
+        try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") != null);
+        try testing.expect(!s.alive());
+
+        // With a budget the body is drained, and the next protocol
+        // starts after it.
+        s = h.initDraining(shape, input);
+        _ = (try s.receive()).?;
+        try s.upgrade(switching);
+        var rest: [16]u8 = undefined;
+        const n = try s.window.reader.readSliceShort(&rest);
+        try testing.expectEqualStrings("FRAME", rest[0..n]);
+    }
+}
+
+test "an upgrade needs a status that switches" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    try testing.expectError(error.NotSwitching, s.upgrade(.{ .status = .ok }));
+    try testing.expectEqualStrings("", h.written());
+    try s.respond(.text(.bad_request, "no"));
+    try testing.expect(!s.handedOver());
+}
+
+test "a 101 through respond hands the connection over too" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET /ws HTTP/1.1\r\nConnection: Upgrade, close\r\nUpgrade: websocket\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    try s.respond(.{ .status = .switching_protocols });
+    try testing.expect(s.handedOver());
+    // The connection is changing hands, so it doesn't say close.
+    try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") == null);
+}
+
+test "no 100 Continue before a read that is going to be refused" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello");
+        _ = (try s.receive()).?;
+
+        var small: [2]u8 = undefined;
+        try testing.expectError(error.BodyTooLarge, s.readBody(&small));
+        try testing.expectError(error.NoDecodeBuffer, s.bodyReader(small[0..1]));
+        try testing.expectEqualStrings("", h.written());
+
+        var buf: [8]u8 = undefined;
+        try testing.expectEqualStrings("hello", try s.readBody(&buf));
+        try testing.expectEqualStrings("HTTP/1.1 100 Continue\r\n\r\n", h.written());
+    }
+}
+
+test "every error a server hands you has a status on purpose" {
+    // `forError` falls back to 500 for anything it doesn't know. That is
+    // the right answer for most of these, but it should be a decision,
+    // so a new error fails here until it gets a line in `named`.
+    const sets = .{ ReceiveError, ReadBodyError, HeadWindow.BodyReaderError, UpgradeError, StreamError, BodyWriter.EndError };
+    inline for (sets) |Set| {
+        inline for (@typeInfo(Set).error_set.?) |e| {
+            if (Response.Status.named(@field(anyerror, e.name)) == null) {
+                std.debug.print("error.{s} has no status in Status.named\n", .{e.name});
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "a Connection: close the caller wrote ends the connection and goes out once" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+    _ = (try s.receive()).?;
+
+    try s.respond(.{ .headers = &.{.{ .name = "Connection", .value = "close" }} });
+    try testing.expect(!s.alive());
+    try testing.expectEqual(@as(?Request, null), try s.receive());
+    const out = h.written();
+    const first = std.mem.indexOf(u8, out, "Connection: close").?;
+    try testing.expect(std.mem.indexOf(u8, out[first + 1 ..], "Connection: close") == null);
 }

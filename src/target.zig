@@ -228,7 +228,7 @@ test "bad escapes" {
     }
 }
 
-test "decoding a null byte is allowed here and your problem later" {
+test "decoding a null byte is allowed" {
     var buf: [64]u8 = undefined;
     const out = try decode("a%00b", &buf);
     try testing.expectEqual(@as(usize, 3), out.len);

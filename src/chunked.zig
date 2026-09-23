@@ -293,7 +293,7 @@ test "trailers survive arriving one byte at a time" {
     try testing.expectEqualStrings("X-Sum: 42\r\nX-Other: y\r\n", last);
 }
 
-test "no trailers is an empty slice, not a missing one" {
+test "no trailers is an empty slice" {
     var buf: [64]u8 = undefined;
     var tbuf: [64]u8 = undefined;
     const input = "1\r\na\r\n0\r\n\r\n";
@@ -304,7 +304,7 @@ test "no trailers is an empty slice, not a missing one" {
     try testing.expectEqualStrings("", r.trailers);
 }
 
-test "trailers bigger than the buffer are dropped, not an error" {
+test "trailers bigger than the buffer are dropped" {
     var buf: [128]u8 = undefined;
     var tbuf: [8]u8 = undefined;
     const input = "0\r\nX-Very-Long-Name: and a long value too\r\n\r\n";

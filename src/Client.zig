@@ -1,4 +1,4 @@
-//! The other half: writes requests, reads responses.
+//! The client side. It writes requests and reads responses.
 //!
 //! Same rules as Server. You hand it a reader and a writer. It doesn't
 //! open sockets, resolve names or follow redirects.
@@ -8,7 +8,6 @@ const Io = std.Io;
 
 const scan = @import("scan.zig");
 const body = @import("body.zig");
-const chunked = @import("chunked.zig");
 const HeadWindow = @import("HeadWindow.zig");
 const field = @import("field.zig");
 const BodyWriter = @import("BodyWriter.zig");
@@ -18,7 +17,6 @@ const Message = @import("Message.zig");
 const Client = @This();
 
 io: Io,
-reader: *Io.Reader,
 writer: *Io.Writer,
 /// Owns where the reader is: head, body, drain.
 window: HeadWindow,
@@ -26,19 +24,16 @@ window: HeadWindow,
 /// and no body. We keep the enum instead of the bytes so that nothing
 /// holds a slice of the caller's request after the send.
 sent_method: ?scan.Method = null,
-/// What the last response said about doing another exchange. A server
-/// saying `close` is just as final as a client saying it.
+/// Whether another exchange can follow. Either side's `Connection:
+/// close` clears it, and so does a failed write.
 keep_alive: bool = true,
-/// Where to ask why a read failed, if the reader keeps track of that.
-failure: ?FailureSource = null,
 phase: Phase = .ready,
 
 /// Where the exchange has got to.
 ///
 /// A single value answers both "can I send another request" and "can I
 /// read a response". Whether the connection outlives the exchange is a
-/// separate thing, `keep_alive`, which the other end's `Connection`
-/// header decides.
+/// separate thing, `keep_alive`.
 ///
 /// `Server.Phase` is the mirror of this. The responder reads then
 /// writes and the requester writes then reads, so the middle two states
@@ -90,15 +85,14 @@ pub const InitError = HeadWindow.InitError;
 pub fn init(io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) InitError!Client {
     return .{
         .io = io,
-        .reader = reader,
         .writer = writer,
         .window = try .init(reader, .{
             .headers = options.headers,
             .head_buf = options.head_buf,
             .trailer_buf = options.trailer_buf,
             .max_drain = options.max_drain,
+            .failure = options.failure,
         }),
-        .failure = options.failure,
     };
 }
 
@@ -111,13 +105,7 @@ pub const Request = struct {
     body: []const u8 = "",
 };
 
-pub const SendError = Io.Writer.Error || error{
-    /// A bad header name, or CR, LF or NUL in a value.
-    InvalidHeader,
-    /// The caller's framing headers say something we would refuse to
-    /// read: both `Content-Length` and `Transfer-Encoding`, two lengths
-    /// that disagree, or a length that isn't the body's.
-    AmbiguousFraming,
+pub const SendError = field.HeadError || Io.Writer.Error || error{
     /// The method or target doesn't fit in a request line.
     InvalidRequest,
     /// The last request hasn't been answered yet. Receive first.
@@ -134,7 +122,7 @@ pub const SendError = Io.Writer.Error || error{
 /// becomes the start of whatever gets sent next, and then you have split
 /// one request into two.
 pub fn send(c: *Client, r: Request) SendError!void {
-    try c.writeHead(r, .from_body);
+    _ = try c.writeHead(r, .{ .complete = r.body });
     errdefer c.writeFailed();
     try c.writer.writeAll(r.body);
     try c.writer.flush();
@@ -159,18 +147,13 @@ pub fn sendStreaming(
     out_buf: []u8,
     options: StreamOptions,
 ) SendError!RequestWriter {
-    try c.writeHead(r, if (options.content_length) |n| .{ .length = n } else .chunked);
+    const plan = try c.writeHead(r, if (options.content_length) |n| .{ .length = n } else .chunked);
     errdefer c.writeFailed();
     // The head goes out now. A server we asked for 100-continue can't
     // answer a request it hasn't seen yet.
     try c.writer.flush();
     c.phase = .sending;
-    return .init(
-        c.writer,
-        out_buf,
-        if (options.content_length) |n| .{ .length = n } else .chunked,
-        .{ .ctx = c, .settled = settled },
-    );
+    return .init(c.writer, out_buf, plan.mode, .{ .ctx = c, .settled = settled });
 }
 
 /// Writes the request body a piece at a time. See `BodyWriter`.
@@ -194,18 +177,10 @@ fn writeFailed(c: *Client) void {
     c.phase = .done;
 }
 
-/// How the body coming after this is framed.
-const Framing = union(enum) {
-    /// Whatever `Request.body` holds.
-    from_body,
-    length: u64,
-    chunked,
-};
-
 /// The request line and headers, up to the blank line. Everything gets
 /// checked before a byte goes out, because half a request line becomes
 /// the start of whatever is sent next.
-fn writeHead(c: *Client, r: Request, framing: Framing) SendError!void {
+fn writeHead(c: *Client, r: Request, out: body.Outgoing) SendError!body.Plan {
     switch (c.phase) {
         .ready, .received => {},
         .sent, .sending => return error.ExchangeOpen,
@@ -216,61 +191,20 @@ fn writeHead(c: *Client, r: Request, framing: Framing) SendError!void {
     if (r.target.len == 0 or hasControl(r.target) or
         std.mem.indexOfScalar(u8, r.target, ' ') != null) return error.InvalidRequest;
 
-    field.check(r.headers, .header) catch return error.InvalidHeader;
-
-    // The caller's own framing has to agree with the body coming after
-    // it, otherwise we send a request our own Scanner would reject.
-    const announced = field.announced(r.headers) catch return error.AmbiguousFraming;
-    const framed = announced.framed();
-    switch (framing) {
-        .from_body => {
-            if (announced.length) |n| {
-                if (n != r.body.len) return error.AmbiguousFraming;
-            }
-            if (announced.encoding) |te| {
-                if (!body.endsWithChunked(te)) return error.AmbiguousFraming;
-                // A body with no terminator never ends. Trailers go
-                // through `sendStreaming` and `endWithTrailers`.
-                if (!std.mem.endsWith(u8, r.body, "0\r\n\r\n")) return error.AmbiguousFraming;
-            }
-        },
-        .length => |n| {
-            if (announced.encoding != null) return error.AmbiguousFraming;
-            if (announced.length) |mine| {
-                if (mine != n) return error.AmbiguousFraming;
-            }
-        },
-        .chunked => {
-            if (announced.length != null) return error.AmbiguousFraming;
-            if (announced.encoding) |te| {
-                if (!body.endsWithChunked(te)) return error.AmbiguousFraming;
-            }
-        },
-    }
+    const h: field.Head = .{ .fields = r.headers, .body = out };
+    const plan = try field.checkHead(h);
 
     // Past every check now. A write that fails from here on leaves part
     // of a request on the wire.
     errdefer c.writeFailed();
-
-    const w = c.writer;
-    try w.writeAll(r.method);
-    try w.writeByte(' ');
-    try w.writeAll(r.target);
-    try w.writeAll(" HTTP/1.1\r\n");
-
-    try field.write(w, r.headers);
-    if (!framed) switch (framing) {
-        // An unframed body reads as the start of the next request, so
-        // this is not optional.
-        .from_body => if (r.body.len != 0) {
-            try w.print("Content-Length: {d}\r\n", .{r.body.len});
-        },
-        .length => |n| try w.print("Content-Length: {d}\r\n", .{n}),
-        .chunked => try w.writeAll("Transfer-Encoding: chunked\r\n"),
-    };
-    try w.writeAll("\r\n");
+    try c.writer.print("{s} {s} HTTP/1.1\r\n", .{ r.method, r.target });
+    try field.writeHead(c.writer, h, plan);
 
     c.sent_method = scan.Method.parse(r.method);
+    // A `close` we send ends the connection just like one from the
+    // server.
+    if (!body.keepAlive(.ours(r.headers))) c.keep_alive = false;
+    return plan;
 }
 
 pub const ReceiveError = error{
@@ -315,35 +249,26 @@ pub fn receive(c: *Client) ReceiveError!?Response {
 
     errdefer c.phase = .done;
 
-    const taken = (c.window.takeResponse(c.sent_method) catch |err| return switch (err) {
+    const resp = (c.window.takeResponse(c.sent_method) catch |err| return switch (err) {
         error.Invalid => error.BadResponse,
-        error.ReadFailed => FailureSource.readError(c.failure),
-        error.HeadTooLarge => error.HeadTooLarge,
-        error.Ambiguous => error.Ambiguous,
-        error.UnsupportedEncoding => error.UnsupportedEncoding,
-        error.Canceled => error.Canceled,
+        else => |e| e,
     }) orelse {
         c.phase = .done;
         return null;
     };
 
-    const code = taken.head.status;
-    // The peer stopped speaking HTTP. Another head here would scan the
-    // next protocol's first bytes.
-    const switching = code == 101 or
-        (c.sent_method == .CONNECT and code >= 200 and code < 300);
-    // An interim response frames nothing. The real one is still coming.
-    const interim = !switching and code >= 100 and code < 200;
+    const answer = body.answer(c.sent_method, resp.head.status);
+    switch (answer) {
+        // The peer stopped speaking HTTP. Another head here would scan
+        // the next protocol's first bytes.
+        .switch_protocols, .tunnel => c.phase = .switching,
+        // Frames nothing. The real response is still to come.
+        .interim => c.phase = .sent,
+        else => c.phase = .received,
+    }
+    if (answer != .interim and !body.keepAlive(.of(resp.head))) c.keep_alive = false;
 
-    if (!interim) c.keep_alive = body.keepAlive(.of(taken.head));
-    c.phase = if (switching) .switching else if (interim) .sent else .received;
-
-    return .{
-        .head = taken.head,
-        .framing = taken.framing,
-        .window = &c.window,
-        .generation = c.window.generation,
-    };
+    return resp;
 }
 
 /// Trailers from the response body, scanned into `storage`. Chunked
@@ -355,8 +280,8 @@ pub fn trailers(c: *Client, storage: []scan.Header) scan.Error![]const scan.Head
 
 pub const BodyError = HeadWindow.BodyError;
 
-/// Reads the whole body into `buf`. If it doesn't fit you get an error,
-/// not a short read.
+/// Reads the whole body into `buf`. If it doesn't fit you get an error
+/// instead of a short read.
 pub fn readBody(c: *Client, buf: []u8) BodyError![]u8 {
     return c.window.readBody(buf);
 }
@@ -386,7 +311,8 @@ pub fn handOver(c: *Client) void {
     // connection nobody switched would give the caller the rest of a
     // response as another protocol's first bytes.
     std.debug.assert(c.phase == .switching);
-    c.window.handOver();
+    // A switching response has no body, so there is nothing to drain.
+    c.window.handOver() catch unreachable;
     c.phase = .handed_over;
 }
 
@@ -699,66 +625,6 @@ test "a request cannot be framed two ways at once" {
     // Rejected before any byte went out, so the exchange is still open
     // for a sensible request.
     try testing.expect(c.alive());
-}
-
-test "a request length that is not the body's is refused" {
-    var h: Harness = undefined;
-    var c = h.init(.whole, "");
-
-    try testing.expectError(error.AmbiguousFraming, c.send(.{
-        .method = "POST",
-        .headers = &.{.{ .name = "Content-Length", .value = "0" }},
-        .body = "GET /admin HTTP/1.1\r\n\r\n",
-    }));
-    try testing.expectEqualStrings("", h.sent());
-}
-
-test "a body always gets a length" {
-    var h: Harness = undefined;
-    var c = h.init(.whole, "");
-    try c.send(.{ .method = "POST", .body = "hello" });
-    try testing.expect(std.mem.indexOf(u8, h.sent(), "Content-Length: 5") != null);
-}
-
-test "a streamed request cannot contradict its own head" {
-    var h: Harness = undefined;
-    var c = h.init(.whole, "");
-
-    var scratch: [64]u8 = undefined;
-    try testing.expectError(error.AmbiguousFraming, c.sendStreaming(.{
-        .method = "POST",
-        .headers = &.{.{ .name = "Content-Length", .value = "5" }},
-    }, &scratch, .{}));
-}
-
-test "an encoding the Scanner would refuse is not sent" {
-    var h: Harness = undefined;
-    var c = h.init(.whole, "");
-
-    try testing.expectError(error.AmbiguousFraming, c.send(.{
-        .method = "POST",
-        .headers = &.{.{ .name = "Transfer-Encoding", .value = "gzip" }},
-        .body = "hello",
-    }));
-    try testing.expectError(error.AmbiguousFraming, c.send(.{
-        .method = "POST",
-        .headers = &.{.{ .name = "Transfer-Encoding", .value = "chunked" }},
-        .body = "hello",
-    }));
-    try testing.expectEqualStrings("", h.sent());
-}
-
-test "a request length is read the way a response's is" {
-    var h: Harness = undefined;
-    var c = h.init(.whole, "");
-    for ([_][]const u8{ "+5", "-0", "1_0" }) |bad| {
-        try testing.expectError(error.AmbiguousFraming, c.send(.{
-            .method = "POST",
-            .headers = &.{.{ .name = "Content-Length", .value = bad }},
-            .body = "hello",
-        }));
-    }
-    try testing.expectEqualStrings("", h.sent());
 }
 
 test "a 101 is the peer agreeing to stop speaking HTTP" {
@@ -1117,4 +983,14 @@ test "a chunked response has no length to report" {
         try testing.expectEqual(@as(?u64, null), res.contentLength());
         try testing.expect(res.hasBody());
     }
+}
+
+test "a Connection: close we sent ends the connection" {
+    var h: Harness = undefined;
+    // The server doesn't have to say close back.
+    var c = h.init(.whole, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    try c.send(.{ .headers = &.{.{ .name = "Connection", .value = "close" }} });
+    _ = (try c.receive()).?;
+    try testing.expect(!c.alive());
+    try testing.expectError(error.Closed, c.send(.{}));
 }

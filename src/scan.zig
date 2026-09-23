@@ -551,7 +551,7 @@ test "responses that are not" {
 // The only two places we are stricter than a permissive parser. A test
 // counts them, so a third one can't turn up without somebody noticing.
 
-test "one space between request line fields, not a run" {
+test "one space between request line fields" {
     var headers: [8]Header = undefined;
     try testing.expectError(error.Invalid, request("POST /  HTTP/1.1\r\n\r\n", &headers, 0));
 }

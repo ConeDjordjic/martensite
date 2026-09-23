@@ -2,8 +2,8 @@
 //!
 //! `std.Io.Reader` only ever says `error.ReadFailed`, so a reader that
 //! knows the peer timed out instead of disappearing has no way to tell
-//! us through the interface. This works around it: a pointer to the
-//! reader, plus a function that gets the cause back out.
+//! us through the interface. This works around that with a pointer to
+//! the reader and a function that gets the cause back out.
 //! `TimedReader.failureSource` gives you one.
 
 const FailureSource = @This();

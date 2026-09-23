@@ -1,7 +1,6 @@
 //! Tests over a real socket.
 //!
-//! The buffer-backed tests are fast, and they have still let four real
-//! bugs through. These ones use a real socket.
+//! The buffer-backed tests are fast, but four real bugs got past them.
 
 const std = @import("std");
 const Io = std.Io;
@@ -183,7 +182,7 @@ fn refusingHandler(io: Io, stream: net.Stream) !void {
     }
 }
 
-/// One connection, one hostile payload, and nothing else running.
+/// Sends one hostile payload on a connection of its own.
 fn probeExchange(io: Io, seed: u16, payload: []const u8) !void {
     var bound = try bind(io, seed);
     defer bound.server.deinit(io);
@@ -416,8 +415,7 @@ test "TimedReader gives up on a peer that says nothing" {
             try testing.expectError(error.ReadFailed, http.receive());
             try testing.expectEqual(TimedReader.Error.Timeout, reader.failure().?);
 
-            // It gave up somewhere near the timeout, not straight away
-            // and not never.
+            // It gave up close to the timeout.
             const waited = Io.Timestamp.now(inner, .awake).nanoseconds - started.nanoseconds;
             try testing.expect(waited > 100 * std.time.ns_per_ms);
             try testing.expect(waited < 3 * std.time.ns_per_s);
@@ -432,7 +430,7 @@ test "TimedReader gives up on a peer that says nothing" {
     }.f);
 }
 
-test "TimedReader bounds a whole head, not just each read of it" {
+test "TimedReader bounds the whole head as well as each read" {
     const io = testing.io;
     try exchange(io, 39700, struct {
         fn f(inner: Io, stream: net.Stream) !void {
@@ -463,8 +461,7 @@ test "TimedReader bounds a whole head, not just each read of it" {
             _ = out.ok(writer.interface.writeAll("GET / HTTP/1.1\r\n")) orelse return;
             _ = out.ok(writer.interface.flush()) orelse return;
             // A header every 50ms and never finishing. The server hangs
-            // up at 300ms, which is the whole point, so a failed write
-            // from here is what we expect.
+            // up at 300ms, so a failed write from here is expected.
             for (0..20) |_| {
                 millis(50).sleep(inner) catch return;
                 writer.interface.writeAll("X-Pad: y\r\n") catch return;

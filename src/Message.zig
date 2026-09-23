@@ -122,15 +122,14 @@ pub fn Message(comptime kind: Kind) type {
             return m.header("upgrade");
         }
 
-        /// The request wants a go-ahead before it sends its body.
-        /// Reading the body sends it. This is a fact about the head, so
-        /// it stays true after the 100 has gone out. Any other `Expect`
-        /// was already rejected by `receive`.
+        /// The request wants a 100 Continue before it sends its body.
+        /// `readBody` and `bodyReader` send one for you. This is about
+        /// the head, so it stays true after the 100 has gone out.
+        /// `receive` already rejected any other `Expect`.
         pub fn expectsContinue(m: M) bool {
             comptime only(.request, "expectsContinue");
             m.check();
-            const value = m.header("expect") orelse return false;
-            return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "100-continue");
+            return expectation(m.head.headers) catch false;
         }
 
         // Responses only.
@@ -147,6 +146,20 @@ pub fn Message(comptime kind: Kind) type {
             return m.head.reason;
         }
     };
+}
+
+/// Whether a request asks for 100 Continue. That is the only
+/// expectation we take, and anything else is a 417.
+pub fn expectation(headers: []const scan.Header) error{UnsupportedExpectation}!bool {
+    var found = false;
+    for (headers) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "expect")) continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, h.value, " \t"), "100-continue")) {
+            return error.UnsupportedExpectation;
+        }
+        found = true;
+    }
+    return found;
 }
 
 pub const HeaderIterator = struct {

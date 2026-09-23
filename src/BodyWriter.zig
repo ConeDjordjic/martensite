@@ -7,13 +7,14 @@
 //!
 //! Any error out of a write, `end` or `endWithTrailers` means the body
 //! on the wire is incomplete. The connection gets told, and every call
-//! after that returns `Finished` without writing. There is nothing to
-//! retry and nothing to clean up.
+//! after that returns `Finished` without writing. You don't need to
+//! clean anything up.
 
 const std = @import("std");
 const Io = std.Io;
 
 const field = @import("field.zig");
+const body = @import("body.zig");
 
 const BodyWriter = @This();
 
@@ -25,13 +26,8 @@ mode: Mode,
 owner: Owner,
 state: State = .open,
 
-pub const Mode = union(enum) {
-    chunked,
-    /// Exactly this many bytes.
-    length: u64,
-    /// No body allowed, so writes get dropped. This is a HEAD response.
-    discard,
-};
+/// `body.outgoing` decides this, along with the head.
+pub const Mode = body.Mode;
 
 pub const State = enum { open, finished, broken };
 
@@ -49,7 +45,7 @@ pub const EndError = Io.Writer.Error || error{
     /// Fewer bytes than the length we promised. The peer would sit
     /// there waiting for the rest.
     LengthMismatch,
-    /// Already ended, or a write failed and took the framing with it.
+    /// Already ended, or an earlier write failed and broke the framing.
     Finished,
 };
 
@@ -95,8 +91,8 @@ pub fn end(b: *BodyWriter) EndError!void {
 pub fn endWithTrailers(b: *BodyWriter, fields: []const field.Header) EndError!void {
     if (b.state != .open) return error.Finished;
     // A counted body has nowhere to put them, and dropping them quietly
-    // could lose a checksum the peer never sees. `discard` is different:
-    // the head promised chunked and this is a HEAD, so the trailers go
+    // could lose a checksum the peer never sees. `discard` is different.
+    // The head promised chunked and this is a HEAD, so the trailers go
     // the same way the body went.
     if (fields.len != 0 and b.mode == .length) return b.fail(error.InvalidTrailer);
     // Check first. Rejecting a trailer halfway through leaves the
@@ -118,8 +114,8 @@ pub fn endWithTrailers(b: *BodyWriter, fields: []const field.Header) EndError!vo
 fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
     const b: *BodyWriter = @alignCast(@fieldParentPtr("interface", io_w));
 
-    // Buffered bytes first, then the vectors. Bytes out of the buffer
-    // don't count here: `drain` reports what it took from `data`.
+    // Buffered bytes first, then the vectors. `drain` reports what it
+    // took from `data`, so bytes from the buffer don't count.
     const buffered = io_w.buffered();
     try b.emit(buffered);
     io_w.end = 0;

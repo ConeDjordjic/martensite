@@ -45,7 +45,8 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(api);
 
-    // Only built, never run here: it wants the network and a CA bundle.
+    // Only built here, never run, because it needs the network and a CA
+    // bundle.
     const tls_client = b.addExecutable(.{
         .name = "tls-client",
         .root_module = b.createModule(.{

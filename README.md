@@ -20,7 +20,7 @@ Nothing allocates. The `scan`, `body` and `chunked` modules take byte
 slices and never touch I/O. `Server` and `Client` need a `std.Io`, but
 you don't have to use either of them.
 
-## The one rule
+## Where slices point
 
 Every slice you get back points into a buffer you own. It stays valid
 until the next operation on that buffer, which for `Server` means the
@@ -79,7 +79,7 @@ both methods too.
 One request gets one response. Calling `respond` twice for the same
 request gives you `error.AlreadyAnswered`, because the second one would
 go out as the answer to a request the peer has not sent yet. Reading
-works the same way while a streamed response is open: `receive` returns
+works the same way while a streamed response is open. `receive` returns
 `error.ResponseOpen` until `end` finishes the body.
 
 Any error out of a `ResponseWriter` means the body on the wire is
@@ -157,7 +157,9 @@ reason `method()` and `target()` on a request give you raw bytes, with
 One exchange at a time. A second `send` before the response has arrived
 is `error.ExchangeOpen`, and a `receive` with nothing outstanding is
 `error.NothingSent`. An interim `1xx` does not close the exchange, so the
-next `receive` gives you the real response.
+next `receive` gives you the real response. A `Connection: close` in the
+headers you send ends the connection after that exchange, the same as one
+from the server.
 
 `Client.Options` has `trailer_buf` and `failure` just like `Server`'s, so
 trailers from a chunked response show up in `client.trailers(&storage)`
@@ -210,11 +212,19 @@ Clients usually send their first frame without waiting for the 101, and
 those bytes are still sitting in the reader after the handover.
 `examples/websocket.zig` is a working echo server with framing.
 
+`upgrade` only takes a status that switches protocols. Anything else is
+`error.NotSwitching`. If the request has a body you haven't read, it gets
+drained first, within `max_drain`. If it can't be, you get
+`error.BodyPending`, because otherwise the new protocol would read the
+body as its own first bytes. The request is still unanswered then, so you
+can send an error instead, and the connection closes after it.
+
 A `CONNECT` answered with a 2xx is the other handover. What comes after
 it is a tunnel, so the answer has no body and no framing headers, and the
 connection stops being HTTP as soon as that answer goes out. After that
-`http.handedOver()` is true and the reader and writer are yours. Trying
-to stream into a tunnel gives `error.NoBodyToStream`.
+`http.handedOver()` is true and the reader and writer are yours. `respond`
+hands over by itself for a 2xx to a `CONNECT` or a 101, and trying to
+stream either one gives `error.NoBodyToStream`.
 
 On the client side, a `101` or a 2xx answer to a `CONNECT` you sent comes
 back from `receive` so you can read the head, and nothing more is sent or
@@ -265,8 +275,8 @@ somewhere to ask, it can tell them apart:
 `Client.Options` has the same field.
 
 Without it a timeout stays `error.ReadFailed`. Anything that is not a
-timeout stays `error.ReadFailed` either way, because they all end up in
-the same place: stop serving this connection.
+timeout stays `error.ReadFailed` either way, because you handle all of
+them the same way, by closing the connection.
 
 ## Correctness
 
@@ -280,15 +290,15 @@ Some of the tests run over a real socket instead of a buffer. Every
 time, which is what catches the difference between what was actually read
 and what the code assumed was there.
 
-Framing is where request smuggling lives, so:
+Request smuggling happens in the framing, so all of these are rejected:
 
-- `Content-Length` and `Transfer-Encoding` together: rejected.
-- Either header twice with different values: rejected.
-- A `Content-Length` with anything but digits in it: rejected.
-- `Transfer-Encoding` that does not end in `chunked`: rejected.
-- A bare LF where a chunk size line needs CRLF: rejected.
-- A CR in a trailer line with no LF after it: rejected.
-- Response header values with CR, LF or NUL in them: rejected.
+- `Content-Length` and `Transfer-Encoding` together.
+- Either header twice with different values.
+- A `Content-Length` with anything but digits in it.
+- `Transfer-Encoding` that does not end in `chunked`.
+- A bare LF where a chunk size line needs CRLF.
+- A CR in a trailer line with no LF after it.
+- Response header values with CR, LF or NUL in them.
 
 Repeated spaces in a request line and folded headers are rejected too.
 
@@ -297,17 +307,17 @@ request that carries both framing headers, or two lengths that disagree,
 or a `Content-Length` that is not the length of the body being written,
 is `error.AmbiguousFraming` and never reaches the wire. Writing a message
 that martensite itself would refuse to read is how a body gets smuggled
-past whichever end is less careful. The check costs nothing: it happens
-before the first byte goes out and before the request counts as answered,
-so the handler can still send something else.
+past whichever end is less careful. The check happens before the first
+byte goes out and before the request counts as answered, so the handler
+can still send something else.
 
 Writing `Transfer-Encoding: chunked` yourself and passing already chunked
 bytes as the body still works. They have to end with `0\r\n\r\n`, and
 trailers after the last chunk go through `respondStreaming` and
 `endWithTrailers` rather than in the body.
 
-A connection costs whatever buffers you hand it, plus 184 bytes of
-bookkeeping on x86-64, 112 of which is the head window. A test pins both
+A connection costs whatever buffers you hand it, plus 176 bytes of
+bookkeeping on x86-64, 136 of which is the head window. A test pins both
 numbers, so if they grow you see it in the diff.
 
 ## Not here
