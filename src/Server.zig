@@ -194,6 +194,7 @@ pub fn receive(s: *Server) ReceiveError!?Request {
     // The last request's body is drained now, so its limit is done with.
     s.window.max_drain = s.max_drain;
 
+    if (target_mod.parse(req.head.target) == null) return error.BadRequest;
     try field.checkHost(req.head.headers, req.head.minor_version >= 1);
     s.expect_continue = try Message.expectation(req.head.headers);
     s.method = scan.Method.parse(req.head.method);
@@ -304,6 +305,7 @@ fn writeHead(s: *Server, r: Response, out: body.Outgoing) SendError!body.Plan {
     const answer = s.answerTo(r.status);
     var h: field.Head = .{
         .fields = r.headers,
+        .content_type = r.content_type,
         .body = out,
         .answer = answer,
         .date = s.dateValue(),
@@ -1164,7 +1166,7 @@ test "the target comes apart" {
         var h: Harness = undefined;
         var s = h.init(shape, "GET /users/7?tab=posts&page=2 HTTP/1.1\r\nHost: x\r\n\r\n");
         const req = (try s.receive()).?;
-        const t = req.parsedTarget().?;
+        const t = req.parsedTarget();
         try testing.expectEqualStrings("/users/7", t.path);
         try testing.expectEqualStrings("tab=posts&page=2", t.query);
 
@@ -2614,4 +2616,62 @@ test "last says a streamed body broke" {
     var rw = try s.respondStreaming(.{}, &scratch, .{ .content_length = 3 });
     try testing.expectError(error.LengthMismatch, rw.end());
     try testing.expectEqual(Sent{ .status = .ok, .body_bytes = 0, .complete = false }, s.last.?);
+}
+
+test "json with headers of your own" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = (try s.receive()).?;
+    var r: Response = .json(.ok, "{}");
+    r.headers = &.{.{ .name = "Set-Cookie", .value = "a=1" }};
+    try s.respond(r);
+    const out = h.written();
+    try testing.expect(std.mem.indexOf(u8, out, "\r\nContent-Type: application/json\r\nSet-Cookie: a=1\r\n") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "Content-Type"));
+}
+
+test "a Content-Type in both places is refused" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = (try s.receive()).?;
+    var r: Response = .json(.ok, "{}");
+    r.headers = &.{.{ .name = "content-type", .value = "text/plain" }};
+    try testing.expectError(error.InvalidHeader, s.respond(r));
+    try testing.expectEqualStrings("", h.written());
+    // Nothing went out, so the request can still be answered.
+    try s.respond(.json(.ok, "{}"));
+}
+
+test "a Content-Type the Scanner would reject is refused" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = (try s.receive()).?;
+    try testing.expectError(error.InvalidHeader, s.respond(.{ .content_type = "text/plain\r\nX: y" }));
+    try testing.expectEqualStrings("", h.written());
+}
+
+test "a target that doesn't parse is refused" {
+    const bad = [_][]const u8{
+        "GET a/b HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET ://x/ HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET http:///x HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT a:1/x HTTP/1.1\r\nHost: x\r\n\r\n",
+    };
+    for (shapes) |shape| for (bad) |input| {
+        var h: Harness = undefined;
+        var s = h.init(shape, input);
+        try testing.expectError(error.BadRequest, s.receive());
+    };
+
+    const good = [_][]const u8{
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        "OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n\r\n",
+        "GET http://a/x?q HTTP/1.1\r\nHost: a\r\n\r\n",
+    };
+    for (shapes) |shape| for (good) |input| {
+        var h: Harness = undefined;
+        var s = h.init(shape, input);
+        _ = (try s.receive()).?.parsedTarget();
+    };
 }

@@ -80,7 +80,21 @@ both methods too.
 one that isn't a host with an optional port. That is `error.BadHost`,
 and the answer is 400. HTTP/1.0 requests can leave `Host` out. For a
 target like `http://a/x` the target's host is the one that counts, and
-`Host` only has to be there once.
+`Host` only has to be there once. A target that isn't one of the four
+forms HTTP allows, like `a/b`, is `error.BadRequest`. So
+`req.parsedTarget()` always has an answer and isn't optional.
+
+`.text`, `.json` and `.html` set the response's `content_type`, which
+leaves `headers` for anything else you want to send:
+
+```zig
+var r: martensite.Response = .json(.ok, body);
+r.headers = &.{.{ .name = "Set-Cookie", .value = cookie }};
+try http.respond(r);
+```
+
+A Content-Type in `headers` as well is `error.InvalidHeader`, and
+nothing is sent.
 
 One request gets one response. Calling `respond` twice for the same
 request gives you `error.AlreadyAnswered`, because the second one would
@@ -323,7 +337,7 @@ with the head. Anything the peer sent after it is waiting in the reader.
 ## Routing bits
 
 ```zig
-const t = req.parsedTarget() orelse return;      // t.path, t.query, t.form
+const t = req.parsedTarget();                    // t.path, t.query, t.form
 var pairs: martensite.target.Pairs = .init(t.query);
 const decoded = try martensite.target.decode(t.path, &buf);
 const q = martensite.target.Pairs.get(t.query, "q") orelse "";

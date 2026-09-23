@@ -69,7 +69,7 @@ const App = struct {
     pub fn handle(app: *App, http: *martensite.Server, req: martensite.Server.Request) !void {
         // Match on the path, so `/events?since=3` routes the same as
         // `/events`.
-        const path = if (req.parsedTarget()) |t| t.path else req.target();
+        const path = req.parsedTarget().path;
         const method = req.knownMethod() orelse return http.respond(.{ .status = .not_implemented });
 
         // HEAD runs the same handler as GET. The library writes the head

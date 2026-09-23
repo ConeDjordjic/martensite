@@ -105,11 +105,13 @@ pub fn Message(comptime kind: Kind) type {
             return m.head.target;
         }
 
-        /// The target split into parts, or null if the shape is illegal.
-        pub fn parsedTarget(m: M) ?target_mod.Target {
+        /// The target split into parts. It parses again on every call,
+        /// which is only a search for `?`.
+        pub fn parsedTarget(m: M) target_mod.Target {
             comptime only(.request, "parsedTarget");
             m.check();
-            return target_mod.parse(m.head.target);
+            // `Server.receive` refuses a target that doesn't parse.
+            return target_mod.parse(m.head.target).?;
         }
 
         /// The protocol the peer wants to switch to. It needs

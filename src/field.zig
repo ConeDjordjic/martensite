@@ -52,6 +52,8 @@ pub fn write(w: *Io.Writer, fields: []const Header) Io.Writer.Error!void {
 /// Everything in a head after the start line, for either side.
 pub const Head = struct {
     fields: []const Header,
+    /// Written as a Content-Type header. The fields can't have one too.
+    content_type: ?[]const u8 = null,
     body: body.Outgoing,
     /// What the response does with its body. Null for a request.
     answer: ?body.Answer = null,
@@ -77,6 +79,10 @@ pub const HeadError = error{
 /// goes out. `writeHead` needs what this returns.
 pub fn checkHead(h: Head) HeadError!body.Plan {
     check(h.fields, .header) catch return error.InvalidHeader;
+    if (h.content_type) |ct| {
+        // Two of them and the peer picks one, and we can't say which.
+        if (!scan.validFieldValue(ct) or has(h.fields, "content-type")) return error.InvalidHeader;
+    }
     if (h.date) |d| {
         if (!scan.validFieldValue(d)) return error.InvalidHeader;
     }
@@ -86,6 +92,7 @@ pub fn checkHead(h: Head) HeadError!body.Plan {
 /// The fields, the framing header from `plan`, Date, Connection and the
 /// blank line. The start line is the caller's job.
 pub fn writeHead(w: *Io.Writer, h: Head, plan: body.Plan) Io.Writer.Error!void {
+    if (h.content_type) |ct| try w.print("Content-Type: {s}\r\n", .{ct});
     try write(w, h.fields);
     switch (plan.line) {
         .none => {},

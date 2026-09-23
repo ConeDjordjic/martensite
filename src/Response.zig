@@ -9,6 +9,9 @@ const field = @import("field.zig");
 const Response = @This();
 
 status: Status = .ok,
+/// Goes out as Content-Type. `text`, `json` and `html` set it, so
+/// `headers` stays yours. Don't put a Content-Type in both.
+content_type: ?[]const u8 = null,
 headers: []const Header = &.{},
 body: []const u8 = "",
 /// False closes the connection after this response. A `Connection:
@@ -21,7 +24,7 @@ pub const Header = field.Header;
 pub fn text(status: Status, s: []const u8) Response {
     return .{
         .status = status,
-        .headers = &.{.{ .name = "Content-Type", .value = "text/plain; charset=utf-8" }},
+        .content_type = "text/plain; charset=utf-8",
         .body = s,
     };
 }
@@ -29,7 +32,7 @@ pub fn text(status: Status, s: []const u8) Response {
 pub fn json(status: Status, s: []const u8) Response {
     return .{
         .status = status,
-        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .content_type = "application/json",
         .body = s,
     };
 }
@@ -37,7 +40,7 @@ pub fn json(status: Status, s: []const u8) Response {
 pub fn html(status: Status, s: []const u8) Response {
     return .{
         .status = status,
-        .headers = &.{.{ .name = "Content-Type", .value = "text/html; charset=utf-8" }},
+        .content_type = "text/html; charset=utf-8",
         .body = s,
     };
 }
