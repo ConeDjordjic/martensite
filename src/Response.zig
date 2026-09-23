@@ -45,6 +45,7 @@ pub fn html(status: Status, s: []const u8) Response {
 pub const Status = enum(u16) {
     @"continue" = 100,
     switching_protocols = 101,
+    early_hints = 103,
 
     ok = 200,
     created = 201,
@@ -141,6 +142,7 @@ pub const Status = enum(u16) {
         return switch (s) {
             .@"continue" => "Continue",
             .switching_protocols => "Switching Protocols",
+            .early_hints => "Early Hints",
             .ok => "OK",
             .created => "Created",
             .accepted => "Accepted",

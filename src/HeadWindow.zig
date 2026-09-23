@@ -96,6 +96,14 @@ pub fn trailers(w: *const HeadWindow, storage: []scan.Header) scan.Error![]const
     return scan.trailers(w.trailers_raw, storage);
 }
 
+/// Whether the connection ends after this message. That is the case when
+/// the window has already stopped, or when there is a body nobody has
+/// started reading and the drain won't take it. Reading the body changes
+/// the answer.
+pub fn endsHere(w: *const HeadWindow) bool {
+    return w.finished or (!w.claimed and !w.usable());
+}
+
 /// Can we take another head from where the reader is now?
 ///
 /// False once a body ended somewhere we can't account for, and false

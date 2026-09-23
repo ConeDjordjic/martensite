@@ -222,8 +222,8 @@ pub const SendError = field.HeadError || Io.Writer.Error || error{
 };
 
 pub const StreamError = SendError || error{
-    /// A 101 or a tunnel has no body to stream. Use `respond` or
-    /// `upgrade`, which hand the connection over once the head is out.
+    /// A 1xx or a tunnel has no body to stream. Use `respond`, or
+    /// `upgrade` for a 101.
     NoBodyToStream,
 };
 
@@ -282,32 +282,51 @@ fn writeHead(s: *Server, r: Response, out: body.Outgoing) SendError!body.Plan {
         return error.BodyPending;
     };
 
-    // With no request in hand there is nothing to keep the connection
-    // for.
-    if (s.phase == .ready) s.keep_alive = false;
-    if (!r.keep_alive or !body.keepAlive(.ours(r.headers))) s.keep_alive = false;
-    s.phase = .answered;
-    // Once an answer is on the wire, a 100 would be a second response.
-    s.expect_continue = false;
+    const interim = answer == .interim;
+    if (interim) {
+        // The real response is still to come, so the request stays
+        // unanswered. A 100 sent this way is the one we owed.
+        if (code == 100) s.expect_continue = false;
+    } else {
+        // With no request in hand there is nothing to keep the connection
+        // for.
+        if (s.phase == .ready) s.keep_alive = false;
+        if (!r.keep_alive or !body.keepAlive(.ours(r.headers))) s.keep_alive = false;
+        // A body left in the reader that the drain won't take ends the
+        // connection. The peer should hear that from the head instead of
+        // from a closed socket.
+        if (s.window.endsHere()) s.keep_alive = false;
+        s.phase = .answered;
+        // Once an answer is on the wire, a 100 would be a second response.
+        s.expect_continue = false;
+    }
 
     errdefer s.writeFailed();
     try s.writer.print("HTTP/1.1 {d} {s}\r\n", .{ code, r.status.phrase() });
-    // A connection that switches protocols isn't closing.
-    h.close = !s.keep_alive and !answer.switches();
+    // A connection that switches protocols isn't closing, and a 1xx
+    // doesn't decide anything about it.
+    h.close = !s.keep_alive and !answer.switches() and !interim;
     try field.writeHead(s.writer, h, plan);
     return plan;
 }
 
 /// Writes a response and flushes it. A 101, or a 2xx to a CONNECT, hands
-/// the connection over like `upgrade` does.
+/// the connection over like `upgrade` does. Any other 1xx, like 103
+/// Early Hints, leaves the request unanswered so the real response can
+/// follow.
+///
+/// If the request has a body you haven't read and `max_drain` won't
+/// cover it, the response says `Connection: close`. Read the body first
+/// if you want to keep the connection.
 pub fn respond(s: *Server, r: Response) SendError!void {
     const plan = try s.writeHead(r, .{ .complete = r.body });
     errdefer s.writeFailed();
     if (plan.mode != .discard) try s.writer.writeAll(r.body);
     try s.writer.flush();
-    if (s.answerTo(r.status).switches()) {
+    const answer = s.answerTo(r.status);
+    if (answer.switches()) {
         s.phase = .handed_over;
-    } else if (!s.keep_alive) {
+    } else if (answer != .interim and !s.keep_alive) {
         s.phase = .done;
     }
 }
@@ -328,7 +347,8 @@ pub fn respondStreaming(
     out_buf: []u8,
     options: StreamOptions,
 ) StreamError!ResponseWriter {
-    if (s.answerTo(r.status).switches()) return error.NoBodyToStream;
+    const answer = s.answerTo(r.status);
+    if (answer.switches() or answer == .interim) return error.NoBodyToStream;
     const plan = try s.writeHead(r, if (options.content_length) |n| .{ .length = n } else .chunked);
     // There is no `ResponseWriter` yet, so nothing else would settle the
     // connection if the head doesn't go out.
@@ -2354,4 +2374,84 @@ test "a Connection: close the caller wrote ends the connection and goes out once
     const out = h.written();
     const first = std.mem.indexOf(u8, out, "Connection: close").?;
     try testing.expect(std.mem.indexOf(u8, out[first + 1 ..], "Connection: close") == null);
+}
+
+test "an unread body the drain won't take makes the response say close" {
+    const input = "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n\r\n";
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        var s = h.init(shape, input);
+        _ = (try s.receive()).?;
+        try s.respond(.text(.payload_too_large, "no"));
+        try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") != null);
+        try testing.expect(!s.alive());
+
+        // Read first, and the connection carries on.
+        s = h.init(shape, input);
+        _ = (try s.receive()).?;
+        var buf: [8]u8 = undefined;
+        _ = try s.readBody(&buf);
+        try s.respond(.text(.ok, "yes"));
+        try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") == null);
+        try testing.expectEqualStrings("/b", (try s.receive()).?.target());
+
+        // The same if the drain can take it.
+        s = h.initDraining(shape, input);
+        _ = (try s.receive()).?;
+        try s.respond(.text(.ok, "yes"));
+        try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") == null);
+        try testing.expectEqualStrings("/b", (try s.receive()).?.target());
+    }
+}
+
+test "a body being streamed back doesn't make the response say close" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+    _ = (try s.receive()).?;
+
+    var decode: [64]u8 = undefined;
+    var b = try s.bodyReader(&decode);
+    var scratch: [64]u8 = undefined;
+    var rw = try s.respondStreaming(.{}, &scratch, .{});
+    _ = try b.interface.streamRemaining(&rw.interface);
+    try rw.end();
+    try testing.expect(std.mem.indexOf(u8, h.written(), "Connection: close") == null);
+    try testing.expect(s.alive());
+}
+
+test "a 103 goes out ahead of the real response" {
+    for (shapes) |shape| {
+        var h: Harness = undefined;
+        // Asking to close doesn't stop the real response coming after
+        // the hint.
+        var s = h.init(shape, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+        _ = (try s.receive()).?;
+
+        var scratch: [64]u8 = undefined;
+        try testing.expectError(error.NoBodyToStream, s.respondStreaming(.{ .status = .early_hints }, &scratch, .{}));
+        try s.respond(.{
+            .status = .early_hints,
+            .headers = &.{.{ .name = "Link", .value = "</style.css>; rel=preload" }},
+        });
+        try s.respond(.text(.ok, "hi"));
+
+        try testing.expectEqualStrings(
+            "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n" ++
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+            h.written(),
+        );
+        try testing.expectError(error.AlreadyAnswered, s.respond(.{}));
+    }
+}
+
+test "a 100 sent by hand is the one we owed" {
+    var h: Harness = undefined;
+    var s = h.init(.whole, "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi");
+    _ = (try s.receive()).?;
+
+    try s.respond(.{ .status = .@"continue" });
+    var buf: [8]u8 = undefined;
+    _ = try s.readBody(&buf);
+    try s.respond(.{});
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, h.written(), "100 Continue"));
 }

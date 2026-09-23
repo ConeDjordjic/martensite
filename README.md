@@ -80,7 +80,9 @@ One request gets one response. Calling `respond` twice for the same
 request gives you `error.AlreadyAnswered`, because the second one would
 go out as the answer to a request the peer has not sent yet. Reading
 works the same way while a streamed response is open. `receive` returns
-`error.ResponseOpen` until `end` finishes the body.
+`error.ResponseOpen` until `end` finishes the body. A 1xx other than 101,
+like 103 Early Hints, doesn't count as the answer, so you can send one
+before the real response.
 
 Any error out of a `ResponseWriter` means the body on the wire is
 incomplete. `LengthMismatch` means the body was shorter than promised,
@@ -90,9 +92,10 @@ connection closes and the writer is done. `end` and `endWithTrailers`
 also return `Finished`, and `flush` returns `WriteFailed`, which is the
 only error `Io.Writer` has.
 
-If the handler never reads the body, the connection ends. Reading a body
-you already rejected is up to you, so you have to say how much of it you
-will take:
+If the handler never reads the body, the connection ends, and the
+response says `Connection: close` so the peer knows. Reading a body you
+already rejected is up to you, so you have to say how much of it you will
+take:
 
 ```zig
 .max_drain = 64 * 1024,   // default is 0: don't read it, close instead
