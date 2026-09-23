@@ -57,56 +57,48 @@ fn serve(io: Io, stream: net.Stream) Io.Cancelable!void {
         .max_drain = 64 * 1024,
     }) catch return;
 
-    while (true) {
-        reader.startDeadline(.{ .duration = seconds(10) });
+    var app: App = .{ .reader = &reader };
+    http.serve(&app, .{
+        .deadline = reader.deadlines(),
+        .head = .{ .duration = seconds(10) },
+        .body = .{ .duration = seconds(10) },
+    }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return,
+    };
+}
 
-        const req = http.receive() catch |err| {
-            _ = http.respond(.{ .status = .forError(err), .keep_alive = false }) catch {};
-            return;
-        } orelse return;
+const App = struct {
+    reader: *martensite.TimedReader,
 
+    pub fn handle(app: *App, http: *martensite.Server, req: martensite.Server.Request) !void {
         // Match on the path, so `/events?since=3` routes the same as
         // `/events`.
         const path = if (req.parsedTarget()) |t| t.path else req.target();
-        const method = req.knownMethod() orelse {
-            _ = http.respond(.{ .status = .not_implemented }) catch return;
-            if (!http.alive()) return;
-            continue;
-        };
+        const method = req.knownMethod() orelse return http.respond(.{ .status = .not_implemented });
 
-        route(&http, &reader, req, method, path) catch return;
-        if (!http.alive()) return;
+        // HEAD runs the same handler as GET. The library writes the head
+        // and drops the body.
+        const get = method == .GET or method == .HEAD;
+
+        if (std.mem.eql(u8, path, "/")) {
+            if (!get) return methodNotAllowed(http, "GET, HEAD");
+            return http.respond(.text(.ok, index));
+        }
+
+        if (std.mem.eql(u8, path, "/events")) {
+            if (!get) return methodNotAllowed(http, "GET, HEAD");
+            return events(http);
+        }
+
+        if (std.mem.eql(u8, path, "/upload")) {
+            if (method != .POST and method != .PUT) return methodNotAllowed(http, "POST, PUT");
+            return upload(http, app.reader, req);
+        }
+
+        return http.respond(.text(.not_found, "no such thing\n"));
     }
-}
-
-fn route(
-    http: *martensite.Server,
-    reader: *martensite.TimedReader,
-    req: martensite.Server.Request,
-    method: martensite.Method,
-    path: []const u8,
-) !void {
-    // HEAD runs the same handler as GET. The library writes the head and
-    // drops the body.
-    const get = method == .GET or method == .HEAD;
-
-    if (std.mem.eql(u8, path, "/")) {
-        if (!get) return methodNotAllowed(http, "GET, HEAD");
-        return http.respond(.text(.ok, index));
-    }
-
-    if (std.mem.eql(u8, path, "/events")) {
-        if (!get) return methodNotAllowed(http, "GET, HEAD");
-        return events(http);
-    }
-
-    if (std.mem.eql(u8, path, "/upload")) {
-        if (method != .POST and method != .PUT) return methodNotAllowed(http, "POST, PUT");
-        return upload(http, reader, req);
-    }
-
-    return http.respond(.text(.not_found, "no such thing\n"));
-}
+};
 
 fn methodNotAllowed(http: *martensite.Server, allow: []const u8) !void {
     return http.respond(.{
@@ -152,9 +144,7 @@ fn upload(
 
     var scratch: [4096]u8 = undefined;
     var counter: Io.Writer.Discarding = .init(&.{});
-    var b = http.bodyReader(&scratch) catch |err| {
-        return http.respond(.{ .status = .forError(err), .keep_alive = false });
-    };
+    var b = try http.bodyReader(&scratch);
     // A chunked body has no length up front, so the cap has to limit the
     // read itself. Reading all of it and complaining afterwards means
     // reading however much they decide to send.
@@ -162,7 +152,7 @@ fn upload(
     while (n <= max_upload) {
         n += b.interface.stream(&counter.writer, .limited64(max_upload + 1 - n)) catch |err| switch (err) {
             error.EndOfStream => break,
-            else => return http.respond(.{ .status = .bad_request, .keep_alive = false }),
+            else => return error.BadRequest,
         };
     } else return http.respond(.{ .status = .payload_too_large, .keep_alive = false });
 
